@@ -1,4 +1,7 @@
-use flate2::{read::GzDecoder, write::GzEncoder};
+use flate2::{
+    read::{DeflateDecoder, GzDecoder},
+    write::{DeflateEncoder, GzEncoder},
+};
 use positioned_io::ReadAt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -6,7 +9,10 @@ use std::{
     fmt::{Debug, Formatter},
     fs::{DirEntry, File, Permissions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
 };
+
+mod varint;
 
 pub const FILE_SIGNATURE: &[u8] = b"DDUPBAK\0";
 
@@ -14,6 +20,7 @@ pub const FILE_SIGNATURE: &[u8] = b"DDUPBAK\0";
 pub enum CompressionFormat {
     None,
     Gzip,
+    Deflate,
 }
 
 impl CompressionFormat {
@@ -21,6 +28,7 @@ impl CompressionFormat {
         match self {
             CompressionFormat::None => 0,
             CompressionFormat::Gzip => 1,
+            CompressionFormat::Deflate => 2,
         }
     }
 
@@ -28,48 +36,9 @@ impl CompressionFormat {
         match value {
             0 => CompressionFormat::None,
             1 => CompressionFormat::Gzip,
+            2 => CompressionFormat::Deflate,
             _ => panic!("Invalid compression format"),
         }
-    }
-}
-
-pub struct VarInt(u64);
-
-impl VarInt {
-    pub fn new(value: u64) -> Self {
-        VarInt(value)
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut value = self.0;
-        let mut buffer = Vec::new();
-
-        while value > 0x7F {
-            buffer.push((value & 0x7F) as u8 | 0x80);
-            value >>= 7;
-        }
-
-        buffer.push(value as u8);
-
-        buffer
-    }
-
-    pub fn decode<S: Read>(stream: &mut S) -> Result<u64, std::io::Error> {
-        let mut value = 0;
-        let mut shift = 0;
-
-        loop {
-            let mut byte = [0; 1];
-            stream.read_exact(&mut byte)?;
-
-            value |= ((byte[0] & 0x7F) as u64) << shift;
-            if byte[0] & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-
-        Ok(value)
     }
 }
 
@@ -105,13 +74,15 @@ fn decode_file_permissions(mode: u32) -> Permissions {
 pub struct FileEntry {
     pub name: String,
     pub mode: Permissions,
+    pub owner: (u32, u32),
+    pub mtime: i64,
+    pub compression: CompressionFormat,
+    pub size: u64,
 
     file: File,
-    decoder: Option<GzDecoder<File>>,
-    size: u64,
+    decoder: Option<Box<dyn Read + Send>>,
     offset: u64,
     consumed: u64,
-    compression: CompressionFormat,
 }
 
 impl Debug for FileEntry {
@@ -119,6 +90,8 @@ impl Debug for FileEntry {
         f.debug_struct("FileEntry")
             .field("name", &self.name)
             .field("mode", &self.mode)
+            .field("owner", &self.owner)
+            .field("mtime", &self.mtime)
             .field("size", &self.size)
             .field("offset", &self.offset)
             .field("compression", &self.compression)
@@ -135,16 +108,8 @@ impl Read for FileEntry {
         let remaining = self.size - self.consumed;
 
         match self.compression {
-            CompressionFormat::Gzip => {
-                if self.decoder.is_none() {
-                    self.file
-                        .seek(SeekFrom::Start(self.offset + self.consumed))?;
-                    let decoder = GzDecoder::new(self.file.try_clone()?);
-                    self.decoder = Some(decoder);
-                }
-
-                let decoder = self.decoder.as_mut().unwrap();
-                let bytes_read = decoder.read(buf)?;
+            CompressionFormat::None => {
+                let bytes_read = self.file.read_at(self.offset + self.consumed, buf)?;
 
                 if bytes_read > remaining as usize {
                     self.consumed += remaining;
@@ -154,10 +119,39 @@ impl Read for FileEntry {
                 self.consumed += bytes_read as u64;
                 Ok(bytes_read)
             }
-            CompressionFormat::None => {
-                let bytes_read = self.file.read_at(self.offset + self.consumed, buf)?;
+            CompressionFormat::Gzip => {
+                if self.decoder.is_none() {
+                    self.file
+                        .seek(SeekFrom::Start(self.offset + self.consumed))?;
+                    let decoder = GzDecoder::new(self.file.try_clone()?);
+                    self.decoder = Some(Box::new(decoder));
+                }
+
+                let decoder = self.decoder.as_mut().unwrap();
+                let bytes_read = decoder.read(buf)?;
 
                 if bytes_read > remaining as usize {
+                    self.decoder = None;
+                    self.consumed += remaining;
+                    return Ok(remaining as usize);
+                }
+
+                self.consumed += bytes_read as u64;
+                Ok(bytes_read)
+            }
+            CompressionFormat::Deflate => {
+                if self.decoder.is_none() {
+                    self.file
+                        .seek(SeekFrom::Start(self.offset + self.consumed))?;
+                    let decoder = DeflateDecoder::new(self.file.try_clone()?);
+                    self.decoder = Some(Box::new(decoder));
+                }
+
+                let decoder = self.decoder.as_mut().unwrap();
+                let bytes_read = decoder.read(buf)?;
+
+                if bytes_read > remaining as usize {
+                    self.decoder = None;
                     self.consumed += remaining;
                     return Ok(remaining as usize);
                 }
@@ -173,6 +167,8 @@ impl Read for FileEntry {
 pub struct DirectoryEntry {
     pub name: String,
     pub mode: Permissions,
+    pub owner: (u32, u32),
+    pub mtime: i64,
     pub entries: Vec<Entry>,
 }
 
@@ -180,6 +176,8 @@ pub struct DirectoryEntry {
 pub struct SymlinkEntry {
     pub name: String,
     pub mode: Permissions,
+    pub owner: (u32, u32),
+    pub mtime: i64,
     pub target: String,
     pub target_dir: bool,
 }
@@ -212,10 +210,35 @@ impl Entry {
             Entry::Symlink(entry) => entry.mode.clone(),
         }
     }
+
+    /// Returns the owner of the entry.
+    /// This is the user ID and group ID of the entry.
+    pub fn owner(&self) -> (u32, u32) {
+        match self {
+            Entry::File(entry) => entry.owner,
+            Entry::Directory(entry) => entry.owner,
+            Entry::Symlink(entry) => entry.owner,
+        }
+    }
+
+    /// Returns the modification time of the entry.
+    /// This is the time the entry was last modified.
+    pub fn mtime(&self) -> i64 {
+        match self {
+            Entry::File(entry) => entry.mtime,
+            Entry::Directory(entry) => entry.mtime,
+            Entry::Symlink(entry) => entry.mtime,
+        }
+    }
 }
+
+type ProgressCallback = Option<fn(&std::path::PathBuf)>;
+type CompressionFormatCallback =
+    Option<fn(&std::path::PathBuf, &std::fs::Metadata) -> CompressionFormat>;
 
 pub struct Archive {
     file: File,
+    compression_callback: CompressionFormatCallback,
 
     entries: Vec<Entry>,
     entries_offset: u64,
@@ -229,8 +252,6 @@ impl Debug for Archive {
     }
 }
 
-type ProgressCallback = Option<fn(&std::path::PathBuf)>;
-
 impl Archive {
     /// Creates a new archive file.
     /// The file signature is written to the beginning of the file.
@@ -242,6 +263,7 @@ impl Archive {
 
         Self {
             file,
+            compression_callback: None,
             entries: Vec::new(),
             entries_offset: 8,
         }
@@ -273,7 +295,7 @@ impl Archive {
         let mut entries = Vec::with_capacity(entries_count as usize);
         file.seek(SeekFrom::Start(entries_offset))?;
 
-        let mut decoder = GzDecoder::new(file.try_clone()?);
+        let mut decoder = DeflateDecoder::new(file.try_clone()?);
         for _ in 0..entries_count {
             let file_clone = file.try_clone()?;
             let entry = Self::decode_entry(&mut decoder, file_clone)?;
@@ -282,9 +304,19 @@ impl Archive {
 
         Ok(Self {
             file,
+            compression_callback: None,
             entries,
             entries_offset,
         })
+    }
+
+    /// Sets the compression callback for the archive.
+    /// This callback is called for each added file entry in the archive.
+    /// The callback should return the compression format to use for the file.
+    pub fn set_compression_callback(&mut self, callback: CompressionFormatCallback) -> &mut Self {
+        self.compression_callback = callback;
+
+        self
     }
 
     /// Adds all files in the given directory to the archive. (including subdirectories)
@@ -298,7 +330,7 @@ impl Archive {
         &mut self,
         path: &str,
         progress: ProgressCallback,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<&mut Self, std::io::Error> {
         self.trim_end_header()?;
 
         for entry in std::fs::read_dir(path)?.flatten() {
@@ -307,7 +339,7 @@ impl Archive {
 
         self.write_end_header()?;
 
-        Ok(())
+        Ok(self)
     }
 
     /// Returns the entries in the archive.
@@ -331,13 +363,13 @@ impl Archive {
         &mut self,
         entry: DirEntry,
         progress: ProgressCallback,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<&mut Self, std::io::Error> {
         self.trim_end_header()?;
         self.encode_entry(None, entry, progress)?;
 
         self.write_end_header()?;
 
-        Ok(())
+        Ok(self)
     }
 
     fn trim_end_header(&mut self) -> Result<(), std::io::Error> {
@@ -351,7 +383,7 @@ impl Archive {
     }
 
     fn write_end_header(&mut self) -> Result<(), std::io::Error> {
-        let mut encoder = GzEncoder::new(&mut self.file, flate2::Compression::default());
+        let mut encoder = DeflateEncoder::new(&mut self.file, flate2::Compression::default());
         for entry in &self.entries {
             Self::encode_entry_metadata(&mut encoder, entry)?;
         }
@@ -395,28 +427,25 @@ impl Archive {
 
         writer.write_all(&buffer)?;
 
+        let (uid, gid) = entry.owner();
+        writer.write_all(&varint::encode_u32(uid))?;
+        writer.write_all(&varint::encode_u32(gid))?;
+        writer.write_all(&varint::encode_i64(entry.mtime()))?;
+
         match entry {
             Entry::File(file_entry) => {
-                writer.write_all(VarInt::new(file_entry.size).encode().as_slice())?;
-                writer.write_all(VarInt::new(file_entry.offset).encode().as_slice())?;
+                writer.write_all(&varint::encode_u64(file_entry.size))?;
+                writer.write_all(&varint::encode_u64(file_entry.offset))?;
             }
             Entry::Directory(dir_entry) => {
-                writer.write_all(
-                    VarInt::new(dir_entry.entries.len() as u64)
-                        .encode()
-                        .as_slice(),
-                )?;
+                writer.write_all(&varint::encode_u64(dir_entry.entries.len() as u64))?;
 
                 for sub_entry in &dir_entry.entries {
                     Self::encode_entry_metadata(writer, sub_entry)?;
                 }
             }
             Entry::Symlink(link_entry) => {
-                writer.write_all(
-                    VarInt::new(link_entry.target.len() as u64)
-                        .encode()
-                        .as_slice(),
-                )?;
+                writer.write_all(&varint::encode_u64(link_entry.target.len() as u64))?;
                 writer.write_all(link_entry.target.as_bytes())?;
                 writer.write_all(&[link_entry.target_dir as u8])?;
             }
@@ -444,15 +473,21 @@ impl Archive {
             let mut buffer = vec![0; 1024 * 1024];
             let mut bytes_read = file.read(&mut buffer)?;
 
-            let compression = if metadata.len() > 16 {
-                CompressionFormat::Gzip
-            } else {
-                CompressionFormat::None
-            };
+            let compression = self.compression_callback.map_or(
+                if metadata.len() > 16 {
+                    CompressionFormat::Deflate
+                } else {
+                    CompressionFormat::None
+                },
+                |f| f(&path, &metadata),
+            );
+
             let entry = FileEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
                 file: self.file.try_clone()?,
+                owner: (metadata.uid(), metadata.gid()),
+                mtime: metadata.mtime(),
                 decoder: None,
                 size: metadata.len(),
                 offset: self.entries_offset,
@@ -467,6 +502,15 @@ impl Archive {
             }
 
             match compression {
+                CompressionFormat::None => loop {
+                    self.file.write_all(&buffer[..bytes_read])?;
+                    self.entries_offset += bytes_read as u64;
+
+                    bytes_read = file.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                },
                 CompressionFormat::Gzip => {
                     let mut encoder =
                         GzEncoder::new(&mut self.file, flate2::Compression::default());
@@ -482,15 +526,21 @@ impl Archive {
 
                     self.entries_offset = self.file.stream_position()?;
                 }
-                CompressionFormat::None => loop {
-                    self.file.write_all(&buffer[..bytes_read])?;
-                    self.entries_offset += bytes_read as u64;
+                CompressionFormat::Deflate => {
+                    let mut encoder =
+                        DeflateEncoder::new(&mut self.file, flate2::Compression::default());
+                    loop {
+                        encoder.write_all(&buffer[..bytes_read])?;
 
-                    bytes_read = file.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
+                        bytes_read = file.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
                     }
-                },
+                    encoder.finish()?;
+
+                    self.entries_offset = self.file.stream_position()?;
+                }
             }
         } else if metadata.is_dir() {
             let mut dir_entries = Vec::new();
@@ -501,6 +551,8 @@ impl Archive {
             let dir_entry = DirectoryEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
+                owner: (metadata.uid(), metadata.gid()),
+                mtime: metadata.mtime(),
                 entries: dir_entries,
             };
 
@@ -516,6 +568,8 @@ impl Archive {
             let link_entry = SymlinkEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
+                owner: (metadata.uid(), metadata.gid()),
+                mtime: metadata.mtime(),
                 target,
                 target_dir: std::fs::metadata(&path)?.is_dir(),
             };
@@ -546,15 +600,22 @@ impl Archive {
         let entry_type = (type_compression_mode >> 30) & 0b11;
         let compression = CompressionFormat::decode(((type_compression_mode >> 26) & 0b1111) as u8);
         let mode = decode_file_permissions(type_compression_mode & 0x3FFFFFFF);
-        let size = VarInt::decode(decoder)?;
+
+        let uid = varint::decode_u32(decoder);
+        let gid = varint::decode_u32(decoder);
+        let mtime = varint::decode_i64(decoder);
+
+        let size = varint::decode_u64(decoder);
 
         match entry_type {
             0 => {
-                let offset = VarInt::decode(decoder)?;
+                let offset = varint::decode_u64(decoder);
 
                 Ok(Entry::File(Box::new(FileEntry {
                     name,
                     mode,
+                    owner: (uid, gid),
+                    mtime,
                     file,
                     decoder: None,
                     size,
@@ -573,6 +634,8 @@ impl Archive {
                 Ok(Entry::Directory(DirectoryEntry {
                     name,
                     mode,
+                    owner: (uid, gid),
+                    mtime,
                     entries,
                 }))
             }
@@ -593,6 +656,8 @@ impl Archive {
                 Ok(Entry::Symlink(SymlinkEntry {
                     name,
                     mode,
+                    owner: (uid, gid),
+                    mtime,
                     target,
                     target_dir: metadata.is_dir(),
                 }))

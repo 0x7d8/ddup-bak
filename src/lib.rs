@@ -7,6 +7,7 @@ use std::{
     fmt::{Debug, Formatter},
     fs::{DirEntry, File, Permissions},
     io::{Read, Seek, SeekFrom, Write},
+    sync::Arc,
 };
 
 mod varint;
@@ -113,7 +114,7 @@ pub struct FileEntry {
     pub compression: CompressionFormat,
     pub size: u64,
 
-    file: File,
+    file: Arc<File>,
     decoder: Option<Box<dyn Read + Send>>,
     offset: u64,
     consumed: u64,
@@ -274,7 +275,7 @@ type CompressionFormatCallback =
     Option<fn(&std::path::PathBuf, &std::fs::Metadata) -> CompressionFormat>;
 
 pub struct Archive {
-    file: File,
+    file: Arc<File>,
     version: u8,
     compression_callback: CompressionFormatCallback,
 
@@ -302,7 +303,7 @@ impl Archive {
         file.sync_all().unwrap();
 
         Self {
-            file,
+            file: Arc::new(file),
             version: FILE_VERSION,
             compression_callback: None,
             entries: Vec::new(),
@@ -338,9 +339,9 @@ impl Archive {
         file.seek(SeekFrom::Start(entries_offset))?;
 
         let mut decoder = DeflateDecoder::new(file.try_clone()?);
+        let file = Arc::new(file);
         for _ in 0..entries_count {
-            let file_clone = file.try_clone()?;
-            let entry = Self::decode_entry(&mut decoder, file_clone)?;
+            let entry = Self::decode_entry(&mut decoder, file.clone())?;
             entries.push(entry);
         }
 
@@ -576,7 +577,7 @@ impl Archive {
             let entry = FileEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
-                file: self.file.try_clone()?,
+                file: self.file.clone(),
                 owner: metadata_owner(&metadata),
                 mtime: metadata_mtime(&metadata),
                 decoder: None,
@@ -634,7 +635,7 @@ impl Archive {
         Ok(())
     }
 
-    fn decode_entry<S: Read>(decoder: &mut S, file: File) -> Result<Entry, std::io::Error> {
+    fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> Result<Entry, std::io::Error> {
         let mut name_length = [0; 1];
         decoder.read_exact(&mut name_length)?;
         let name_length = name_length[0] as usize;
@@ -681,7 +682,7 @@ impl Archive {
             1 => {
                 let mut entries: Vec<Entry> = Vec::with_capacity(size as usize);
                 for _ in 0..size {
-                    let entry = Self::decode_entry(decoder, file.try_clone()?)?;
+                    let entry = Self::decode_entry(decoder, file.clone())?;
                     entries.push(entry);
                 }
 
@@ -698,14 +699,10 @@ impl Archive {
                 decoder.read_exact(&mut target_bytes)?;
 
                 let target = String::from_utf8(target_bytes).unwrap();
-                let target = std::path::PathBuf::from(target);
 
-                let target = target
-                    .canonicalize()
-                    .unwrap_or_else(|_| target.clone())
-                    .to_string_lossy()
-                    .to_string();
-                let metadata = std::fs::metadata(&target)?;
+                let mut target_dir_bytes = [0; 1];
+                decoder.read_exact(&mut target_dir_bytes)?;
+                let target_dir = target_dir_bytes[0] != 0;
 
                 Ok(Entry::Symlink(SymlinkEntry {
                     name,
@@ -713,7 +710,7 @@ impl Archive {
                     owner: (uid, gid),
                     mtime,
                     target,
-                    target_dir: metadata.is_dir(),
+                    target_dir,
                 }))
             }
             _ => panic!("Unsupported entry type"),

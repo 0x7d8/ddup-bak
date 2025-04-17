@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "ddup-bak"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "crc",
  "flate2",

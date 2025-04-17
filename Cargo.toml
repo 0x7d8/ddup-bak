@@ -1,7 +1,12 @@
 [package]
 name = "ddup-bak"
+description = "An archive format that supports multiple compression algorithms at once."
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+homepage = "https://github.com/0x7d8/ddup-bak"
+repository = "https://github.com/0x7d8/ddup-bak.git"
+categories = ["command-line-utilities", "compression"]
 
 [[bin]]
 name = "ddup-bak"

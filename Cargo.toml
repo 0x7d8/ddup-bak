@@ -1,0 +1,12 @@
+[package]
+name = "ddup-bak"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ddup-bak"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.1.1"
+positioned-io = "0.3.4"

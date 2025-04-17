@@ -3,13 +3,10 @@ use flate2::{
     write::{DeflateEncoder, GzEncoder},
 };
 use positioned_io::ReadAt;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     fmt::{Debug, Formatter},
     fs::{DirEntry, File, Permissions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
 };
 
 mod varint;
@@ -42,9 +39,12 @@ impl CompressionFormat {
     }
 }
 
+#[inline]
 fn encode_file_permissions(permissions: Permissions) -> u32 {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+
         permissions.mode()
     }
     #[cfg(windows)]
@@ -52,10 +52,12 @@ fn encode_file_permissions(permissions: Permissions) -> u32 {
         if permissions.readonly() { 1 } else { 0 }
     }
 }
-
+#[inline]
 fn decode_file_permissions(mode: u32) -> Permissions {
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+
         Permissions::from_mode(mode)
     }
     #[cfg(windows)]
@@ -68,6 +70,35 @@ fn decode_file_permissions(mode: u32) -> Permissions {
         }
 
         permissions
+    }
+}
+
+#[inline]
+fn metadata_owner(_metadata: &std::fs::Metadata) -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        (_metadata.uid(), _metadata.gid())
+    }
+    #[cfg(windows)]
+    {
+        (0, 0)
+    }
+}
+#[inline]
+fn metadata_mtime(metadata: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.mtime()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        metadata.last_write_time() as i64
     }
 }
 
@@ -486,8 +517,8 @@ impl Archive {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
                 file: self.file.try_clone()?,
-                owner: (metadata.uid(), metadata.gid()),
-                mtime: metadata.mtime(),
+                owner: metadata_owner(&metadata),
+                mtime: metadata_mtime(&metadata),
                 decoder: None,
                 size: metadata.len(),
                 offset: self.entries_offset,
@@ -551,8 +582,8 @@ impl Archive {
             let dir_entry = DirectoryEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
-                owner: (metadata.uid(), metadata.gid()),
-                mtime: metadata.mtime(),
+                owner: metadata_owner(&metadata),
+                mtime: metadata_mtime(&metadata),
                 entries: dir_entries,
             };
 
@@ -568,8 +599,8 @@ impl Archive {
             let link_entry = SymlinkEntry {
                 name: file_name.to_string(),
                 mode: metadata.permissions(),
-                owner: (metadata.uid(), metadata.gid()),
-                mtime: metadata.mtime(),
+                owner: metadata_owner(&metadata),
+                mtime: metadata_mtime(&metadata),
                 target,
                 target_dir: std::fs::metadata(&path)?.is_dir(),
             };

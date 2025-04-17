@@ -11,7 +11,8 @@ use std::{
 
 mod varint;
 
-pub const FILE_SIGNATURE: &[u8] = b"DDUPBAK\0";
+pub const FILE_SIGNATURE: [u8; 7] = *b"DDUPBAK";
+pub const FILE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompressionFormat {
@@ -107,6 +108,8 @@ pub struct FileEntry {
     pub mode: Permissions,
     pub owner: (u32, u32),
     pub mtime: i64,
+
+    pub crc32: u32,
     pub compression: CompressionFormat,
     pub size: u64,
 
@@ -123,9 +126,10 @@ impl Debug for FileEntry {
             .field("mode", &self.mode)
             .field("owner", &self.owner)
             .field("mtime", &self.mtime)
-            .field("size", &self.size)
             .field("offset", &self.offset)
+            .field("crc32", &self.crc32)
             .field("compression", &self.compression)
+            .field("size", &self.size)
             .finish()
     }
 }
@@ -263,12 +267,15 @@ impl Entry {
     }
 }
 
+pub const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+
 type ProgressCallback = Option<fn(&std::path::PathBuf)>;
 type CompressionFormatCallback =
     Option<fn(&std::path::PathBuf, &std::fs::Metadata) -> CompressionFormat>;
 
 pub struct Archive {
     file: File,
+    version: u8,
     compression_callback: CompressionFormatCallback,
 
     entries: Vec<Entry>,
@@ -278,6 +285,7 @@ pub struct Archive {
 impl Debug for Archive {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Archive")
+            .field("version", &self.version)
             .field("entries", &self.entries)
             .finish()
     }
@@ -289,11 +297,13 @@ impl Archive {
     /// The file is truncated to 0 bytes.
     pub fn new(mut file: File) -> Self {
         file.set_len(0).unwrap();
-        file.write_all(FILE_SIGNATURE).unwrap();
+        file.write_all(&FILE_SIGNATURE).unwrap();
+        file.write_all(&[FILE_VERSION]).unwrap();
         file.sync_all().unwrap();
 
         Self {
             file,
+            version: FILE_VERSION,
             compression_callback: None,
             entries: Vec::new(),
             entries_offset: 8,
@@ -308,12 +318,13 @@ impl Archive {
 
         let mut buffer = [0; 8];
         file.read_exact(&mut buffer)?;
-        if buffer != FILE_SIGNATURE {
+        if !buffer.starts_with(&FILE_SIGNATURE) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Invalid file signature",
             ));
         }
+        let version = buffer[7];
 
         file.read_exact_at(len - 16, &mut buffer)?;
         let entries_count = u64::from_le_bytes(buffer);
@@ -335,6 +346,7 @@ impl Archive {
 
         Ok(Self {
             file,
+            version,
             compression_callback: None,
             entries,
             entries_offset,
@@ -467,6 +479,7 @@ impl Archive {
             Entry::File(file_entry) => {
                 writer.write_all(&varint::encode_u64(file_entry.size))?;
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
+                writer.write_all(&file_entry.crc32.to_le_bytes())?;
             }
             Entry::Directory(dir_entry) => {
                 writer.write_all(&varint::encode_u64(dir_entry.entries.len() as u64))?;
@@ -513,27 +526,11 @@ impl Archive {
                 |f| f(&path, &metadata),
             );
 
-            let entry = FileEntry {
-                name: file_name.to_string(),
-                mode: metadata.permissions(),
-                file: self.file.try_clone()?,
-                owner: metadata_owner(&metadata),
-                mtime: metadata_mtime(&metadata),
-                decoder: None,
-                size: metadata.len(),
-                offset: self.entries_offset,
-                consumed: 0,
-                compression,
-            };
-
-            if let Some(entries) = entries {
-                entries.push(Entry::File(Box::new(entry)));
-            } else {
-                self.entries.push(Entry::File(Box::new(entry)));
-            }
-
+            let offset = self.entries_offset;
+            let mut crc32 = CRC32.digest();
             match compression {
                 CompressionFormat::None => loop {
+                    crc32.update(&buffer[..bytes_read]);
                     self.file.write_all(&buffer[..bytes_read])?;
                     self.entries_offset += bytes_read as u64;
 
@@ -546,6 +543,7 @@ impl Archive {
                     let mut encoder =
                         GzEncoder::new(&mut self.file, flate2::Compression::default());
                     loop {
+                        crc32.update(&buffer[..bytes_read]);
                         encoder.write_all(&buffer[..bytes_read])?;
 
                         bytes_read = file.read(&mut buffer)?;
@@ -561,6 +559,7 @@ impl Archive {
                     let mut encoder =
                         DeflateEncoder::new(&mut self.file, flate2::Compression::default());
                     loop {
+                        crc32.update(&buffer[..bytes_read]);
                         encoder.write_all(&buffer[..bytes_read])?;
 
                         bytes_read = file.read(&mut buffer)?;
@@ -572,6 +571,26 @@ impl Archive {
 
                     self.entries_offset = self.file.stream_position()?;
                 }
+            }
+
+            let entry = FileEntry {
+                name: file_name.to_string(),
+                mode: metadata.permissions(),
+                file: self.file.try_clone()?,
+                owner: metadata_owner(&metadata),
+                mtime: metadata_mtime(&metadata),
+                decoder: None,
+                crc32: crc32.finalize(),
+                size: metadata.len(),
+                offset,
+                consumed: 0,
+                compression,
+            };
+
+            if let Some(entries) = entries {
+                entries.push(Entry::File(Box::new(entry)));
+            } else {
+                self.entries.push(Entry::File(Box::new(entry)));
             }
         } else if metadata.is_dir() {
             let mut dir_entries = Vec::new();
@@ -641,6 +660,9 @@ impl Archive {
         match entry_type {
             0 => {
                 let offset = varint::decode_u64(decoder);
+                let mut crc32_bytes = [0; 4];
+                decoder.read_exact(&mut crc32_bytes)?;
+                let crc32 = u32::from_le_bytes(crc32_bytes);
 
                 Ok(Entry::File(Box::new(FileEntry {
                     name,
@@ -649,6 +671,7 @@ impl Archive {
                     mtime,
                     file,
                     decoder: None,
+                    crc32,
                     size,
                     offset,
                     consumed: 0,

@@ -181,7 +181,6 @@ impl Repository {
 
         let archive_path = self.archive_path(name);
         let archive_tmp_path = self.directory.join(".ddup-bak/archives-tmp").join(name);
-        let mut archive = Archive::new(File::create(&archive_path)?);
 
         std::fs::create_dir_all(&archive_tmp_path)?;
 
@@ -196,9 +195,10 @@ impl Repository {
             self.recursive_create_archive(entry, &archive_tmp_path, progress_chunking)?;
         }
 
-        for entry in std::fs::read_dir(&archive_tmp_path)?.flatten() {
-            archive.add_entry(entry, progress_archiving)?;
-        }
+        let mut archive = Archive::new(File::create(&archive_path)?);
+
+        let entries = std::fs::read_dir(&archive_tmp_path)?.flatten().collect::<Vec<_>>();
+        archive.add_entries(entries, progress_archiving)?;
 
         std::fs::remove_dir_all(&archive_tmp_path)?;
 

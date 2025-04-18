@@ -389,13 +389,16 @@ impl Archive {
     ///
     /// # Panics
     /// This function will panic if any filename is not valid UTF-8 or longer than 255 bytes.
-    pub fn add_entry(
+    pub fn add_entries(
         &mut self,
-        entry: DirEntry,
+        entries: Vec<DirEntry>,
         progress: ProgressCallback,
     ) -> Result<&mut Self, std::io::Error> {
         self.trim_end_header()?;
-        self.encode_entry(None, entry, progress)?;
+
+        for entry in entries {
+            self.encode_entry(None, entry, progress)?;
+        }
 
         self.write_end_header()?;
 
@@ -408,6 +411,8 @@ impl Archive {
         }
 
         self.file.set_len(self.entries_offset)?;
+        self.file.flush()?;
+        self.file.seek(SeekFrom::Start(self.entries_offset))?;
 
         Ok(())
     }
@@ -420,6 +425,7 @@ impl Archive {
 
         encoder.flush()?;
         encoder.finish()?;
+        self.file.flush()?;
 
         self.file
             .write_all(&(self.entries.len() as u64).to_le_bytes())?;

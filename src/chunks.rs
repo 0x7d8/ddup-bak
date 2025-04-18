@@ -86,8 +86,8 @@ impl ChunkIndex {
         let mut path = String::with_capacity(7 + 32 * 3 + 10);
         path.push_str("chunks/");
 
-        for item in hex_array.iter().take(31) {
-            path.push_str(&format!("{:02x}/", item[0] << 4 | item[1]));
+        for pair in hex_array.iter().take(31) {
+            path.push_str(&format!("{:02x}/", pair[0] << 4 | pair[1]));
         }
 
         path.push_str(&format!(

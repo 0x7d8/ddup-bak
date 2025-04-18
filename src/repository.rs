@@ -301,6 +301,8 @@ impl Repository {
             .join(".ddup-bak/archives-restored")
             .join(name);
 
+        std::fs::create_dir_all(&destination)?;
+
         for entry in archive.into_entries() {
             self.recursive_restore_archive(entry, &destination, progress)?;
         }

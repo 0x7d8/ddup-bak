@@ -418,11 +418,13 @@ impl Archive {
             Self::encode_entry_metadata(&mut encoder, entry)?;
         }
 
+        encoder.flush()?;
         encoder.finish()?;
 
         self.file
             .write_all(&(self.entries.len() as u64).to_le_bytes())?;
         self.file.write_all(&self.entries_offset.to_le_bytes())?;
+        self.file.flush()?;
         self.file.sync_all()?;
 
         Ok(())
@@ -518,19 +520,21 @@ impl Archive {
                 |f| f(&path, &metadata),
             );
 
-            let offset = self.entries_offset;
             let mut crc32 = CRC32.digest();
             match compression {
-                CompressionFormat::None => loop {
-                    crc32.update(&buffer[..bytes_read]);
-                    self.file.write_all(&buffer[..bytes_read])?;
-                    self.entries_offset += bytes_read as u64;
+                CompressionFormat::None => {
+                    loop {
+                        crc32.update(&buffer[..bytes_read]);
+                        self.file.write_all(&buffer[..bytes_read])?;
 
-                    bytes_read = file.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
+                        bytes_read = file.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
                     }
-                },
+
+                    self.file.flush()?;
+                }
                 CompressionFormat::Gzip => {
                     let mut encoder =
                         GzEncoder::new(&mut self.file, flate2::Compression::default());
@@ -543,9 +547,9 @@ impl Archive {
                             break;
                         }
                     }
-                    encoder.finish()?;
 
-                    self.entries_offset = self.file.stream_position()?;
+                    encoder.flush()?;
+                    encoder.finish()?;
                 }
                 CompressionFormat::Deflate => {
                     let mut encoder =
@@ -559,9 +563,9 @@ impl Archive {
                             break;
                         }
                     }
-                    encoder.finish()?;
 
-                    self.entries_offset = self.file.stream_position()?;
+                    encoder.flush()?;
+                    encoder.finish()?;
                 }
             }
 
@@ -574,10 +578,12 @@ impl Archive {
                 decoder: None,
                 crc32: crc32.finalize(),
                 size: metadata.len(),
-                offset,
+                offset: self.entries_offset,
                 consumed: 0,
                 compression,
             };
+
+            self.entries_offset = self.file.stream_position()?;
 
             if let Some(entries) = entries {
                 entries.push(Entry::File(Box::new(entry)));

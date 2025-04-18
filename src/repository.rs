@@ -5,7 +5,7 @@ use crate::{
 use std::{
     fs::{File, FileTimes},
     io::{BufWriter, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 pub type DeletionProgressCallback = Option<fn(u64, bool)>;
@@ -19,7 +19,7 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(directory: &PathBuf) -> std::io::Result<Self> {
+    pub fn new(directory: &Path) -> std::io::Result<Self> {
         let chunk_index = ChunkIndex::new(directory.join(".ddup-bak"))?;
         let mut ignored_files = Vec::new();
 
@@ -34,14 +34,14 @@ impl Repository {
         }
 
         Ok(Self {
-            directory: directory.clone(),
+            directory: directory.to_path_buf(),
             save_on_drop: true,
             chunk_index,
             ignored_files,
         })
     }
 
-    pub fn new_empty(directory: &PathBuf, chunk_size: usize, ignored_files: Vec<String>) -> Self {
+    pub fn new_empty(directory: &Path, chunk_size: usize, ignored_files: Vec<String>) -> Self {
         let chunk_index = ChunkIndex::new_empty(directory.join(".ddup-bak"), chunk_size);
 
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
@@ -51,7 +51,7 @@ impl Repository {
         std::fs::write(directory.join(".ddup-bak/ignored_files"), "").unwrap();
 
         Self {
-            directory: directory.clone(),
+            directory: directory.to_path_buf(),
             save_on_drop: true,
             chunk_index,
             ignored_files,
@@ -95,8 +95,8 @@ impl Repository {
 
         for entry in std::fs::read_dir(archive_dir)?.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".ddup") {
-                    archives.push(name[..name.len() - 5].to_string());
+                if let Some(stripped) = name.strip_suffix(".ddup") {
+                    archives.push(stripped.to_string());
                 }
             }
         }
@@ -107,14 +107,15 @@ impl Repository {
     fn recursive_create_archive(
         &mut self,
         entry: std::fs::DirEntry,
-        archive: &mut Archive,
-        temp_path: &PathBuf,
+        temp_path: &Path,
         progress_chunking: ProgressCallback,
     ) -> std::io::Result<()> {
         let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
 
-        progress_chunking.map(|f| f(&path));
+        if let Some(f) = progress_chunking {
+            f(&path)
+        }
 
         if path.is_file() {
             let chunks = self
@@ -131,7 +132,7 @@ impl Repository {
                             format!("Chunk not found: {:?}", chunk),
                         ))
                     },
-                    |id| Ok(id),
+                    Ok,
                 )?;
 
                 writer.write_all(&crate::varint::encode_u64(id))?;
@@ -143,7 +144,7 @@ impl Repository {
             std::fs::create_dir_all(&destination)?;
 
             for sub_entry in std::fs::read_dir(&path)?.flatten() {
-                self.recursive_create_archive(sub_entry, archive, &destination, progress_chunking)?;
+                self.recursive_create_archive(sub_entry, &destination, progress_chunking)?;
             }
         } else if path.is_symlink() {
             if let Ok(target) = std::fs::read_link(&path) {
@@ -192,12 +193,7 @@ impl Repository {
                 continue;
             }
 
-            self.recursive_create_archive(
-                entry,
-                &mut archive,
-                &archive_tmp_path,
-                progress_chunking,
-            )?;
+            self.recursive_create_archive(entry, &archive_tmp_path, progress_chunking)?;
         }
 
         for entry in std::fs::read_dir(&archive_tmp_path)?.flatten() {
@@ -212,12 +208,14 @@ impl Repository {
     fn recursive_restore_archive(
         &mut self,
         entry: crate::archive::Entry,
-        directory: &PathBuf,
+        directory: &Path,
         progress: ProgressCallback,
     ) -> std::io::Result<()> {
         let path = directory.join(entry.name());
 
-        progress.map(|f| f(&path));
+        if let Some(f) = progress {
+            f(&path)
+        }
 
         match entry {
             crate::archive::Entry::File(mut file_entry) => {
@@ -237,7 +235,7 @@ impl Repository {
                                 format!("Chunk not found: {}", chunk_id),
                             ))
                         },
-                        |file| Ok(file),
+                        Ok,
                     )?;
 
                     loop {
@@ -272,7 +270,7 @@ impl Repository {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
             }
             #[cfg(windows)]
-            crate::Entry::Symlink(link_entry) => {
+            crate::archive::Entry::Symlink(link_entry) => {
                 if link_entry.target_dir {
                     std::os::windows::fs::symlink_dir(link_entry.target, &path)?;
                 } else {
@@ -323,7 +321,9 @@ impl Repository {
                 }
 
                 if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id) {
-                    progress.map(|f| f(chunk_id, deleted));
+                    if let Some(f) = progress {
+                        f(chunk_id, deleted)
+                    }
                 }
             },
             crate::archive::Entry::Directory(dir_entry) => {

@@ -197,7 +197,9 @@ impl Repository {
 
         let mut archive = Archive::new(File::create(&archive_path)?);
 
-        let entries = std::fs::read_dir(&archive_tmp_path)?.flatten().collect::<Vec<_>>();
+        let entries = std::fs::read_dir(&archive_tmp_path)?
+            .flatten()
+            .collect::<Vec<_>>();
         archive.add_entries(entries, progress_archiving)?;
 
         std::fs::remove_dir_all(&archive_tmp_path)?;

@@ -69,14 +69,3 @@ pub fn decode_u64<S: Read>(stream: &mut S) -> u64 {
 
     result
 }
-
-#[inline]
-pub fn encode_i64(value: i64) -> Vec<u8> {
-    encode_u64(((value << 1) ^ (value >> 63)) as u64)
-}
-#[inline]
-pub fn decode_i64<S: Read>(stream: &mut S) -> i64 {
-    let value = decode_u64(stream);
-
-    ((value >> 1) as i64) ^ -((value & 1) as i64)
-}

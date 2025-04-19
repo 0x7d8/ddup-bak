@@ -145,14 +145,14 @@ impl Repository {
         path: &PathBuf,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
         let destination = temp_path.join(path.file_name().unwrap());
+        let metadata = path.symlink_metadata()?;
 
-        if path.is_file() {
+        if metadata.is_file() {
             let chunks = chunk_index.chunk_file(path, CompressionFormat::Deflate)?;
 
             let file = File::create(&destination)?;
-            let metadata = path.metadata()?;
 
             let mut writer = BufWriter::new(&file);
             for chunk in chunks {
@@ -182,13 +182,27 @@ impl Repository {
 
             writer.flush()?;
             file.sync_all()?;
-        } else if path.is_dir() {
+        } else if metadata.is_dir() {
             std::fs::create_dir_all(&destination)?;
-        } else if path.is_symlink() {
+            std::fs::set_permissions(&destination, metadata.permissions())?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                let (uid, gid) = (metadata.uid(), metadata.gid());
+                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+            }
+        } else if metadata.is_symlink() {
             if let Ok(target) = std::fs::read_link(path) {
                 #[cfg(unix)]
                 {
+                    use std::os::unix::fs::MetadataExt;
+
                     std::os::unix::fs::symlink(target, &destination)?;
+                    std::fs::set_permissions(&destination, metadata.permissions())?;
+                    let (uid, gid) = (metadata.uid(), metadata.gid());
+                    std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
                 }
                 #[cfg(windows)]
                 {
@@ -205,7 +219,7 @@ impl Repository {
             f(path)
         }
 
-        Ok(())
+        Ok(metadata.is_dir())
     }
 
     pub fn create_archive(
@@ -272,21 +286,25 @@ impl Repository {
 
                     match path_to_process {
                         Some(path) => {
-                            if let Err(e) = Self::recursive_create_archive(
+                            let is_dir = match Self::recursive_create_archive(
                                 &thread_chunk_index,
                                 &path,
                                 &thread_archive_tmp_path,
                                 progress_chunking,
                             ) {
-                                let mut error_guard = thread_errors.lock().unwrap();
-                                error_guard.push(e);
+                                Ok(is_dir) => is_dir,
+                                Err(e) => {
+                                    let mut error_guard = thread_errors.lock().unwrap();
+                                    error_guard.push(e);
 
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
-                            }
+                                    let mut done: std::sync::MutexGuard<'_, bool> =
+                                        thread_all_done.lock().unwrap();
+                                    *done = true;
+                                    break;
+                                }
+                            };
 
-                            if path.is_dir() {
+                            if is_dir {
                                 match std::fs::read_dir(&path) {
                                     Ok(entries) => {
                                         let mut queue = thread_work_queue.lock().unwrap();

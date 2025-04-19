@@ -27,8 +27,9 @@ fn main() {
         }
         "decode" => {
             let archive = std::env::args().nth(2).expect("No archive given");
+            let output_dir = std::env::args().nth(3).expect("No output directory given");
 
-            repository
+            let restored_output_dir = repository
                 .restore_archive(
                     &archive,
                     Some(|file| {
@@ -36,6 +37,26 @@ fn main() {
                     }),
                 )
                 .unwrap();
+
+            for entry in std::fs::read_dir(&output_dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.file_name().unwrap() == ".ddup-bak" {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).unwrap();
+                } else {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            }
+
+            for entry in std::fs::read_dir(restored_output_dir).unwrap().flatten() {
+                let path = entry.path();
+
+                let new_path = PathBuf::from(&output_dir).join(path.file_name().unwrap());
+                std::fs::rename(path, new_path).unwrap();
+            }
         }
         "nuke" => {
             let archive = std::env::args().nth(2).expect("No archive given");

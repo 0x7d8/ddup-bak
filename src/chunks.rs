@@ -81,7 +81,7 @@ impl ChunkIndex {
 
     #[inline]
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
-        let mut path = self.directory.clone();
+        let mut path = self.directory.join("chunks");
         for byte in chunk.iter().take(2) {
             path.push(format!("{:02x}", byte));
         }

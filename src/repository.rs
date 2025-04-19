@@ -336,7 +336,7 @@ impl Repository {
         &mut self,
         name: &str,
         progress: ProgressCallback,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<PathBuf> {
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -357,7 +357,7 @@ impl Repository {
             self.recursive_restore_archive(entry, &destination, progress)?;
         }
 
-        Ok(())
+        Ok(destination)
     }
 
     fn recursive_delete_archive(

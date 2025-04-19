@@ -36,6 +36,7 @@ fn main() {
                     Some(|file| {
                         println!("Restored file: {}", file.display());
                     }),
+                    8,
                 )
                 .unwrap();
 

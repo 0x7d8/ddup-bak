@@ -349,8 +349,8 @@ impl Repository {
         Ok(archive)
     }
 
-    pub fn recursive_restore_archive(
-        &mut self,
+    fn recursive_restore_archive(
+        chunk_index: &ChunkIndex,
         entry: Entry,
         directory: &Path,
         progress: ProgressCallback,
@@ -368,7 +368,7 @@ impl Repository {
                         break;
                     }
 
-                    let mut chunk = self.chunk_index.get_chunk_id_file(chunk_id).map_or_else(
+                    let mut chunk = chunk_index.get_chunk_id_file(chunk_id).map_or_else(
                         || {
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::NotFound,
@@ -410,7 +410,7 @@ impl Repository {
                 }
 
                 for sub_entry in dir_entry.entries {
-                    self.recursive_restore_archive(sub_entry, &path, progress)?;
+                    Self::recursive_restore_archive(chunk_index, sub_entry, &path, progress)?;
                 }
             }
             #[cfg(unix)]
@@ -444,7 +444,13 @@ impl Repository {
         &mut self,
         name: &str,
         progress: ProgressCallback,
+        threads: usize,
     ) -> std::io::Result<PathBuf> {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -461,11 +467,185 @@ impl Repository {
 
         std::fs::create_dir_all(&destination)?;
 
-        for entry in archive.into_entries() {
-            self.recursive_restore_archive(entry, &destination, progress)?;
+        let entries: Vec<Entry> = archive.into_entries();
+        let work_queue = Arc::new(Mutex::new(VecDeque::from(entries)));
+        let all_done = Arc::new(Mutex::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
+        let mut thread_handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let thread_work_queue = Arc::clone(&work_queue);
+            let thread_all_done = Arc::clone(&all_done);
+            let thread_errors = Arc::clone(&errors);
+            let thread_chunk_index = self.chunk_index.clone();
+            let thread_destination = destination.clone();
+
+            let handle = thread::spawn(move || {
+                loop {
+                    {
+                        let done = thread_all_done.lock().unwrap();
+                        if *done {
+                            break;
+                        }
+                    }
+
+                    let entry_to_process = {
+                        let mut queue = thread_work_queue.lock().unwrap();
+                        queue.pop_front()
+                    };
+
+                    match entry_to_process {
+                        Some(entry) => {
+                            if let Err(e) = Self::recursive_restore_archive(
+                                &thread_chunk_index,
+                                entry,
+                                &thread_destination,
+                                progress,
+                            ) {
+                                let mut error_guard = thread_errors.lock().unwrap();
+                                error_guard.push(e);
+
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            let queue = thread_work_queue.lock().unwrap();
+                            if queue.is_empty() {
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+
+                            drop(queue);
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+
+            thread_handles.push(handle);
+        }
+
+        for handle in thread_handles {
+            handle.join().unwrap();
+        }
+
+        {
+            let error_guard = errors.lock().unwrap();
+            if let Some(first_error) = error_guard.first() {
+                return Err(std::io::Error::new(
+                    first_error.kind(),
+                    format!("Error during archive restoration: {}", first_error),
+                ));
+            }
         }
 
         Ok(destination)
+    }
+
+    pub fn restore_entries(
+        &mut self,
+        name: &str,
+        entries: Vec<Entry>,
+        progress: ProgressCallback,
+        threads: usize,
+    ) -> std::io::Result<()> {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        if !self.list_archives()?.contains(&name.to_string()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Archive {} not found", name),
+            ));
+        }
+
+        let destination = self
+            .directory
+            .join(".ddup-bak/archives-restored")
+            .join(name);
+
+        std::fs::create_dir_all(&destination)?;
+
+        let work_queue = Arc::new(Mutex::new(VecDeque::from(entries)));
+        let all_done = Arc::new(Mutex::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
+        let mut thread_handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let thread_work_queue = Arc::clone(&work_queue);
+            let thread_all_done = Arc::clone(&all_done);
+            let thread_errors = Arc::clone(&errors);
+            let thread_chunk_index = self.chunk_index.clone();
+            let thread_destination = destination.clone();
+
+            let handle = thread::spawn(move || {
+                loop {
+                    {
+                        let done = thread_all_done.lock().unwrap();
+                        if *done {
+                            break;
+                        }
+                    }
+
+                    let entry_to_process = {
+                        let mut queue = thread_work_queue.lock().unwrap();
+                        queue.pop_front()
+                    };
+
+                    match entry_to_process {
+                        Some(entry) => {
+                            if let Err(e) = Self::recursive_restore_archive(
+                                &thread_chunk_index,
+                                entry,
+                                &thread_destination,
+                                progress,
+                            ) {
+                                let mut error_guard = thread_errors.lock().unwrap();
+                                error_guard.push(e);
+
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+                        }
+                        None => {
+                            let queue = thread_work_queue.lock().unwrap();
+                            if queue.is_empty() {
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+
+                            drop(queue);
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+
+            thread_handles.push(handle);
+        }
+
+        for handle in thread_handles {
+            handle.join().unwrap();
+        }
+
+        {
+            let error_guard = errors.lock().unwrap();
+            if let Some(first_error) = error_guard.first() {
+                return Err(std::io::Error::new(
+                    first_error.kind(),
+                    format!("Error during entries restoration: {}", first_error),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn recursive_delete_archive(

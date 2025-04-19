@@ -148,7 +148,9 @@ impl Repository {
         let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
 
-        progress_chunking.map(|f| f(&path));
+        if let Some(f) = progress_chunking {
+            f(&path)
+        }
 
         if path.is_file() {
             let chunks = self

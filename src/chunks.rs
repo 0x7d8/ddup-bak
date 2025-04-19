@@ -117,7 +117,9 @@ impl ChunkIndex {
     pub fn clean(&mut self, progress: DeletionProgressCallback) -> std::io::Result<()> {
         for (id, (chunk, count)) in &self.chunks {
             if *count == 0 {
-                progress.map(|f| f(*id, true));
+                if let Some(f) = progress {
+                    f(*id, true)
+                }
 
                 let mut path = self.path_from_chunk(chunk);
                 std::fs::remove_file(&path)?;

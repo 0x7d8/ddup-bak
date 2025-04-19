@@ -99,7 +99,6 @@ pub struct FileEntry {
     pub owner: (u32, u32),
     pub mtime: SystemTime,
 
-    pub crc32: u32,
     pub compression: CompressionFormat,
     pub size: u64,
 
@@ -117,7 +116,6 @@ impl Debug for FileEntry {
             .field("owner", &self.owner)
             .field("mtime", &self.mtime)
             .field("offset", &self.offset)
-            .field("crc32", &self.crc32)
             .field("compression", &self.compression)
             .field("size", &self.size)
             .finish()
@@ -256,8 +254,6 @@ impl Entry {
         }
     }
 }
-
-pub const CRC32: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
 
 pub type ProgressCallback = Option<fn(&std::path::PathBuf)>;
 type CompressionFormatCallback =
@@ -479,7 +475,6 @@ impl Archive {
             Entry::File(file_entry) => {
                 writer.write_all(&varint::encode_u64(file_entry.size))?;
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
-                writer.write_all(&file_entry.crc32.to_le_bytes())?;
             }
             Entry::Directory(dir_entry) => {
                 writer.write_all(&varint::encode_u64(dir_entry.entries.len() as u64))?;
@@ -526,11 +521,9 @@ impl Archive {
                 |f| f(&path, &metadata),
             );
 
-            let mut crc32 = CRC32.digest();
             match compression {
                 CompressionFormat::None => {
                     loop {
-                        crc32.update(&buffer[..bytes_read]);
                         self.file.write_all(&buffer[..bytes_read])?;
 
                         bytes_read = file.read(&mut buffer)?;
@@ -545,7 +538,6 @@ impl Archive {
                     let mut encoder =
                         GzEncoder::new(&mut self.file, flate2::Compression::default());
                     loop {
-                        crc32.update(&buffer[..bytes_read]);
                         encoder.write_all(&buffer[..bytes_read])?;
 
                         bytes_read = file.read(&mut buffer)?;
@@ -561,7 +553,6 @@ impl Archive {
                     let mut encoder =
                         DeflateEncoder::new(&mut self.file, flate2::Compression::default());
                     loop {
-                        crc32.update(&buffer[..bytes_read]);
                         encoder.write_all(&buffer[..bytes_read])?;
 
                         bytes_read = file.read(&mut buffer)?;
@@ -582,7 +573,6 @@ impl Archive {
                 owner: metadata_owner(&metadata),
                 mtime: metadata_mtime(&metadata),
                 decoder: None,
-                crc32: crc32.finalize(),
                 size: metadata.len(),
                 offset: self.entries_offset,
                 consumed: 0,
@@ -666,9 +656,6 @@ impl Archive {
         match entry_type {
             0 => {
                 let offset = varint::decode_u64(decoder);
-                let mut crc32_bytes = [0; 4];
-                decoder.read_exact(&mut crc32_bytes)?;
-                let crc32 = u32::from_le_bytes(crc32_bytes);
 
                 Ok(Entry::File(Box::new(FileEntry {
                     name,
@@ -677,7 +664,6 @@ impl Archive {
                     mtime,
                     file,
                     decoder: None,
-                    crc32,
                     size,
                     offset,
                     consumed: 0,

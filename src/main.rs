@@ -1,16 +1,12 @@
 use std::path::PathBuf;
 
-pub mod archive;
-pub mod chunks;
-mod varint;
-
 fn main() {
     let mode = std::env::args().nth(1).expect("No mode given");
 
     let mut repository = if std::path::Path::new(".ddup-bak").is_dir() {
-        ddup_bak::repository::Repository::new(&PathBuf::from(".")).unwrap()
+        ddup_bak::repository::Repository::open(&PathBuf::from(".")).unwrap()
     } else {
-        ddup_bak::repository::Repository::new_empty(&PathBuf::from("."), 1024 * 1024, vec![])
+        ddup_bak::repository::Repository::new(&PathBuf::from("."), 1024 * 1024, vec![])
     };
 
     match mode.as_str() {

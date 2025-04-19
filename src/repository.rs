@@ -19,8 +19,11 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn new(directory: &Path) -> std::io::Result<Self> {
-        let chunk_index = ChunkIndex::new(directory.join(".ddup-bak"))?;
+    /// Opens an existing repository.
+    /// The repository must be initialized with `new` before use.
+    /// The repository directory must contain a `.ddup-bak` directory.
+    pub fn open(directory: &Path) -> std::io::Result<Self> {
+        let chunk_index = ChunkIndex::open(directory.join(".ddup-bak"))?;
         let mut ignored_files = Vec::new();
 
         let ignored_files_path = directory.join(".ddup-bak/ignored_files");
@@ -41,8 +44,8 @@ impl Repository {
         })
     }
 
-    pub fn new_empty(directory: &Path, chunk_size: usize, ignored_files: Vec<String>) -> Self {
-        let chunk_index = ChunkIndex::new_empty(directory.join(".ddup-bak"), chunk_size);
+    pub fn new(directory: &Path, chunk_size: usize, ignored_files: Vec<String>) -> Self {
+        let chunk_index = ChunkIndex::new(directory.join(".ddup-bak"), chunk_size);
 
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
@@ -64,31 +67,48 @@ impl Repository {
             .join(format!("{}.ddup", name))
     }
 
+    /// Sets the save_on_drop flag.
+    /// If set to true, the repository will save all changes to disk when dropped.
+    /// If set to false, the repository will not save changes when dropped.
+    /// This is useful for testing purposes, where you may want to discard changes.
+    /// By default, this flag is set to true and should NOT be changed.
     pub fn set_save_on_drop(&mut self, save_on_drop: bool) {
         self.save_on_drop = save_on_drop;
         self.chunk_index.set_save_on_drop(save_on_drop);
     }
 
+    /// Adds a file to the ignored list.
+    /// If the file is already in the list, it does nothing.
+    /// The file is added as a relative path from the repository directory.
     pub fn add_ignored_file(&mut self, file: &str) {
         if !self.ignored_files.contains(&file.to_string()) {
             self.ignored_files.push(file.to_string());
         }
     }
 
+    /// Removes a file from the ignored list.
+    /// If the file is not in the list, it does nothing.
     pub fn remove_ignored_file(&mut self, file: &str) {
         if let Some(pos) = self.ignored_files.iter().position(|x| x == file) {
             self.ignored_files.remove(pos);
         }
     }
 
+    /// Checks if a file is ignored.
+    /// Returns true if the file is ignored, false otherwise.
     pub fn is_ignored(&self, file: &str) -> bool {
         self.ignored_files.contains(&file.to_string())
     }
 
+    /// Returns a reference to the list of ignored files.
     pub fn get_ignored_files(&self) -> &[String] {
         &self.ignored_files
     }
 
+    /// Lists all archives in the repository.
+    /// Returns a vector of archive names without the ".ddup" extension.
+    /// Example: "my_archive" instead of "my_archive.ddup".
+    /// The archives are stored in the ".ddup-bak/archives" directory.
     pub fn list_archives(&self) -> std::io::Result<Vec<String>> {
         let mut archives = Vec::new();
         let archive_dir = self.directory.join(".ddup-bak/archives");
@@ -104,6 +124,21 @@ impl Repository {
         Ok(archives)
     }
 
+    /// Gets an archive by name.
+    /// Do not use this method to extract data, the data is chunked and compressed.
+    /// Use `restore_archive` instead.
+    pub fn get_archive(&self, name: &str) -> std::io::Result<Archive> {
+        let archive_path = self.archive_path(name);
+
+        Archive::open(archive_path.to_str().unwrap())
+    }
+
+    pub fn clean(&mut self, progress: DeletionProgressCallback) -> std::io::Result<()> {
+        self.chunk_index.clean(progress)?;
+
+        Ok(())
+    }
+
     fn recursive_create_archive(
         &mut self,
         entry: std::fs::DirEntry,
@@ -113,9 +148,7 @@ impl Repository {
         let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
 
-        if let Some(f) = progress_chunking {
-            f(&path)
-        }
+        progress_chunking.map(|f| f(&path));
 
         if path.is_file() {
             let chunks = self
@@ -136,6 +169,19 @@ impl Repository {
                 )?;
 
                 writer.write_all(&crate::varint::encode_u64(id))?;
+            }
+
+            let metadata = path.metadata()?;
+
+            file.set_permissions(metadata.permissions())?;
+            file.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                let (uid, gid) = (metadata.uid(), metadata.gid());
+                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
             }
 
             writer.flush()?;
@@ -324,7 +370,7 @@ impl Repository {
                     break;
                 }
 
-                if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id) {
+                if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true) {
                     if let Some(f) = progress {
                         f(chunk_id, deleted)
                     }

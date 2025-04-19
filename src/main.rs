@@ -17,11 +17,12 @@ fn main() {
                 .create_archive(
                     &archive,
                     Some(|file| {
-                        println!("Chunking file: {}", file.display());
+                        println!("Chunked file: {}", file.display());
                     }),
                     Some(|file| {
-                        println!("Archiving file: {}", file.display());
+                        println!("Archived file: {}", file.display());
                     }),
+                    8,
                 )
                 .unwrap();
         }
@@ -33,7 +34,7 @@ fn main() {
                 .restore_archive(
                     &archive,
                     Some(|file| {
-                        println!("Restoring file: {}", file.display());
+                        println!("Restored file: {}", file.display());
                     }),
                 )
                 .unwrap();
@@ -75,7 +76,7 @@ fn main() {
                 .unwrap();
         }
         _ => {
-            println!("Invalid mode. Use 'encode' or 'decode'.");
+            println!("Invalid mode. Use 'encode' or 'decode' or 'nuke'.");
         }
     }
 }

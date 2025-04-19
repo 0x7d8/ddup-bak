@@ -90,10 +90,6 @@ fn metadata_owner(_metadata: &std::fs::Metadata) -> (u32, u32) {
         (0, 0)
     }
 }
-#[inline]
-fn metadata_mtime(metadata: &std::fs::Metadata) -> SystemTime {
-    metadata.modified().unwrap()
-}
 
 pub struct FileEntry {
     pub name: String,
@@ -108,6 +104,23 @@ pub struct FileEntry {
     decoder: Option<Box<dyn Read + Send>>,
     offset: u64,
     consumed: u64,
+}
+
+impl Clone for FileEntry {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            mode: self.mode.clone(),
+            owner: self.owner,
+            mtime: self.mtime,
+            compression: self.compression,
+            size: self.size,
+            file: self.file.clone(),
+            decoder: None,
+            offset: self.offset,
+            consumed: 0,
+        }
+    }
 }
 
 impl Debug for FileEntry {
@@ -188,7 +201,7 @@ impl Read for FileEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DirectoryEntry {
     pub name: String,
     pub mode: Permissions,
@@ -197,7 +210,7 @@ pub struct DirectoryEntry {
     pub entries: Vec<Entry>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SymlinkEntry {
     pub name: String,
     pub mode: Permissions,
@@ -207,7 +220,7 @@ pub struct SymlinkEntry {
     pub target_dir: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Entry {
     File(Box<FileEntry>),
     Directory(Box<DirectoryEntry>),
@@ -548,16 +561,13 @@ impl Archive {
         progress: ProgressCallback,
     ) -> Result<(), std::io::Error> {
         let path = fs_entry.path();
-        if let Some(f) = progress {
-            f(&path)
-        }
 
-        let file_name = path.file_name().unwrap().to_string_lossy();
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let metadata = path.symlink_metadata()?;
 
         if metadata.is_file() {
             let mut file = File::open(&path)?;
-            let mut buffer = vec![0; 1024 * 1024];
+            let mut buffer = [0; 4096];
             let mut bytes_read = file.read(&mut buffer)?;
 
             let compression = self.compression_callback.map_or(
@@ -615,11 +625,11 @@ impl Archive {
             }
 
             let entry = FileEntry {
-                name: file_name.to_string(),
+                name: file_name,
                 mode: metadata.permissions(),
                 file: self.file.clone(),
                 owner: metadata_owner(&metadata),
-                mtime: metadata_mtime(&metadata),
+                mtime: metadata.modified()?,
                 decoder: None,
                 size: metadata.len(),
                 offset: self.entries_offset,
@@ -641,10 +651,10 @@ impl Archive {
             }
 
             let dir_entry = DirectoryEntry {
-                name: file_name.to_string(),
+                name: file_name,
                 mode: metadata.permissions(),
                 owner: metadata_owner(&metadata),
-                mtime: metadata_mtime(&metadata),
+                mtime: metadata.modified()?,
                 entries: dir_entries,
             };
 
@@ -654,23 +664,28 @@ impl Archive {
                 self.entries.push(Entry::Directory(Box::new(dir_entry)));
             }
         } else if metadata.is_symlink() {
-            let target = std::fs::read_link(&path)?;
-            let target = target.to_string_lossy().to_string();
+            if let Ok(target) = std::fs::read_link(&path) {
+                let target = target.to_string_lossy().to_string();
 
-            let link_entry = SymlinkEntry {
-                name: file_name.to_string(),
-                mode: metadata.permissions(),
-                owner: metadata_owner(&metadata),
-                mtime: metadata_mtime(&metadata),
-                target,
-                target_dir: std::fs::metadata(&path)?.is_dir(),
-            };
+                let link_entry = SymlinkEntry {
+                    name: file_name,
+                    mode: metadata.permissions(),
+                    owner: metadata_owner(&metadata),
+                    mtime: metadata.modified()?,
+                    target,
+                    target_dir: std::fs::metadata(&path)?.is_dir(),
+                };
 
-            if let Some(entries) = entries {
-                entries.push(Entry::Symlink(Box::new(link_entry)));
-            } else {
-                self.entries.push(Entry::Symlink(Box::new(link_entry)));
+                if let Some(entries) = entries {
+                    entries.push(Entry::Symlink(Box::new(link_entry)));
+                } else {
+                    self.entries.push(Entry::Symlink(Box::new(link_entry)));
+                }
             }
+        }
+
+        if let Some(f) = progress {
+            f(&path)
         }
 
         Ok(())

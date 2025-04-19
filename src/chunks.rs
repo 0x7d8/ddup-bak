@@ -9,18 +9,20 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::PathBuf,
+    sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
 
 pub type ChunkHash = [u8; 32];
 
+#[derive(Debug, Clone)]
 pub struct ChunkIndex {
     pub directory: PathBuf,
     pub save_on_drop: bool,
 
-    next_id: u64,
-    deleted_chunks: VecDeque<u64>,
-    chunks: HashMap<u64, (ChunkHash, u64)>,
-    chunk_hashes: HashMap<ChunkHash, u64>,
+    next_id: Arc<AtomicU64>,
+    deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
+    chunks: Arc<RwLock<HashMap<u64, (ChunkHash, u64)>>>,
+    chunk_hashes: Arc<RwLock<HashMap<ChunkHash, u64>>>,
     chunk_size: usize,
 }
 
@@ -29,10 +31,10 @@ impl ChunkIndex {
         ChunkIndex {
             directory,
             save_on_drop: true,
-            next_id: 1,
-            deleted_chunks: VecDeque::new(),
-            chunks: HashMap::new(),
-            chunk_hashes: HashMap::new(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
+            chunks: Arc::new(RwLock::new(HashMap::new())),
+            chunk_hashes: Arc::new(RwLock::new(HashMap::new())),
             chunk_size,
         }
     }
@@ -49,19 +51,13 @@ impl ChunkIndex {
         let chunk_count = u64::from_le_bytes(buffer[12..20].try_into().unwrap()) as usize;
         let next_id = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
 
-        let mut chunk_index = ChunkIndex {
-            directory,
-            save_on_drop: true,
-            next_id,
-            deleted_chunks: VecDeque::with_capacity(deleted_chunks),
-            chunks: HashMap::with_capacity(chunk_count),
-            chunk_hashes: HashMap::with_capacity(chunk_count),
-            chunk_size,
-        };
+        let mut result_deleted_chunks = VecDeque::with_capacity(deleted_chunks);
+        let mut result_chunks = HashMap::with_capacity(chunk_count);
+        let mut result_chunk_hashes = HashMap::with_capacity(chunk_count);
 
         for _ in 0..deleted_chunks {
             let id = varint::decode_u64(&mut decoder);
-            chunk_index.deleted_chunks.push_back(id);
+            result_deleted_chunks.push_back(id);
         }
 
         loop {
@@ -72,11 +68,20 @@ impl ChunkIndex {
 
             let id = varint::decode_u64(&mut decoder);
             let count = varint::decode_u64(&mut decoder);
-            chunk_index.chunks.insert(id, (buffer, count));
-            chunk_index.chunk_hashes.insert(buffer, id);
+
+            result_chunks.insert(id, (buffer, count));
+            result_chunk_hashes.insert(buffer, id);
         }
 
-        Ok(chunk_index)
+        Ok(Self {
+            directory,
+            save_on_drop: true,
+            next_id: Arc::new(AtomicU64::new(next_id)),
+            deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
+            chunks: Arc::new(RwLock::new(result_chunks)),
+            chunk_hashes: Arc::new(RwLock::new(result_chunk_hashes)),
+            chunk_size,
+        })
     }
 
     #[inline]
@@ -104,18 +109,24 @@ impl ChunkIndex {
 
     #[inline]
     pub fn references(&self, chunk: &ChunkHash) -> u64 {
-        let id = self.chunk_hashes.get(chunk);
+        let id = self.chunk_hashes.read().unwrap();
+        let id = id.get(chunk);
 
         let id = match id {
             Some(id) => id,
             None => return 0,
         };
 
-        self.chunks.get(id).copied().map_or(0, |(_, count)| count)
+        self.chunks
+            .read()
+            .unwrap()
+            .get(id)
+            .copied()
+            .map_or(0, |(_, count)| count)
     }
 
     pub fn clean(&mut self, progress: DeletionProgressCallback) -> std::io::Result<()> {
-        for (id, (chunk, count)) in &self.chunks {
+        for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
             if *count == 0 {
                 if let Some(f) = progress {
                     f(*id, true)
@@ -124,7 +135,7 @@ impl ChunkIndex {
                 let mut path = self.path_from_chunk(chunk);
                 std::fs::remove_file(&path)?;
 
-                self.chunk_hashes.remove(chunk);
+                self.chunk_hashes.write().unwrap().remove(chunk);
 
                 while let Some(parent) = path.parent() {
                     if parent == self.directory {
@@ -140,25 +151,29 @@ impl ChunkIndex {
                     path = parent.to_path_buf();
                 }
 
-                self.deleted_chunks.push_back(*id);
+                self.deleted_chunks.lock().unwrap().push_back(*id);
             }
         }
 
-        self.chunks.retain(|_, (_, count)| *count > 0);
+        self.chunks
+            .write()
+            .unwrap()
+            .retain(|_, (_, count)| *count > 0);
 
         Ok(())
     }
 
     #[inline]
     pub fn dereference_chunk_id(&mut self, chunk_id: u64, clean: bool) -> Option<bool> {
-        let (_, count) = self.chunks.get_mut(&chunk_id)?;
+        let mut count = self.chunks.write().unwrap();
+        let (_, count) = count.get_mut(&chunk_id)?;
         *count -= 1;
 
         if *count == 0 && clean {
-            let (chunk, _) = *self.chunks.get(&chunk_id)?;
+            let (chunk, _) = *self.chunks.read().unwrap().get(&chunk_id)?;
 
-            self.chunks.remove(&chunk_id);
-            self.chunk_hashes.remove(&chunk);
+            self.chunks.write().unwrap().remove(&chunk_id);
+            self.chunk_hashes.write().unwrap().remove(&chunk);
 
             let mut path = self.path_from_chunk(&chunk);
             std::fs::remove_file(&path).ok()?;
@@ -177,7 +192,7 @@ impl ChunkIndex {
                 path = parent.to_path_buf();
             }
 
-            self.deleted_chunks.push_back(chunk_id);
+            self.deleted_chunks.lock().unwrap().push_back(chunk_id);
 
             return Some(true);
         }
@@ -187,7 +202,8 @@ impl ChunkIndex {
 
     #[inline]
     pub fn get_chunk_id_file(&self, chunk_id: u64) -> Option<Box<dyn Read + Send>> {
-        let (chunk, _) = self.chunks.get(&chunk_id)?;
+        let chunk = self.chunks.read().unwrap();
+        let (chunk, _) = chunk.get(&chunk_id)?;
         let path = self.path_from_chunk(chunk);
 
         let mut file = File::open(path).ok()?;
@@ -213,43 +229,53 @@ impl ChunkIndex {
 
     #[inline]
     pub fn get_chunk_id(&self, chunk: &ChunkHash) -> Option<u64> {
-        self.chunk_hashes.get(chunk).copied()
+        self.chunk_hashes.read().unwrap().get(chunk).copied()
     }
 
     #[inline]
-    fn next_id(&mut self) -> u64 {
-        if let Some(id) = self.deleted_chunks.pop_front() {
+    fn next_id(&self) -> u64 {
+        if let Some(id) = self.deleted_chunks.lock().unwrap().pop_front() {
             return id;
         }
 
-        let id = self.next_id;
-        self.next_id += 1;
-
-        id
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn add_chunk(
-        &mut self,
+        &self,
         chunk: &ChunkHash,
         data: &[u8],
         compression: CompressionFormat,
     ) -> std::io::Result<()> {
-        let id = match self.chunk_hashes.get(chunk) {
-            Some(id) => *id,
+        let id = self.chunk_hashes.read().unwrap().get(chunk).copied();
+        let id = match id {
+            Some(id) => id,
             None => {
                 let id = self.next_id();
-                self.chunk_hashes.insert(*chunk, id);
+                self.chunk_hashes.write().unwrap().insert(*chunk, id);
 
                 id
             }
         };
 
-        let (_, count) = self.chunks.entry(id).or_insert((*chunk, 0));
-        *count += 1;
+        let count = self.chunks.read().unwrap().get(&id).copied();
+        let (_, count) = match count {
+            Some((_, count)) => (chunk, count),
+            None => {
+                self.chunks.write().unwrap().insert(id, (*chunk, 0));
 
-        if *count > 1 {
+                (chunk, 0)
+            }
+        };
+
+        if count > 0 {
             return Ok(());
         }
+
+        self.chunks.write().unwrap().entry(id).and_modify(|e| {
+            e.1 += 1;
+        });
 
         let path = self.path_from_chunk(chunk);
 
@@ -278,7 +304,7 @@ impl ChunkIndex {
     }
 
     pub fn chunk_file(
-        &mut self,
+        &self,
         path: &PathBuf,
         compression: CompressionFormat,
     ) -> std::io::Result<Vec<ChunkHash>> {
@@ -314,21 +340,28 @@ impl Drop for ChunkIndex {
         let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
 
         encoder
-            .write_all(&(self.deleted_chunks.len() as u64).to_le_bytes())
+            .write_all(&(self.deleted_chunks.lock().unwrap().len() as u64).to_le_bytes())
             .unwrap();
         encoder
             .write_all(&(self.chunk_size as u32).to_le_bytes())
             .unwrap();
         encoder
-            .write_all(&(self.chunks.len() as u64).to_le_bytes())
+            .write_all(&(self.chunks.read().unwrap().len() as u64).to_le_bytes())
             .unwrap();
-        encoder.write_all(&self.next_id.to_le_bytes()).unwrap();
+        encoder
+            .write_all(
+                &self
+                    .next_id
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_le_bytes(),
+            )
+            .unwrap();
 
-        for id in &self.deleted_chunks {
+        for id in self.deleted_chunks.lock().unwrap().iter() {
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
         }
 
-        for (id, (chunk, count)) in &self.chunks {
+        for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
             encoder.write_all(chunk).unwrap();
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
             encoder.write_all(&varint::encode_u64(*count)).unwrap();

@@ -1,6 +1,7 @@
 use crate::{
-    archive::{Archive, CompressionFormat, ProgressCallback},
+    archive::{Archive, CompressionFormat, Entry, ProgressCallback},
     chunks::ChunkIndex,
+    varint,
 };
 use std::{
     fs::{File, FileTimes},
@@ -140,29 +141,22 @@ impl Repository {
     }
 
     fn recursive_create_archive(
-        &mut self,
-        entry: std::fs::DirEntry,
+        chunk_index: &ChunkIndex,
+        path: &PathBuf,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
     ) -> std::io::Result<()> {
-        let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
 
-        if let Some(f) = progress_chunking {
-            f(&path)
-        }
-
         if path.is_file() {
-            let chunks = self
-                .chunk_index
-                .chunk_file(&path, CompressionFormat::Deflate)?;
+            let chunks = chunk_index.chunk_file(path, CompressionFormat::Deflate)?;
 
             let file = File::create(&destination)?;
             let metadata = path.metadata()?;
 
             let mut writer = BufWriter::new(&file);
             for chunk in chunks {
-                let id = self.chunk_index.get_chunk_id(&chunk).map_or_else(
+                let id = chunk_index.get_chunk_id(&chunk).map_or_else(
                     || {
                         Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -172,7 +166,7 @@ impl Repository {
                     Ok,
                 )?;
 
-                writer.write_all(&crate::varint::encode_u64(id))?;
+                writer.write_all(&varint::encode_u64(id))?;
             }
 
             file.set_permissions(metadata.permissions())?;
@@ -190,12 +184,8 @@ impl Repository {
             file.sync_all()?;
         } else if path.is_dir() {
             std::fs::create_dir_all(&destination)?;
-
-            for sub_entry in std::fs::read_dir(&path)?.flatten() {
-                self.recursive_create_archive(sub_entry, &destination, progress_chunking)?;
-            }
         } else if path.is_symlink() {
-            if let Ok(target) = std::fs::read_link(&path) {
+            if let Ok(target) = std::fs::read_link(path) {
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(target, &destination)?;
@@ -211,6 +201,10 @@ impl Repository {
             }
         }
 
+        if let Some(f) = progress_chunking {
+            f(path)
+        }
+
         Ok(())
     }
 
@@ -219,7 +213,13 @@ impl Repository {
         name: &str,
         progress_chunking: ProgressCallback,
         progress_archiving: ProgressCallback,
+        threads: usize,
     ) -> std::io::Result<Archive> {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
         if self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -232,6 +232,7 @@ impl Repository {
 
         std::fs::create_dir_all(&archive_tmp_path)?;
 
+        let mut initial_paths = Vec::new();
         for entry in std::fs::read_dir(&self.directory)?.flatten() {
             let path = entry.path();
             if self.is_ignored(path.to_str().unwrap())
@@ -240,7 +241,100 @@ impl Repository {
                 continue;
             }
 
-            self.recursive_create_archive(entry, &archive_tmp_path, progress_chunking)?;
+            initial_paths.push(path);
+        }
+
+        let work_queue = Arc::new(Mutex::new(VecDeque::from(initial_paths)));
+        let all_done = Arc::new(Mutex::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
+        let mut thread_handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let thread_work_queue = Arc::clone(&work_queue);
+            let thread_all_done = Arc::clone(&all_done);
+            let thread_errors = Arc::clone(&errors);
+            let thread_chunk_index = self.chunk_index.clone();
+            let thread_archive_tmp_path = archive_tmp_path.clone();
+
+            let handle = thread::spawn(move || {
+                loop {
+                    {
+                        let done = thread_all_done.lock().unwrap();
+                        if *done {
+                            break;
+                        }
+                    }
+
+                    let path_to_process = {
+                        let mut queue = thread_work_queue.lock().unwrap();
+                        queue.pop_front()
+                    };
+
+                    match path_to_process {
+                        Some(path) => {
+                            if let Err(e) = Self::recursive_create_archive(
+                                &thread_chunk_index,
+                                &path,
+                                &thread_archive_tmp_path,
+                                progress_chunking,
+                            ) {
+                                let mut error_guard = thread_errors.lock().unwrap();
+                                error_guard.push(e);
+
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+
+                            if path.is_dir() {
+                                match std::fs::read_dir(&path) {
+                                    Ok(entries) => {
+                                        let mut queue = thread_work_queue.lock().unwrap();
+                                        for entry in entries.flatten() {
+                                            queue.push_back(entry.path());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let mut error_guard = thread_errors.lock().unwrap();
+                                        error_guard.push(e);
+
+                                        let mut done = thread_all_done.lock().unwrap();
+                                        *done = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            let queue = thread_work_queue.lock().unwrap();
+                            if queue.is_empty() {
+                                let mut done = thread_all_done.lock().unwrap();
+                                *done = true;
+                                break;
+                            }
+
+                            drop(queue);
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+
+            thread_handles.push(handle);
+        }
+
+        for handle in thread_handles {
+            handle.join().unwrap();
+        }
+
+        {
+            let error_guard = errors.lock().unwrap();
+            if let Some(first_error) = error_guard.first() {
+                return Err(std::io::Error::new(
+                    first_error.kind(),
+                    format!("Error during archive creation: {}", first_error),
+                ));
+            }
         }
 
         let mut archive = Archive::new(File::create(&archive_path)?);
@@ -257,23 +351,19 @@ impl Repository {
 
     pub fn recursive_restore_archive(
         &mut self,
-        entry: crate::archive::Entry,
+        entry: Entry,
         directory: &Path,
         progress: ProgressCallback,
     ) -> std::io::Result<()> {
         let path = directory.join(entry.name());
 
-        if let Some(f) = progress {
-            f(&path)
-        }
-
         match entry {
-            crate::archive::Entry::File(mut file_entry) => {
+            Entry::File(mut file_entry) => {
                 let mut file = File::create(&path)?;
                 let mut buffer = [0; 4096];
 
                 loop {
-                    let chunk_id = crate::varint::decode_u64(&mut file_entry);
+                    let chunk_id = varint::decode_u64(&mut file_entry);
                     if chunk_id == 0 {
                         break;
                     }
@@ -308,7 +398,7 @@ impl Repository {
                     std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
                 }
             }
-            crate::archive::Entry::Directory(dir_entry) => {
+            Entry::Directory(dir_entry) => {
                 std::fs::create_dir_all(&path)?;
 
                 std::fs::set_permissions(&path, dir_entry.mode)?;
@@ -324,7 +414,7 @@ impl Repository {
                 }
             }
             #[cfg(unix)]
-            crate::archive::Entry::Symlink(link_entry) => {
+            Entry::Symlink(link_entry) => {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
                 std::fs::set_permissions(&path, link_entry.mode)?;
 
@@ -332,7 +422,7 @@ impl Repository {
                 std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
             }
             #[cfg(windows)]
-            crate::archive::Entry::Symlink(link_entry) => {
+            Entry::Symlink(link_entry) => {
                 if link_entry.target_dir {
                     std::os::windows::fs::symlink_dir(link_entry.target, &path)?;
                 } else {
@@ -341,6 +431,10 @@ impl Repository {
 
                 std::fs::set_permissions(&path, link_entry.mode)?;
             }
+        }
+
+        if let Some(f) = progress {
+            f(&path)
         }
 
         Ok(())
@@ -376,11 +470,11 @@ impl Repository {
 
     fn recursive_delete_archive(
         &mut self,
-        entry: crate::archive::Entry,
+        entry: Entry,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {
         match entry {
-            crate::archive::Entry::File(mut file_entry) => loop {
+            Entry::File(mut file_entry) => loop {
                 let chunk_id = crate::varint::decode_u64(&mut file_entry);
                 if chunk_id == 0 {
                     break;
@@ -392,7 +486,7 @@ impl Repository {
                     }
                 }
             },
-            crate::archive::Entry::Directory(dir_entry) => {
+            Entry::Directory(dir_entry) => {
                 for sub_entry in dir_entry.entries {
                     self.recursive_delete_archive(sub_entry, progress)?;
                 }

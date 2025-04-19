@@ -165,11 +165,13 @@ impl ChunkIndex {
 
     #[inline]
     pub fn dereference_chunk_id(&mut self, chunk_id: u64, clean: bool) -> Option<bool> {
-        let mut count = self.chunks.write().unwrap();
-        let (_, count) = count.get_mut(&chunk_id)?;
+        let mut chunks = self.chunks.write().unwrap();
+        let (_, count) = chunks.get_mut(&chunk_id)?;
         *count -= 1;
 
         if *count == 0 && clean {
+            drop(chunks);
+
             let (chunk, _) = *self.chunks.read().unwrap().get(&chunk_id)?;
 
             self.chunks.write().unwrap().remove(&chunk_id);

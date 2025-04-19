@@ -664,7 +664,7 @@ impl Archive {
                 self.entries.push(Entry::Directory(Box::new(dir_entry)));
             }
         } else if metadata.is_symlink() {
-            if let Ok(target) = std::fs::read_link(&path) {
+            if let Ok(Ok(target)) = std::fs::read_link(&path).map(|p| p.canonicalize()) {
                 let target = target.to_string_lossy().to_string();
 
                 let link_entry = SymlinkEntry {

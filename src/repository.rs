@@ -194,7 +194,7 @@ impl Repository {
                 std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
             }
         } else if metadata.is_symlink() {
-            if let Ok(target) = std::fs::read_link(path) {
+            if let Ok(Ok(target)) = std::fs::read_link(path).map(|p| p.canonicalize()) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;

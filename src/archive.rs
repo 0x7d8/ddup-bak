@@ -5,9 +5,11 @@ use flate2::{
 };
 use positioned_io::ReadAt;
 use std::{
+    ffi::OsStr,
     fmt::{Debug, Formatter},
     fs::{DirEntry, File, Permissions},
     io::{Read, Seek, SeekFrom, Write},
+    path::Path,
     sync::Arc,
     time::SystemTime,
 };
@@ -399,6 +401,52 @@ impl Archive {
         self.write_end_header()?;
 
         Ok(self)
+    }
+
+    fn recursive_find_archive_entry<'a>(
+        entry: &'a crate::archive::Entry,
+        entry_parts: &[&OsStr],
+    ) -> std::io::Result<Option<&'a crate::archive::Entry>> {
+        if entry_parts.is_empty() {
+            return Ok(None);
+        }
+
+        if Some(entry.name()) == entry_parts.last().map(|s| s.to_string_lossy()).as_deref() {
+            return Ok(Some(entry));
+        }
+
+        if let crate::archive::Entry::Directory(dir_entry) = entry {
+            for sub_entry in &dir_entry.entries {
+                if let Some(found) =
+                    Self::recursive_find_archive_entry(sub_entry, &entry_parts[1..])?
+                {
+                    return Ok(Some(found));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Finds an entry in the archive by name.
+    /// Returns `None` if the entry is not found.
+    /// The entry name is the path inside the archive.
+    /// Example: "world/user/level.dat" would be a valid entry name.
+    pub fn find_archive_entry(
+        &self,
+        entry_name: &Path,
+    ) -> std::io::Result<Option<&crate::archive::Entry>> {
+        let entry_parts = entry_name
+            .components()
+            .map(|c| c.as_os_str())
+            .collect::<Vec<&OsStr>>();
+        for entry in self.entries() {
+            if let Some(found) = Self::recursive_find_archive_entry(entry, &entry_parts)? {
+                return Ok(Some(found));
+            }
+        }
+
+        Ok(None)
     }
 
     fn trim_end_header(&mut self) -> Result<(), std::io::Error> {

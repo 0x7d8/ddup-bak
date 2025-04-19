@@ -158,6 +158,8 @@ impl Repository {
                 .chunk_file(&path, CompressionFormat::Deflate)?;
 
             let file = File::create(&destination)?;
+            let metadata = path.metadata()?;
+
             let mut writer = BufWriter::new(&file);
             for chunk in chunks {
                 let id = self.chunk_index.get_chunk_id(&chunk).map_or_else(
@@ -172,8 +174,6 @@ impl Repository {
 
                 writer.write_all(&crate::varint::encode_u64(id))?;
             }
-
-            let metadata = path.metadata()?;
 
             file.set_permissions(metadata.permissions())?;
             file.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
@@ -255,7 +255,7 @@ impl Repository {
         Ok(archive)
     }
 
-    fn recursive_restore_archive(
+    pub fn recursive_restore_archive(
         &mut self,
         entry: crate::archive::Entry,
         directory: &Path,
@@ -311,6 +311,14 @@ impl Repository {
             crate::archive::Entry::Directory(dir_entry) => {
                 std::fs::create_dir_all(&path)?;
 
+                std::fs::set_permissions(&path, dir_entry.mode)?;
+
+                #[cfg(unix)]
+                {
+                    let (uid, gid) = dir_entry.owner;
+                    std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
+                }
+
                 for sub_entry in dir_entry.entries {
                     self.recursive_restore_archive(sub_entry, &path, progress)?;
                 }
@@ -318,6 +326,10 @@ impl Repository {
             #[cfg(unix)]
             crate::archive::Entry::Symlink(link_entry) => {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
+                std::fs::set_permissions(&path, link_entry.mode)?;
+
+                let (uid, gid) = link_entry.owner;
+                std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
             }
             #[cfg(windows)]
             crate::archive::Entry::Symlink(link_entry) => {
@@ -326,6 +338,8 @@ impl Repository {
                 } else {
                     std::os::windows::fs::symlink_file(link_entry.target, &path)?;
                 }
+
+                std::fs::set_permissions(&path, link_entry.mode)?;
             }
         }
 
@@ -394,6 +408,13 @@ impl Repository {
         name: &str,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {
+        if !self.list_archives()?.contains(&name.to_string()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Archive {} not found", name),
+            ));
+        }
+
         let archive_path = self.archive_path(name);
         let archive = Archive::open(archive_path.to_str().unwrap())?;
 

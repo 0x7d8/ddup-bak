@@ -1,12 +1,12 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 fn main() {
     let mode = std::env::args().nth(1).expect("No mode given");
 
     let mut repository = if std::path::Path::new(".ddup-bak").is_dir() {
-        ddup_bak::repository::Repository::open(&PathBuf::from(".")).unwrap()
+        ddup_bak::repository::Repository::open(Path::new(".")).unwrap()
     } else {
-        ddup_bak::repository::Repository::new(&PathBuf::from("."), 1024 * 1024, vec![])
+        ddup_bak::repository::Repository::new(Path::new("."), 1024 * 1024, vec![])
     };
 
     match mode.as_str() {
@@ -54,7 +54,7 @@ fn main() {
             for entry in std::fs::read_dir(restored_output_dir).unwrap().flatten() {
                 let path = entry.path();
 
-                let new_path = PathBuf::from(&output_dir).join(path.file_name().unwrap());
+                let new_path = Path::new(&output_dir).join(path.file_name().unwrap());
                 std::fs::rename(path, new_path).unwrap();
             }
         }

@@ -184,6 +184,9 @@ impl Repository {
                 writer.write_all(&crate::varint::encode_u64(id))?;
             }
 
+            writer.flush()?;
+            file.sync_all()?;
+
             file.set_permissions(metadata.permissions())?;
             file.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
 
@@ -194,11 +197,16 @@ impl Repository {
                 let (uid, gid) = (metadata.uid(), metadata.gid());
                 std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
             }
-
-            writer.flush()?;
-            file.sync_all()?;
         } else if metadata.is_dir() {
             std::fs::create_dir_all(&destination)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+
+                let (uid, gid) = (metadata.uid(), metadata.gid());
+                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+            }
 
             for sub_entry in std::fs::read_dir(&path)?.flatten() {
                 scope.spawn({
@@ -227,7 +235,13 @@ impl Repository {
             if let Ok(target) = std::fs::read_link(&path) {
                 #[cfg(unix)]
                 {
+                    use std::os::unix::fs::MetadataExt;
+
                     std::os::unix::fs::symlink(target, &destination)?;
+
+                    std::fs::set_permissions(&destination, metadata.permissions())?;
+                    let (uid, gid) = (metadata.uid(), metadata.gid());
+                    std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
                 }
                 #[cfg(windows)]
                 {

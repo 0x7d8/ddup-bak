@@ -195,7 +195,7 @@ impl Repository {
                 use std::os::unix::fs::MetadataExt;
 
                 let (uid, gid) = (metadata.uid(), metadata.gid());
-                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+                std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
             }
         } else if metadata.is_dir() {
             std::fs::create_dir_all(&destination)?;
@@ -205,7 +205,7 @@ impl Repository {
                 use std::os::unix::fs::MetadataExt;
 
                 let (uid, gid) = (metadata.uid(), metadata.gid());
-                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+                std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
             }
 
             for sub_entry in std::fs::read_dir(&path)?.flatten() {
@@ -241,7 +241,7 @@ impl Repository {
 
                     std::fs::set_permissions(&destination, metadata.permissions())?;
                     let (uid, gid) = (metadata.uid(), metadata.gid());
-                    std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+                    std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
                 }
                 #[cfg(windows)]
                 {

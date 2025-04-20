@@ -9,6 +9,11 @@ fn main() {
         ddup_bak::repository::Repository::new(Path::new("."), 1024 * 1024, vec![])
     };
 
+    let threads = std::env::var("THREADS")
+        .unwrap_or_else(|_| "16".to_string())
+        .parse::<usize>()
+        .unwrap_or(16);
+
     match mode.as_str() {
         "encode" => {
             let archive = std::env::args().nth(2).expect("No archive given");
@@ -22,7 +27,7 @@ fn main() {
                     Some(|file| {
                         println!("Archived file: {}", file.display());
                     }),
-                    16,
+                    threads,
                 )
                 .unwrap();
         }
@@ -36,7 +41,7 @@ fn main() {
                     Some(|file| {
                         println!("Restored file: {}", file.display());
                     }),
-                    16,
+                    threads,
                 )
                 .unwrap();
 

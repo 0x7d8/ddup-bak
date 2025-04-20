@@ -22,7 +22,7 @@ fn main() {
                     Some(|file| {
                         println!("Archived file: {}", file.display());
                     }),
-                    8,
+                    16,
                 )
                 .unwrap();
         }
@@ -36,7 +36,7 @@ fn main() {
                     Some(|file| {
                         println!("Restored file: {}", file.display());
                     }),
-                    8,
+                    16,
                 )
                 .unwrap();
 

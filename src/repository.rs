@@ -1,12 +1,12 @@
 use crate::{
     archive::{Archive, CompressionFormat, Entry, ProgressCallback},
     chunks::ChunkIndex,
-    varint,
 };
 use std::{
     fs::{File, FileTimes},
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
 pub type DeletionProgressCallback = Option<fn(u64, bool)>;
@@ -73,18 +73,22 @@ impl Repository {
     /// If set to false, the repository will not save changes when dropped.
     /// This is useful for testing purposes, where you may want to discard changes.
     /// By default, this flag is set to true and should NOT be changed.
-    pub fn set_save_on_drop(&mut self, save_on_drop: bool) {
+    pub fn set_save_on_drop(&mut self, save_on_drop: bool) -> &mut Self {
         self.save_on_drop = save_on_drop;
         self.chunk_index.set_save_on_drop(save_on_drop);
+
+        self
     }
 
     /// Adds a file to the ignored list.
     /// If the file is already in the list, it does nothing.
     /// The file is added as a relative path from the repository directory.
-    pub fn add_ignored_file(&mut self, file: &str) {
+    pub fn add_ignored_file(&mut self, file: &str) -> &mut Self {
         if !self.ignored_files.contains(&file.to_string()) {
             self.ignored_files.push(file.to_string());
         }
+
+        self
     }
 
     /// Removes a file from the ignored list.
@@ -134,7 +138,7 @@ impl Repository {
         Archive::open(archive_path.to_str().unwrap())
     }
 
-    pub fn clean(&mut self, progress: DeletionProgressCallback) -> std::io::Result<()> {
+    pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
         self.chunk_index.clean(progress)?;
 
         Ok(())
@@ -142,15 +146,26 @@ impl Repository {
 
     fn recursive_create_archive(
         chunk_index: &ChunkIndex,
-        path: &PathBuf,
+        entry: std::fs::DirEntry,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
-    ) -> std::io::Result<bool> {
+        scope: &rayon::Scope,
+        error: Arc<RwLock<Option<std::io::Error>>>,
+    ) -> std::io::Result<()> {
+        let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
         let metadata = path.symlink_metadata()?;
 
+        if error.read().unwrap().is_some() {
+            return Ok(());
+        }
+
+        if let Some(f) = progress_chunking {
+            f(&path)
+        }
+
         if metadata.is_file() {
-            let chunks = chunk_index.chunk_file(path, CompressionFormat::Deflate)?;
+            let chunks = chunk_index.chunk_file(&path, CompressionFormat::Deflate)?;
 
             let file = File::create(&destination)?;
 
@@ -166,7 +181,7 @@ impl Repository {
                     Ok,
                 )?;
 
-                writer.write_all(&varint::encode_u64(id))?;
+                writer.write_all(&crate::varint::encode_u64(id))?;
             }
 
             file.set_permissions(metadata.permissions())?;
@@ -184,25 +199,35 @@ impl Repository {
             file.sync_all()?;
         } else if metadata.is_dir() {
             std::fs::create_dir_all(&destination)?;
-            std::fs::set_permissions(&destination, metadata.permissions())?;
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
+            for sub_entry in std::fs::read_dir(&path)?.flatten() {
+                scope.spawn({
+                    let error = Arc::clone(&error);
+                    let destination = destination.clone();
+                    let chunk_index = chunk_index.clone();
 
-                let (uid, gid) = (metadata.uid(), metadata.gid());
-                std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
+                    move |scope| {
+                        if let Err(err) = Self::recursive_create_archive(
+                            &chunk_index,
+                            sub_entry,
+                            &destination,
+                            progress_chunking,
+                            scope,
+                            Arc::clone(&error),
+                        ) {
+                            let mut error = error.write().unwrap();
+                            if error.is_none() {
+                                *error = Some(err);
+                            }
+                        }
+                    }
+                });
             }
         } else if metadata.is_symlink() {
-            if let Ok(Ok(target)) = std::fs::read_link(path).map(|p| p.canonicalize()) {
+            if let Ok(target) = std::fs::read_link(&path) {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::MetadataExt;
-
                     std::os::unix::fs::symlink(target, &destination)?;
-                    std::fs::set_permissions(&destination, metadata.permissions())?;
-                    let (uid, gid) = (metadata.uid(), metadata.gid());
-                    std::os::unix::fs::chown(&destination, Some(uid), Some(gid))?;
                 }
                 #[cfg(windows)]
                 {
@@ -215,11 +240,7 @@ impl Repository {
             }
         }
 
-        if let Some(f) = progress_chunking {
-            f(path)
-        }
-
-        Ok(metadata.is_dir())
+        Ok(())
     }
 
     pub fn create_archive(
@@ -229,11 +250,6 @@ impl Repository {
         progress_archiving: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
-        use std::collections::VecDeque;
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-        use std::time::Duration;
-
         if self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -246,113 +262,49 @@ impl Repository {
 
         std::fs::create_dir_all(&archive_tmp_path)?;
 
-        let mut initial_paths = Vec::new();
-        for entry in std::fs::read_dir(&self.directory)?.flatten() {
-            let path = entry.path();
-            if self.is_ignored(path.to_str().unwrap())
-                || path.file_name() == Some(".ddup-bak".as_ref())
-            {
-                continue;
-            }
+        let worker_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap(),
+        );
+        let error = Arc::new(RwLock::new(None));
 
-            initial_paths.push(path);
-        }
-
-        let work_queue = Arc::new(Mutex::new(VecDeque::from(initial_paths)));
-        let all_done = Arc::new(Mutex::new(false));
-        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
-        let mut thread_handles = Vec::with_capacity(threads);
-
-        for _ in 0..threads {
-            let thread_work_queue = Arc::clone(&work_queue);
-            let thread_all_done = Arc::clone(&all_done);
-            let thread_errors = Arc::clone(&errors);
-            let thread_chunk_index = self.chunk_index.clone();
-            let thread_archive_tmp_path = archive_tmp_path.clone();
-
-            let handle = thread::spawn(move || {
-                loop {
-                    {
-                        let done = thread_all_done.lock().unwrap();
-                        if *done {
-                            break;
-                        }
-                    }
-
-                    let path_to_process = {
-                        let mut queue = thread_work_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-
-                    match path_to_process {
-                        Some(path) => {
-                            let is_dir = match Self::recursive_create_archive(
-                                &thread_chunk_index,
-                                &path,
-                                &thread_archive_tmp_path,
-                                progress_chunking,
-                            ) {
-                                Ok(is_dir) => is_dir,
-                                Err(e) => {
-                                    let mut error_guard = thread_errors.lock().unwrap();
-                                    error_guard.push(e);
-
-                                    let mut done: std::sync::MutexGuard<'_, bool> =
-                                        thread_all_done.lock().unwrap();
-                                    *done = true;
-                                    break;
-                                }
-                            };
-
-                            if is_dir {
-                                match std::fs::read_dir(&path) {
-                                    Ok(entries) => {
-                                        let mut queue = thread_work_queue.lock().unwrap();
-                                        for entry in entries.flatten() {
-                                            queue.push_back(entry.path());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let mut error_guard = thread_errors.lock().unwrap();
-                                        error_guard.push(e);
-
-                                        let mut done = thread_all_done.lock().unwrap();
-                                        *done = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            let queue = thread_work_queue.lock().unwrap();
-                            if queue.is_empty() {
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
-                            }
-
-                            drop(queue);
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                    }
+        worker_pool.in_place_scope(|scope| {
+            for entry in std::fs::read_dir(&self.directory).unwrap().flatten() {
+                let path = entry.path();
+                if self.is_ignored(path.to_str().unwrap())
+                    || path.file_name() == Some(".ddup-bak".as_ref())
+                {
+                    continue;
                 }
-            });
 
-            thread_handles.push(handle);
-        }
+                scope.spawn({
+                    let error = Arc::clone(&error);
+                    let chunk_index = self.chunk_index.clone();
+                    let archive_tmp_path = archive_tmp_path.to_path_buf();
 
-        for handle in thread_handles {
-            handle.join().unwrap();
-        }
-
-        {
-            let error_guard = errors.lock().unwrap();
-            if let Some(first_error) = error_guard.first() {
-                return Err(std::io::Error::new(
-                    first_error.kind(),
-                    format!("Error during archive creation: {}", first_error),
-                ));
+                    move |scope| {
+                        if let Err(err) = Self::recursive_create_archive(
+                            &chunk_index,
+                            entry,
+                            &archive_tmp_path,
+                            progress_chunking,
+                            scope,
+                            Arc::clone(&error),
+                        ) {
+                            let mut error = error.write().unwrap();
+                            if error.is_none() {
+                                *error = Some(err);
+                            }
+                        }
+                    }
+                });
             }
+        });
+
+        if let Some(err) = error.write().unwrap().take() {
+            return Err(err);
         }
 
         let mut archive = Archive::new(File::create(&archive_path)?);
@@ -367,21 +319,27 @@ impl Repository {
         Ok(archive)
     }
 
-    fn recursive_restore_archive(
+    pub fn recursive_restore_archive(
         chunk_index: &ChunkIndex,
-        entry: Entry,
+        entry: crate::archive::Entry,
         directory: &Path,
         progress: ProgressCallback,
+        scope: &rayon::Scope,
+        error: Arc<RwLock<Option<std::io::Error>>>,
     ) -> std::io::Result<()> {
         let path = directory.join(entry.name());
 
+        if let Some(f) = progress {
+            f(&path)
+        }
+
         match entry {
-            Entry::File(mut file_entry) => {
+            crate::archive::Entry::File(mut file_entry) => {
                 let mut file = File::create(&path)?;
                 let mut buffer = [0; 4096];
 
                 loop {
-                    let chunk_id = varint::decode_u64(&mut file_entry);
+                    let chunk_id = crate::varint::decode_u64(&mut file_entry);
                     if chunk_id == 0 {
                         break;
                     }
@@ -416,7 +374,7 @@ impl Repository {
                     std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
                 }
             }
-            Entry::Directory(dir_entry) => {
+            crate::archive::Entry::Directory(dir_entry) => {
                 std::fs::create_dir_all(&path)?;
 
                 std::fs::set_permissions(&path, dir_entry.mode)?;
@@ -428,11 +386,31 @@ impl Repository {
                 }
 
                 for sub_entry in dir_entry.entries {
-                    Self::recursive_restore_archive(chunk_index, sub_entry, &path, progress)?;
+                    scope.spawn({
+                        let error = Arc::clone(&error);
+                        let chunk_index = chunk_index.clone();
+                        let path = path.to_path_buf();
+
+                        move |scope| {
+                            if let Err(err) = Self::recursive_restore_archive(
+                                &chunk_index,
+                                sub_entry,
+                                &path,
+                                progress,
+                                scope,
+                                Arc::clone(&error),
+                            ) {
+                                let mut error = error.write().unwrap();
+                                if error.is_none() {
+                                    *error = Some(err);
+                                }
+                            }
+                        }
+                    });
                 }
             }
             #[cfg(unix)]
-            Entry::Symlink(link_entry) => {
+            crate::archive::Entry::Symlink(link_entry) => {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
                 std::fs::set_permissions(&path, link_entry.mode)?;
 
@@ -440,7 +418,7 @@ impl Repository {
                 std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
             }
             #[cfg(windows)]
-            Entry::Symlink(link_entry) => {
+            crate::archive::Entry::Symlink(link_entry) => {
                 if link_entry.target_dir {
                     std::os::windows::fs::symlink_dir(link_entry.target, &path)?;
                 } else {
@@ -451,24 +429,15 @@ impl Repository {
             }
         }
 
-        if let Some(f) = progress {
-            f(&path)
-        }
-
         Ok(())
     }
 
     pub fn restore_archive(
-        &mut self,
+        &self,
         name: &str,
         progress: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
-        use std::collections::VecDeque;
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-        use std::time::Duration;
-
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -485,96 +454,54 @@ impl Repository {
 
         std::fs::create_dir_all(&destination)?;
 
-        let entries: Vec<Entry> = archive.into_entries();
-        let work_queue = Arc::new(Mutex::new(VecDeque::from(entries)));
-        let all_done = Arc::new(Mutex::new(false));
-        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
-        let mut thread_handles = Vec::with_capacity(threads);
+        let worker_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap(),
+        );
+        let error = Arc::new(RwLock::new(None));
 
-        for _ in 0..threads {
-            let thread_work_queue = Arc::clone(&work_queue);
-            let thread_all_done = Arc::clone(&all_done);
-            let thread_errors = Arc::clone(&errors);
-            let thread_chunk_index = self.chunk_index.clone();
-            let thread_destination = destination.clone();
+        worker_pool.in_place_scope(|scope| {
+            for entry in archive.into_entries() {
+                scope.spawn({
+                    let error = Arc::clone(&error);
+                    let chunk_index = self.chunk_index.clone();
+                    let destination = destination.clone();
 
-            let handle = thread::spawn(move || {
-                loop {
-                    {
-                        let done = thread_all_done.lock().unwrap();
-                        if *done {
-                            break;
-                        }
-                    }
-
-                    let entry_to_process = {
-                        let mut queue = thread_work_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-
-                    match entry_to_process {
-                        Some(entry) => {
-                            if let Err(e) = Self::recursive_restore_archive(
-                                &thread_chunk_index,
-                                entry,
-                                &thread_destination,
-                                progress,
-                            ) {
-                                let mut error_guard = thread_errors.lock().unwrap();
-                                error_guard.push(e);
-
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
+                    move |scope| {
+                        if let Err(err) = Self::recursive_restore_archive(
+                            &chunk_index,
+                            entry,
+                            &destination,
+                            progress,
+                            scope,
+                            Arc::clone(&error),
+                        ) {
+                            let mut error = error.write().unwrap();
+                            if error.is_none() {
+                                *error = Some(err);
                             }
                         }
-                        None => {
-                            let queue = thread_work_queue.lock().unwrap();
-                            if queue.is_empty() {
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
-                            }
-
-                            drop(queue);
-                            thread::sleep(Duration::from_millis(10));
-                        }
                     }
-                }
-            });
-
-            thread_handles.push(handle);
-        }
-
-        for handle in thread_handles {
-            handle.join().unwrap();
-        }
-
-        {
-            let error_guard = errors.lock().unwrap();
-            if let Some(first_error) = error_guard.first() {
-                return Err(std::io::Error::new(
-                    first_error.kind(),
-                    format!("Error during archive restoration: {}", first_error),
-                ));
+                });
             }
+        });
+
+        if let Some(err) = error.write().unwrap().take() {
+            return Err(err);
         }
 
         Ok(destination)
     }
 
     pub fn restore_entries(
-        &mut self,
+        &self,
         name: &str,
         entries: Vec<Entry>,
         progress: ProgressCallback,
         threads: usize,
-    ) -> std::io::Result<()> {
-        use std::collections::VecDeque;
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-        use std::time::Duration;
-
+    ) -> std::io::Result<PathBuf> {
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -589,81 +516,45 @@ impl Repository {
 
         std::fs::create_dir_all(&destination)?;
 
-        let work_queue = Arc::new(Mutex::new(VecDeque::from(entries)));
-        let all_done = Arc::new(Mutex::new(false));
-        let errors = Arc::new(Mutex::new(Vec::<std::io::Error>::new()));
-        let mut thread_handles = Vec::with_capacity(threads);
+        let worker_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap(),
+        );
+        let error = Arc::new(RwLock::new(None));
 
-        for _ in 0..threads {
-            let thread_work_queue = Arc::clone(&work_queue);
-            let thread_all_done = Arc::clone(&all_done);
-            let thread_errors = Arc::clone(&errors);
-            let thread_chunk_index = self.chunk_index.clone();
-            let thread_destination = destination.clone();
+        worker_pool.in_place_scope(|scope| {
+            for entry in entries {
+                scope.spawn({
+                    let error = Arc::clone(&error);
+                    let chunk_index = self.chunk_index.clone();
+                    let destination = destination.clone();
 
-            let handle = thread::spawn(move || {
-                loop {
-                    {
-                        let done = thread_all_done.lock().unwrap();
-                        if *done {
-                            break;
-                        }
-                    }
-
-                    let entry_to_process = {
-                        let mut queue = thread_work_queue.lock().unwrap();
-                        queue.pop_front()
-                    };
-
-                    match entry_to_process {
-                        Some(entry) => {
-                            if let Err(e) = Self::recursive_restore_archive(
-                                &thread_chunk_index,
-                                entry,
-                                &thread_destination,
-                                progress,
-                            ) {
-                                let mut error_guard = thread_errors.lock().unwrap();
-                                error_guard.push(e);
-
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
+                    move |scope| {
+                        if let Err(err) = Self::recursive_restore_archive(
+                            &chunk_index,
+                            entry,
+                            &destination,
+                            progress,
+                            scope,
+                            Arc::clone(&error),
+                        ) {
+                            let mut error = error.write().unwrap();
+                            if error.is_none() {
+                                *error = Some(err);
                             }
                         }
-                        None => {
-                            let queue = thread_work_queue.lock().unwrap();
-                            if queue.is_empty() {
-                                let mut done = thread_all_done.lock().unwrap();
-                                *done = true;
-                                break;
-                            }
-
-                            drop(queue);
-                            thread::sleep(Duration::from_millis(10));
-                        }
                     }
-                }
-            });
-
-            thread_handles.push(handle);
-        }
-
-        for handle in thread_handles {
-            handle.join().unwrap();
-        }
-
-        {
-            let error_guard = errors.lock().unwrap();
-            if let Some(first_error) = error_guard.first() {
-                return Err(std::io::Error::new(
-                    first_error.kind(),
-                    format!("Error during entries restoration: {}", first_error),
-                ));
+                });
             }
+        });
+
+        if let Some(err) = error.write().unwrap().take() {
+            return Err(err);
         }
 
-        Ok(())
+        Ok(destination)
     }
 
     fn recursive_delete_archive(

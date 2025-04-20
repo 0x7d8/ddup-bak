@@ -125,7 +125,7 @@ impl ChunkIndex {
             .map_or(0, |(_, count)| count)
     }
 
-    pub fn clean(&mut self, progress: DeletionProgressCallback) -> std::io::Result<()> {
+    pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
         for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
             if *count == 0 {
                 if let Some(f) = progress {

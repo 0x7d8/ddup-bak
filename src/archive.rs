@@ -98,6 +98,7 @@ pub struct FileEntry {
     pub mtime: SystemTime,
 
     pub compression: CompressionFormat,
+    pub size_compressed: Option<u64>,
     pub size: u64,
 
     file: Arc<File>,
@@ -114,6 +115,7 @@ impl Clone for FileEntry {
             owner: self.owner,
             mtime: self.mtime,
             compression: self.compression,
+            size_compressed: self.size_compressed,
             size: self.size,
             file: self.file.clone(),
             decoder: None,
@@ -159,10 +161,16 @@ impl Read for FileEntry {
             }
             CompressionFormat::Gzip => {
                 if self.decoder.is_none() {
-                    self.file
-                        .seek(SeekFrom::Start(self.offset + self.consumed))?;
-                    let decoder = GzDecoder::new(self.file.try_clone()?);
-                    self.decoder = Some(Box::new(decoder));
+                    let reader = BoundedReader {
+                        file: Arc::clone(&self.file),
+                        offset: self.offset,
+                        position: 0,
+                        compressed_size: self.size_compressed.unwrap(),
+                    };
+
+                    let decoder = Box::new(GzDecoder::new(reader));
+
+                    self.decoder = Some(decoder);
                 }
 
                 let decoder = self.decoder.as_mut().unwrap();
@@ -179,10 +187,16 @@ impl Read for FileEntry {
             }
             CompressionFormat::Deflate => {
                 if self.decoder.is_none() {
-                    self.file
-                        .seek(SeekFrom::Start(self.offset + self.consumed))?;
-                    let decoder = DeflateDecoder::new(self.file.try_clone()?);
-                    self.decoder = Some(Box::new(decoder));
+                    let reader = BoundedReader {
+                        file: Arc::clone(&self.file),
+                        offset: self.offset,
+                        position: 0,
+                        compressed_size: self.size_compressed.unwrap(),
+                    };
+
+                    let decoder = Box::new(DeflateDecoder::new(reader));
+
+                    self.decoder = Some(decoder);
                 }
 
                 let decoder = self.decoder.as_mut().unwrap();
@@ -198,6 +212,31 @@ impl Read for FileEntry {
                 Ok(bytes_read)
             }
         }
+    }
+}
+
+struct BoundedReader {
+    file: Arc<File>,
+    offset: u64,
+    position: u64,
+    compressed_size: u64,
+}
+
+impl Read for BoundedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.compressed_size {
+            return Ok(0);
+        }
+
+        let remaining = self.compressed_size - self.position;
+        let to_read = std::cmp::min(buf.len(), remaining as usize);
+
+        let bytes_read = self
+            .file
+            .read_at(self.offset + self.position, &mut buf[0..to_read])?;
+        self.position += bytes_read as u64;
+
+        Ok(bytes_read)
     }
 }
 
@@ -535,6 +574,11 @@ impl Archive {
         match entry {
             Entry::File(file_entry) => {
                 writer.write_all(&varint::encode_u64(file_entry.size))?;
+
+                if let Some(size_compressed) = file_entry.size_compressed {
+                    writer.write_all(&varint::encode_u64(size_compressed))?;
+                }
+
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
             }
             Entry::Directory(dir_entry) => {
@@ -631,6 +675,10 @@ impl Archive {
                 owner: metadata_owner(&metadata),
                 mtime: metadata.modified()?,
                 decoder: None,
+                size_compressed: match compression {
+                    CompressionFormat::None => None,
+                    _ => Some(self.file.stream_position()? - self.entries_offset),
+                },
                 size: metadata.len(),
                 offset: self.entries_offset,
                 consumed: 0,
@@ -718,6 +766,10 @@ impl Archive {
 
         match entry_type {
             0 => {
+                let size_compressed = match compression {
+                    CompressionFormat::None => None,
+                    _ => Some(varint::decode_u64(decoder)),
+                };
                 let offset = varint::decode_u64(decoder);
 
                 Ok(Entry::File(Box::new(FileEntry {
@@ -727,6 +779,7 @@ impl Archive {
                     mtime,
                     file,
                     decoder: None,
+                    size_compressed,
                     size,
                     offset,
                     consumed: 0,

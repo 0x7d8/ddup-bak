@@ -264,11 +264,7 @@ impl ChunkIndex {
         let count = self.chunks.read().unwrap().get(&id).copied();
         let count = match count {
             Some((_, count)) => count,
-            None => {
-                self.chunks.write().unwrap().insert(id, (*chunk, 0));
-
-                0
-            }
+            None => 0,
         };
 
         if count > 0 {
@@ -305,7 +301,7 @@ impl ChunkIndex {
         &self,
         path: &PathBuf,
         compression: CompressionFormat,
-    ) -> std::io::Result<Vec<ChunkHash>> {
+    ) -> std::io::Result<Vec<u64>> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
 
@@ -330,13 +326,12 @@ impl ChunkIndex {
         }
 
         let mut chunks_write = self.chunks.write().unwrap();
-        for id in chunk_ids.into_iter() {
-            chunks_write.entry(id).and_modify(|e| {
-                e.1 += 1;
-            });
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let (_, count) = chunks_write.entry(chunk_ids[i]).or_insert((chunk, 0));
+            *count += 1;
         }
 
-        Ok(chunks)
+        Ok(chunk_ids)
     }
 }
 

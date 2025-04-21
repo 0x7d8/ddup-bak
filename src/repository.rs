@@ -170,17 +170,7 @@ impl Repository {
             let file = File::create(&destination)?;
 
             let mut writer = BufWriter::new(&file);
-            for chunk in chunks {
-                let id = chunk_index.get_chunk_id(&chunk).map_or_else(
-                    || {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("Chunk not found: {:?}", chunk),
-                        ))
-                    },
-                    Ok,
-                )?;
-
+            for id in chunks {
                 writer.write_all(&crate::varint::encode_u64(id))?;
             }
 

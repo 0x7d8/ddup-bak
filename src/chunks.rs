@@ -249,7 +249,7 @@ impl ChunkIndex {
         chunk: &ChunkHash,
         data: &[u8],
         compression: CompressionFormat,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u64> {
         let id = self.chunk_hashes.read().unwrap().get(chunk).copied();
         let id = match id {
             Some(id) => id,
@@ -262,22 +262,18 @@ impl ChunkIndex {
         };
 
         let count = self.chunks.read().unwrap().get(&id).copied();
-        let (_, count) = match count {
-            Some((_, count)) => (chunk, count),
+        let count = match count {
+            Some((_, count)) => count,
             None => {
                 self.chunks.write().unwrap().insert(id, (*chunk, 0));
 
-                (chunk, 0)
+                0
             }
         };
 
         if count > 0 {
-            return Ok(());
+            return Ok(id);
         }
-
-        self.chunks.write().unwrap().entry(id).and_modify(|e| {
-            e.1 += 1;
-        });
 
         let path = self.path_from_chunk(chunk);
 
@@ -302,7 +298,7 @@ impl ChunkIndex {
         file.flush()?;
         file.sync_all()?;
 
-        Ok(())
+        Ok(id)
     }
 
     pub fn chunk_file(
@@ -314,6 +310,7 @@ impl ChunkIndex {
         let len = file.metadata()?.len();
 
         let mut chunks = Vec::with_capacity(len as usize / self.chunk_size);
+        let mut chunk_ids = Vec::with_capacity(len as usize / self.chunk_size);
         let mut buffer = vec![0; self.chunk_size];
         let mut hasher = Blake2b::<U32>::new();
 
@@ -328,8 +325,15 @@ impl ChunkIndex {
             let mut hash_array = [0; 32];
             hash_array.copy_from_slice(&hash);
 
-            self.add_chunk(&hash_array, &buffer[..bytes_read], compression)?;
+            chunk_ids.push(self.add_chunk(&hash_array, &buffer[..bytes_read], compression)?);
             chunks.push(hash_array);
+        }
+
+        let mut chunks_write = self.chunks.write().unwrap();
+        for id in chunk_ids.into_iter() {
+            chunks_write.entry(id).and_modify(|e| {
+                e.1 += 1;
+            });
         }
 
         Ok(chunks)
@@ -338,11 +342,18 @@ impl ChunkIndex {
 
 impl Drop for ChunkIndex {
     fn drop(&mut self) {
+        if !self.save_on_drop {
+            return;
+        }
+
         let file = File::create(self.directory.join("chunks/index")).unwrap();
         let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
 
+        let deleted_chunks = self.deleted_chunks.lock().unwrap();
+        let chunks = self.chunks.read().unwrap();
+
         encoder
-            .write_all(&(self.deleted_chunks.lock().unwrap().len() as u64).to_le_bytes())
+            .write_all(&(deleted_chunks.len() as u64).to_le_bytes())
             .unwrap();
         encoder
             .write_all(&(self.chunk_size as u32).to_le_bytes())
@@ -359,11 +370,11 @@ impl Drop for ChunkIndex {
             )
             .unwrap();
 
-        for id in self.deleted_chunks.lock().unwrap().iter() {
+        for id in deleted_chunks.iter() {
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
         }
 
-        for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
+        for (id, (chunk, count)) in chunks.iter() {
             encoder.write_all(chunk).unwrap();
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
             encoder.write_all(&varint::encode_u64(*count)).unwrap();

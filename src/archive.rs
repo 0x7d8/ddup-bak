@@ -17,7 +17,7 @@ use std::{
 pub const FILE_SIGNATURE: [u8; 7] = *b"DDUPBAK";
 pub const FILE_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompressionFormat {
     None,
     Gzip,
@@ -539,9 +539,9 @@ impl Archive {
         let name = entry.name();
         let name_length = name.len() as u8;
 
-        let mut buffer = Vec::with_capacity(1 + name.len() + 4);
+        writer.write_all(&varint::encode_u32(name_length as u32))?;
 
-        buffer.push(name_length);
+        let mut buffer = Vec::with_capacity(name.len() + 4);
         buffer.extend_from_slice(name.as_bytes());
 
         let mode = encode_file_permissions(entry.mode());
@@ -740,9 +740,7 @@ impl Archive {
     }
 
     fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> Result<Entry, std::io::Error> {
-        let mut name_length = [0; 1];
-        decoder.read_exact(&mut name_length)?;
-        let name_length = name_length[0] as usize;
+        let name_length = varint::decode_u32(decoder) as usize;
 
         let mut name_bytes = vec![0; name_length];
         decoder.read_exact(&mut name_bytes)?;

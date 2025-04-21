@@ -21,6 +21,7 @@ fn main() {
             repository
                 .create_archive(
                     &archive,
+                    None,
                     Some(|file| {
                         println!("Chunked file: {}", file.display());
                     }),

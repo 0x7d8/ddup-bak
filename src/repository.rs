@@ -15,8 +15,8 @@ pub struct Repository {
     pub directory: PathBuf,
     pub save_on_drop: bool,
 
-    chunk_index: ChunkIndex,
-    ignored_files: Vec<String>,
+    pub chunk_index: ChunkIndex,
+    pub ignored_files: Vec<String>,
 }
 
 impl Repository {
@@ -260,6 +260,7 @@ impl Repository {
     pub fn create_archive(
         &mut self,
         name: &str,
+        directory: Option<&Path>,
         progress_chunking: ProgressCallback,
         progress_archiving: ProgressCallback,
         threads: usize,
@@ -285,7 +286,10 @@ impl Repository {
         let error = Arc::new(RwLock::new(None));
 
         worker_pool.in_place_scope(|scope| {
-            for entry in std::fs::read_dir(&self.directory).unwrap().flatten() {
+            for entry in std::fs::read_dir(directory.unwrap_or(&self.directory))
+                .unwrap()
+                .flatten()
+            {
                 let path = entry.path();
                 if self.is_ignored(path.to_str().unwrap())
                     || path.file_name() == Some(".ddup-bak".as_ref())
@@ -295,8 +299,10 @@ impl Repository {
 
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let chunk_index = self.chunk_index.clone();
+                    let mut chunk_index = self.chunk_index.clone();
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
+
+                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
@@ -335,7 +341,7 @@ impl Repository {
 
     pub fn recursive_restore_archive(
         chunk_index: &ChunkIndex,
-        entry: crate::archive::Entry,
+        entry: Entry,
         directory: &Path,
         progress: ProgressCallback,
         scope: &rayon::Scope,
@@ -343,12 +349,16 @@ impl Repository {
     ) -> std::io::Result<()> {
         let path = directory.join(entry.name());
 
+        if error.read().unwrap().is_some() {
+            return Ok(());
+        }
+
         if let Some(f) = progress {
             f(&path)
         }
 
         match entry {
-            crate::archive::Entry::File(mut file_entry) => {
+            Entry::File(mut file_entry) => {
                 let mut file = File::create(&path)?;
                 let mut buffer = [0; 4096];
 
@@ -385,10 +395,10 @@ impl Repository {
                 {
                     let (uid, gid) = file_entry.owner;
 
-                    std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
+                    std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
                 }
             }
-            crate::archive::Entry::Directory(dir_entry) => {
+            Entry::Directory(dir_entry) => {
                 std::fs::create_dir_all(&path)?;
 
                 std::fs::set_permissions(&path, dir_entry.mode)?;
@@ -424,15 +434,15 @@ impl Repository {
                 }
             }
             #[cfg(unix)]
-            crate::archive::Entry::Symlink(link_entry) => {
+            Entry::Symlink(link_entry) => {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
                 std::fs::set_permissions(&path, link_entry.mode)?;
 
                 let (uid, gid) = link_entry.owner;
-                std::os::unix::fs::chown(&path, Some(uid), Some(gid))?;
+                std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
             }
             #[cfg(windows)]
-            crate::archive::Entry::Symlink(link_entry) => {
+            Entry::Symlink(link_entry) => {
                 if link_entry.target_dir {
                     std::os::windows::fs::symlink_dir(link_entry.target, &path)?;
                 } else {
@@ -480,8 +490,10 @@ impl Repository {
             for entry in archive.into_entries() {
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let chunk_index = self.chunk_index.clone();
+                    let mut chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
+
+                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_restore_archive(
@@ -542,8 +554,10 @@ impl Repository {
             for entry in entries {
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let chunk_index = self.chunk_index.clone();
+                    let mut chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
+
+                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_restore_archive(

@@ -45,12 +45,6 @@ encoded version of entry type + compression format + unix file permissions
 | `2..6`  | LE Bytes for compression_format |
 | `6..32` | LE Bytes for unix permissions   |
 
-#### variants
-
-- **`0`**: File
-- **`1`**: Directory
-- **`2`**: Symlink
-
 ### signature
 
 each archive file has an 8-byte signature at the beginning, this signature is made out of 2 parts.
@@ -73,8 +67,8 @@ each archive file has an 8-byte signature at the beginning, this signature is ma
 each archive file has an array of entries with can be files, symlinks or directories.
 all entries have a few base properties that will always be available
 
-`...varint(u32)          ` - Byte Length of String (UTF8)<br>
-`...u8                   ` - Array of utf8 scalar values (as many as in the byte length)<br>
+`...varint(u32)          ` - Byte Length of Name String (UTF8)<br>
+`...u8                   ` - Array of Name (file name only, no path) utf8 scalar values (as many as in the byte length)<br>
 `   type_compression_mode` - Entry Type, Compression Format and File Permissions<br>
 `...varint(u32)          ` - Unix User Id (File owner)<br>
 `...varint(u32)          ` - Unix Group Id (File owner)<br>

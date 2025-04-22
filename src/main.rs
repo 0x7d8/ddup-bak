@@ -21,6 +21,14 @@ fn cli() -> Command {
                         .default_value(".")
                         .required(false),
                 )
+                .arg(
+                    Arg::new("chunk_size")
+                        .help("The chunk size to use for the repository (bytes)")
+                        .num_args(1)
+                        .default_value("1048576")
+                        .value_parser(clap::value_parser!(usize))
+                        .required(false),
+                )
                 .arg_required_else_help(false),
         )
         .subcommand(
@@ -70,21 +78,27 @@ fn cli() -> Command {
                         .about("Lists all backups")
                         .arg_required_else_help(false),
                 )
-                /* .subcommand(
+                .subcommand(
                     Command::new("fs")
                         .about("Manages the backup file system")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the backup to list files for")
+                                .num_args(1)
+                                .required(true),
+                        )
                         .subcommand(
                             Command::new("ls")
                                 .about("Lists files in the backup file system")
                                 .arg(
                                     Arg::new("path")
-                                        .help("The path to list files from")
+                                        .help("The path to list files for")
                                         .num_args(1)
                                         .required(false),
                                 )
                                 .arg_required_else_help(false),
                         ),
-                )*/
+                )
                 .arg_required_else_help(true)
                 .subcommand_required(true),
         )
@@ -108,12 +122,13 @@ fn main() {
             Some(("list", sub_matches)) => {
                 std::process::exit(commands::backup::list::list(sub_matches))
             }
-            /*Some(("fs", sub_matches)) => match sub_matches.subcommand() {
-                Some(("ls", sub_matches)) => {
-                    std::process::exit(commands::backup::fs::ls::ls(sub_matches))
-                }
-                _ => unreachable!(),
-            },*/
+            Some(("fs", sub_matches)) => match sub_matches.subcommand() {
+                Some(("ls", sub_sub_matches)) => std::process::exit(commands::backup::fs::ls::ls(
+                    sub_matches.get_one::<String>("name").unwrap(),
+                    sub_sub_matches,
+                )),
+                _ => cli().print_help().unwrap(),
+            },
             _ => unreachable!(),
         },
         _ => cli().print_help().unwrap(),

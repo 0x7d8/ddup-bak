@@ -128,7 +128,7 @@ impl ChunkIndex {
     pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
         for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
             if *count == 0 {
-                if let Some(f) = progress {
+                if let Some(f) = progress.clone() {
                     f(*id, true)
                 }
 

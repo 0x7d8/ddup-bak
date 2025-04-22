@@ -1,89 +1,121 @@
-use std::path::Path;
+use clap::{Arg, Command};
+
+mod commands;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn cli() -> Command {
+    Command::new("ddup-bak")
+        .about("A description")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .allow_external_subcommands(true)
+        .version(VERSION)
+        .subcommand(
+            Command::new("init")
+                .about("Initializes a new ddup-bak repository")
+                .arg(
+                    Arg::new("directory")
+                        .help("The directory to initialize the repository in")
+                        .num_args(1)
+                        .default_value(".")
+                        .required(false),
+                )
+                .arg_required_else_help(false),
+        )
+        .subcommand(
+            Command::new("backup")
+                .about("Manages backups")
+                .subcommand(
+                    Command::new("create")
+                        .about("Creates a new backup")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the backup to create")
+                                .num_args(1)
+                                .required(true),
+                        )
+                        .arg_required_else_help(true),
+                )
+                .subcommand(
+                    Command::new("delete")
+                        .about("Deletes a backup")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the backup to delete")
+                                .num_args(1)
+                                .required(true),
+                        )
+                        .arg_required_else_help(false),
+                )
+                .subcommand(
+                    Command::new("restore")
+                        .about("Restores a backup")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the backup to restore")
+                                .num_args(1)
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("destination")
+                                .help("The destination to restore the backup to")
+                                .num_args(1)
+                                .required(false),
+                        )
+                        .arg_required_else_help(false),
+                )
+                .subcommand(
+                    Command::new("list")
+                        .about("Lists all backups")
+                        .arg_required_else_help(false),
+                )
+                /* .subcommand(
+                    Command::new("fs")
+                        .about("Manages the backup file system")
+                        .subcommand(
+                            Command::new("ls")
+                                .about("Lists files in the backup file system")
+                                .arg(
+                                    Arg::new("path")
+                                        .help("The path to list files from")
+                                        .num_args(1)
+                                        .required(false),
+                                )
+                                .arg_required_else_help(false),
+                        ),
+                )*/
+                .arg_required_else_help(true)
+                .subcommand_required(true),
+        )
+}
 
 fn main() {
-    let mode = std::env::args().nth(1).expect("No mode given");
+    let matches = cli().get_matches();
 
-    let mut repository = if std::path::Path::new(".ddup-bak").is_dir() {
-        ddup_bak::repository::Repository::open(Path::new(".")).unwrap()
-    } else {
-        ddup_bak::repository::Repository::new(Path::new("."), 1024 * 1024, vec![])
-    };
-
-    let threads = std::env::var("THREADS")
-        .unwrap_or_else(|_| "16".to_string())
-        .parse::<usize>()
-        .unwrap_or(16);
-
-    match mode.as_str() {
-        "encode" => {
-            let archive = std::env::args().nth(2).expect("No archive given");
-
-            repository
-                .create_archive(
-                    &archive,
-                    None,
-                    Some(|file| {
-                        println!("Chunked file: {}", file.display());
-                    }),
-                    Some(|file| {
-                        println!("Archived file: {}", file.display());
-                    }),
-                    threads,
-                )
-                .unwrap();
-        }
-        "decode" => {
-            let archive = std::env::args().nth(2).expect("No archive given");
-            let output_dir = std::env::args().nth(3).expect("No output directory given");
-
-            let restored_output_dir = repository
-                .restore_archive(
-                    &archive,
-                    Some(|file| {
-                        println!("Restored file: {}", file.display());
-                    }),
-                    threads,
-                )
-                .unwrap();
-
-            for entry in std::fs::read_dir(&output_dir).unwrap().flatten() {
-                let path = entry.path();
-                if path.file_name().unwrap() == ".ddup-bak" {
-                    continue;
-                }
-
-                if path.is_dir() {
-                    std::fs::remove_dir_all(&path).unwrap();
-                } else {
-                    std::fs::remove_file(&path).unwrap();
-                }
+    match matches.subcommand() {
+        Some(("init", sub_matches)) => std::process::exit(commands::init::init(sub_matches)),
+        Some(("backup", sub_matches)) => match sub_matches.subcommand() {
+            Some(("create", sub_matches)) => {
+                std::process::exit(commands::backup::create::create(sub_matches))
             }
-
-            for entry in std::fs::read_dir(restored_output_dir).unwrap().flatten() {
-                let path = entry.path();
-
-                let new_path = Path::new(&output_dir).join(path.file_name().unwrap());
-                std::fs::rename(path, new_path).unwrap();
+            Some(("delete", sub_matches)) => {
+                std::process::exit(commands::backup::delete::delete(sub_matches))
             }
-        }
-        "nuke" => {
-            let archive = std::env::args().nth(2).expect("No archive given");
-
-            repository
-                .delete_archive(
-                    &archive,
-                    Some(|chunk_id, deleted| {
-                        if deleted {
-                            println!("Deleted chunk: {}", chunk_id);
-                        } else {
-                            println!("Dereferenced chunk: {}", chunk_id);
-                        }
-                    }),
-                )
-                .unwrap();
-        }
-        _ => {
-            println!("Invalid mode. Use 'encode' or 'decode' or 'nuke'.");
-        }
+            Some(("restore", sub_matches)) => {
+                std::process::exit(commands::backup::restore::restore(sub_matches))
+            }
+            Some(("list", sub_matches)) => {
+                std::process::exit(commands::backup::list::list(sub_matches))
+            }
+            /*Some(("fs", sub_matches)) => match sub_matches.subcommand() {
+                Some(("ls", sub_matches)) => {
+                    std::process::exit(commands::backup::fs::ls::ls(sub_matches))
+                }
+                _ => unreachable!(),
+            },*/
+            _ => unreachable!(),
+        },
+        _ => cli().print_help().unwrap(),
     }
 }

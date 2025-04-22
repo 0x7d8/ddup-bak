@@ -309,7 +309,7 @@ impl Entry {
     }
 }
 
-pub type ProgressCallback = Option<fn(&std::path::PathBuf)>;
+pub type ProgressCallback = Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>;
 type CompressionFormatCallback =
     Option<fn(&std::path::PathBuf, &std::fs::Metadata) -> CompressionFormat>;
 
@@ -414,7 +414,7 @@ impl Archive {
         self.trim_end_header()?;
 
         for entry in std::fs::read_dir(path)?.flatten() {
-            self.encode_entry(None, entry, progress)?;
+            self.encode_entry(None, entry, progress.clone())?;
         }
 
         self.write_end_header()?;
@@ -447,7 +447,7 @@ impl Archive {
         self.trim_end_header()?;
 
         for entry in entries {
-            self.encode_entry(None, entry, progress)?;
+            self.encode_entry(None, entry, progress.clone())?;
         }
 
         self.write_end_header()?;
@@ -695,7 +695,7 @@ impl Archive {
         } else if metadata.is_dir() {
             let mut dir_entries = Vec::new();
             for entry in std::fs::read_dir(&path)?.flatten() {
-                self.encode_entry(Some(&mut dir_entries), entry, progress)?;
+                self.encode_entry(Some(&mut dir_entries), entry, progress.clone())?;
             }
 
             let dir_entry = DirectoryEntry {
@@ -732,7 +732,7 @@ impl Archive {
             }
         }
 
-        if let Some(f) = progress {
+        if let Some(f) = progress.clone() {
             f(&path)
         }
 

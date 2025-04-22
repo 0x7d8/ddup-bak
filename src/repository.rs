@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-pub type DeletionProgressCallback = Option<fn(u64, bool)>;
+pub type DeletionProgressCallback = Option<Arc<dyn Fn(u64, bool) + Send + Sync + 'static>>;
 
 pub struct Repository {
     pub directory: PathBuf,
@@ -160,7 +160,7 @@ impl Repository {
             return Ok(());
         }
 
-        if let Some(f) = progress_chunking {
+        if let Some(f) = progress_chunking.clone() {
             f(&path)
         }
 
@@ -203,6 +203,7 @@ impl Repository {
                     let error = Arc::clone(&error);
                     let destination = destination.clone();
                     let chunk_index = chunk_index.clone();
+                    let progress_chunking = progress_chunking.clone();
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
@@ -291,6 +292,7 @@ impl Repository {
                     let error = Arc::clone(&error);
                     let mut chunk_index = self.chunk_index.clone();
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
+                    let progress_chunking = progress_chunking.clone();
 
                     chunk_index.set_save_on_drop(false);
 
@@ -343,7 +345,7 @@ impl Repository {
             return Ok(());
         }
 
-        if let Some(f) = progress {
+        if let Some(f) = progress.clone() {
             f(&path)
         }
 
@@ -404,6 +406,7 @@ impl Repository {
                         let error = Arc::clone(&error);
                         let chunk_index = chunk_index.clone();
                         let path = path.to_path_buf();
+                        let progress = progress.clone();
 
                         move |scope| {
                             if let Err(err) = Self::recursive_restore_archive(
@@ -482,6 +485,7 @@ impl Repository {
                     let error = Arc::clone(&error);
                     let mut chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
+                    let progress = progress.clone();
 
                     chunk_index.set_save_on_drop(false);
 
@@ -546,6 +550,7 @@ impl Repository {
                     let error = Arc::clone(&error);
                     let mut chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
+                    let progress = progress.clone();
 
                     chunk_index.set_save_on_drop(false);
 
@@ -588,14 +593,14 @@ impl Repository {
                 }
 
                 if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true) {
-                    if let Some(f) = progress {
+                    if let Some(f) = progress.clone() {
                         f(chunk_id, deleted)
                     }
                 }
             },
             Entry::Directory(dir_entry) => {
                 for sub_entry in dir_entry.entries {
-                    self.recursive_delete_archive(sub_entry, progress)?;
+                    self.recursive_delete_archive(sub_entry, progress.clone())?;
                 }
             }
             _ => {}
@@ -620,7 +625,7 @@ impl Repository {
         let archive = Archive::open(archive_path.to_str().unwrap())?;
 
         for entry in archive.into_entries() {
-            self.recursive_delete_archive(entry, progress)?;
+            self.recursive_delete_archive(entry, progress.clone())?;
         }
 
         std::fs::remove_file(archive_path)?;

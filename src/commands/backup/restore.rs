@@ -8,6 +8,7 @@ pub fn restore(matches: &ArgMatches) -> i32 {
     let repository = open_repository();
     let name = matches.get_one::<String>("name").expect("required");
     let destination = matches.get_one::<String>("destination");
+    let threads = matches.get_one::<usize>("threads").expect("required");
 
     if !repository
         .list_archives()
@@ -47,7 +48,7 @@ pub fn restore(matches: &ArgMatches) -> i32 {
                     progress.set_text(file.to_string_lossy());
                 })
             }),
-            16,
+            *threads,
         )
         .unwrap();
 

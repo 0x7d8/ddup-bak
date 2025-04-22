@@ -1,4 +1,5 @@
 use crate::commands::open_repository;
+use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::archive::Entry;
@@ -37,8 +38,6 @@ fn render_unix_permissions(mode: &Permissions) -> String {
 }
 
 fn format_time(time: SystemTime) -> String {
-    use chrono::{DateTime, Local};
-
     let datetime: DateTime<Local> = time.into();
     datetime.format("%b %e %H:%M").to_string()
 }

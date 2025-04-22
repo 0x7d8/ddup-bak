@@ -7,6 +7,7 @@ use colored::Colorize;
 pub fn create(matches: &ArgMatches) -> i32 {
     let mut repository = open_repository();
     let name = matches.get_one::<String>("name").expect("required");
+    let threads = matches.get_one::<usize>("threads").expect("required");
 
     if repository
         .list_archives()
@@ -48,7 +49,7 @@ pub fn create(matches: &ArgMatches) -> i32 {
                 })
             }),
             None,
-            16,
+            *threads,
         )
         .unwrap();
 

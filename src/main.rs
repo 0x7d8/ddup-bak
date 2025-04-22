@@ -43,6 +43,16 @@ fn cli() -> Command {
                                 .num_args(1)
                                 .required(true),
                         )
+                        .arg(
+                            Arg::new("threads")
+                                .help("The number of threads to use for the backup")
+                                .short('t')
+                                .long("threads")
+                                .num_args(1)
+                                .default_value("16")
+                                .value_parser(clap::value_parser!(usize))
+                                .required(false),
+                        )
                         .arg_required_else_help(true),
                 )
                 .subcommand(
@@ -69,6 +79,16 @@ fn cli() -> Command {
                             Arg::new("destination")
                                 .help("The destination to restore the backup to")
                                 .num_args(1)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("threads")
+                                .help("The number of threads to use for the restore")
+                                .short('t')
+                                .long("threads")
+                                .num_args(1)
+                                .default_value("16")
+                                .value_parser(clap::value_parser!(usize))
                                 .required(false),
                         )
                         .arg_required_else_help(false),

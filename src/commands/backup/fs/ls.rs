@@ -29,9 +29,9 @@ fn render_unix_permissions(mode: &Permissions) -> String {
     #[cfg(not(unix))]
     {
         if mode.readonly() {
-            "r--".normal()
+            "r--".to_string()
         } else {
-            "r-x".normal()
+            "r-x".to_string()
         }
     }
 }

@@ -117,6 +117,17 @@ fn cli() -> Command {
                                         .required(false),
                                 )
                                 .arg_required_else_help(false),
+                        )
+                        .subcommand(
+                            Command::new("cat")
+                                .about("Displays the content of a file in the backup file system")
+                                .arg(
+                                    Arg::new("path")
+                                        .help("The path to the file to display")
+                                        .num_args(1)
+                                        .required(false),
+                                )
+                                .arg_required_else_help(false),
                         ),
                 )
                 .arg_required_else_help(true)
@@ -147,6 +158,12 @@ fn main() {
                     sub_matches.get_one::<String>("name").unwrap(),
                     sub_sub_matches,
                 )),
+                Some(("cat", sub_sub_matches)) => {
+                    std::process::exit(commands::backup::fs::cat::cat(
+                        sub_matches.get_one::<String>("name").unwrap(),
+                        sub_sub_matches,
+                    ))
+                }
                 _ => cli().print_help().unwrap(),
             },
             _ => unreachable!(),

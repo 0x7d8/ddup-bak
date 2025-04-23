@@ -203,7 +203,7 @@ impl ChunkIndex {
     }
 
     #[inline]
-    pub fn get_chunk_id_file(&self, chunk_id: u64) -> Option<Box<dyn Read + Send>> {
+    pub fn read_chunk_id_content(&self, chunk_id: u64) -> Option<Box<dyn Read + Send>> {
         let chunk = self.chunks.read().unwrap();
         let (chunk, _) = chunk.get(&chunk_id)?;
         let path = self.path_from_chunk(chunk);
@@ -274,7 +274,7 @@ impl ChunkIndex {
         let path = self.path_from_chunk(chunk);
 
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut file = std::fs::File::create(path)?;
+        let mut file = File::create(path)?;
         file.write_all(&[compression.encode()])?;
 
         match compression {

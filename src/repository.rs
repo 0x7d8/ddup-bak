@@ -331,6 +331,53 @@ impl Repository {
         Ok(archive)
     }
 
+    pub fn read_entry_content<S: Write>(
+        &self,
+        entry: Entry,
+        stream: &mut S,
+    ) -> std::io::Result<()> {
+        match entry {
+            Entry::File(mut file_entry) => {
+                let mut buffer = [0; 4096];
+
+                loop {
+                    let chunk_id = crate::varint::decode_u64(&mut file_entry);
+                    if chunk_id == 0 {
+                        break;
+                    }
+
+                    let mut chunk = self
+                        .chunk_index
+                        .read_chunk_id_content(chunk_id)
+                        .map_or_else(
+                            || {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!("Chunk not found: {}", chunk_id),
+                                ))
+                            },
+                            Ok,
+                        )?;
+
+                    loop {
+                        let bytes_read = chunk.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+
+                        stream.write_all(&buffer[..bytes_read])?;
+                    }
+                }
+
+                Ok(())
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Entry is not a file",
+            )),
+        }
+    }
+
     pub fn recursive_restore_archive(
         chunk_index: &ChunkIndex,
         entry: Entry,
@@ -360,7 +407,7 @@ impl Repository {
                         break;
                     }
 
-                    let mut chunk = chunk_index.get_chunk_id_file(chunk_id).map_or_else(
+                    let mut chunk = chunk_index.read_chunk_id_content(chunk_id).map_or_else(
                         || {
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::NotFound,

@@ -1,8 +1,7 @@
-use std::sync::Arc;
-
 use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
+use std::sync::Arc;
 
 pub fn create(matches: &ArgMatches) -> i32 {
     let mut repository = open_repository();

@@ -305,8 +305,7 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
         println!("{}", rendered_entries);
     } else {
         println!(
-            "{} {} {}",
-            "path".red(),
+            "{} {}",
             path.display().to_string().cyan(),
             "does not exist!".red()
         );

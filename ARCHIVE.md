@@ -13,7 +13,7 @@ varints are used to efficiently store integer values with as few bytes as possib
 
 when the control bit (128) is set, you must read the next byte of the file for the second part of the varint.
 it is important that data stays le, so if first part is "1 0110111" and second part is "0 1111111", then the resulting integer
-must be "01101111111111" (153391689). varints are either u32 or u64, this is defined by the spec using varint(u32) or varint(u64)
+must be "01101111111111" (7167). varints are either u32 or u64, this is defined by the spec using varint(u32) or varint(u64)
 
 ### compression_format
 

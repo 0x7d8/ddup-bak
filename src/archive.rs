@@ -280,11 +280,11 @@ impl Entry {
 
     /// Returns the mode of the entry.
     /// This is the file permissions of the entry.
-    pub fn mode(&self) -> Permissions {
+    pub fn mode(&self) -> &Permissions {
         match self {
-            Entry::File(entry) => entry.mode.clone(),
-            Entry::Directory(entry) => entry.mode.clone(),
-            Entry::Symlink(entry) => entry.mode.clone(),
+            Entry::File(entry) => &entry.mode,
+            Entry::Directory(entry) => &entry.mode,
+            Entry::Symlink(entry) => &entry.mode,
         }
     }
 
@@ -544,7 +544,7 @@ impl Archive {
         let mut buffer = Vec::with_capacity(name.len() + 4);
         buffer.extend_from_slice(name.as_bytes());
 
-        let mode = encode_file_permissions(entry.mode());
+        let mode = encode_file_permissions(entry.mode().clone());
         let compression = match entry {
             Entry::File(file_entry) => file_entry.compression,
             _ => CompressionFormat::None,

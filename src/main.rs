@@ -125,7 +125,7 @@ fn cli() -> Command {
                                     Arg::new("path")
                                         .help("The path to the file to display")
                                         .num_args(1)
-                                        .required(false),
+                                        .required(true),
                                 )
                                 .arg_required_else_help(false),
                         ),

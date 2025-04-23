@@ -6,7 +6,7 @@ use std::path::Path;
 
 pub fn cat(name: &str, matches: &ArgMatches) -> i32 {
     let repository = open_repository();
-    let path = matches.get_one::<String>("path");
+    let path = matches.get_one::<String>("path").expect("required");
 
     if !repository
         .list_archives()
@@ -26,8 +26,7 @@ pub fn cat(name: &str, matches: &ArgMatches) -> i32 {
 
     let archive = repository.get_archive(name).unwrap();
 
-    let path = Path::new(path.map_or(".", |s| s.as_str()));
-    if let Some(entry) = archive.find_archive_entry(path).unwrap() {
+    if let Some(entry) = archive.find_archive_entry(Path::new(path)).unwrap() {
         match entry {
             Entry::File(file) => {
                 repository
@@ -35,21 +34,13 @@ pub fn cat(name: &str, matches: &ArgMatches) -> i32 {
                     .unwrap();
             }
             _ => {
-                println!(
-                    "{} {}",
-                    path.display().to_string().cyan(),
-                    "is not a file!".red()
-                );
+                println!("{} {}", path.cyan(), "is not a file!".red());
 
                 return 1;
             }
         }
     } else {
-        println!(
-            "{} {}",
-            path.display().to_string().cyan(),
-            "does not exist!".red()
-        );
+        println!("{} {}", path.cyan(), "does not exist!".red());
 
         return 1;
     }

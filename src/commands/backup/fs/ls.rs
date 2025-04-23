@@ -3,7 +3,7 @@ use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::archive::Entry;
-use std::{fs::Permissions, path::Path, time::SystemTime};
+use std::{collections::HashMap, fs::Permissions, path::Path, time::SystemTime};
 
 fn render_unix_permissions(mode: &Permissions) -> String {
     #[cfg(unix)]
@@ -57,7 +57,7 @@ fn get_username(uid: u32) -> String {
     use std::mem::MaybeUninit;
     use std::ptr;
 
-    let mut buf = [0; 2048]; // Buffer for passwd struct
+    let mut buf = [0; 2048];
     let mut result = MaybeUninit::<passwd>::uninit();
     let mut passwd_ptr = ptr::null_mut();
 
@@ -153,19 +153,19 @@ fn is_executable(_mode: &Permissions) -> bool {
     !_mode.readonly()
 }
 
-fn calculate_column_widths(entries: &[Entry]) -> (usize, usize) {
+fn calculate_column_widths(
+    entries: &[&Entry],
+    users: &mut HashMap<u32, String>,
+    groups: &mut HashMap<u32, String>,
+) -> (usize, usize) {
     let mut max_user_len = 0;
     let mut max_group_len = 0;
 
     for entry in entries {
-        let (uid, gid) = match entry {
-            Entry::File(file) => (file.owner.0, file.owner.1),
-            Entry::Directory(dir) => (dir.owner.0, dir.owner.1),
-            Entry::Symlink(link) => (link.owner.0, link.owner.1),
-        };
+        let (uid, gid) = entry.owner();
 
-        let username = get_username(uid);
-        let groupname = get_groupname(gid);
+        let username = users.entry(uid).or_insert_with(|| get_username(uid));
+        let groupname = groups.entry(gid).or_insert_with(|| get_groupname(gid));
 
         max_user_len = max_user_len.max(username.len());
         max_group_len = max_group_len.max(groupname.len());
@@ -174,15 +174,24 @@ fn calculate_column_widths(entries: &[Entry]) -> (usize, usize) {
     (max_user_len, max_group_len)
 }
 
-fn render_entry(entry: &Entry, user_width: usize, group_width: usize) -> String {
+fn render_entry(
+    entry: &Entry,
+    user_width: usize,
+    group_width: usize,
+    users: &HashMap<u32, String>,
+    groups: &HashMap<u32, String>,
+) -> String {
     let file_type = get_file_type_char(entry);
+
+    let (uid, gid) = entry.owner();
+    let username = users.get(&uid).unwrap();
+    let groupname = groups.get(&gid).unwrap();
+
+    let perms = render_unix_permissions(entry.mode());
+    let time_str = format_time(entry.mtime());
 
     match entry {
         Entry::File(file) => {
-            let perms = render_unix_permissions(&file.mode);
-            let username = get_username(file.owner.0);
-            let groupname = get_groupname(file.owner.1);
-            let time_str = format_time(file.mtime);
             let name = if is_executable(&file.mode) {
                 file.name.green().bold()
             } else {
@@ -203,10 +212,6 @@ fn render_entry(entry: &Entry, user_width: usize, group_width: usize) -> String 
             )
         }
         Entry::Directory(dir) => {
-            let perms = render_unix_permissions(&dir.mode);
-            let username = get_username(dir.owner.0);
-            let groupname = get_groupname(dir.owner.1);
-            let time_str = format_time(dir.mtime);
             let name = dir.name.blue().bold();
             let link_count = (dir.entries.len() + 2).to_string();
 
@@ -224,12 +229,15 @@ fn render_entry(entry: &Entry, user_width: usize, group_width: usize) -> String 
             )
         }
         Entry::Symlink(link) => {
-            let perms = render_unix_permissions(&link.mode);
-            let username = get_username(link.owner.0);
-            let groupname = get_groupname(link.owner.1);
-            let time_str = format_time(link.mtime);
-            let name = link.name.cyan();
-            let target = format!("-> {}", link.target).cyan().bold();
+            let name = link.name.bright_cyan().bold();
+            let target = format!(
+                "-> {}",
+                if is_executable(&link.mode) {
+                    link.target.blue().on_green()
+                } else {
+                    link.target.blue()
+                }
+            );
 
             format!(
                 "{}{} {:>4} {:<width_user$} {:<width_group$}     {} {} {}",
@@ -248,12 +256,15 @@ fn render_entry(entry: &Entry, user_width: usize, group_width: usize) -> String 
     }
 }
 
-fn render_entries(entries: &[Entry]) -> String {
-    let (user_width, group_width) = calculate_column_widths(entries);
+fn render_entries(entries: &[&Entry]) -> String {
+    let mut users: HashMap<u32, String> = HashMap::new();
+    let mut groups: HashMap<u32, String> = HashMap::new();
+
+    let (user_width, group_width) = calculate_column_widths(entries, &mut users, &mut groups);
 
     entries
         .iter()
-        .map(|entry| render_entry(entry, user_width, group_width))
+        .map(|entry| render_entry(entry, user_width, group_width, &users, &groups))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -281,27 +292,28 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
     let archive = repository.get_archive(name).unwrap();
 
     let path = Path::new(path.map_or(".", |s| s.as_str()));
-    if let Some(entry) = archive.find_archive_entry(path).unwrap() {
+    if let Some(entry) = archive.find_archive_entry(Path::new(path)).unwrap() {
         let mut entries = Vec::new();
 
         match entry {
-            Entry::File(file) => {
-                entries.push(Entry::File(file.clone()));
-            }
             Entry::Directory(dir) => {
                 for entry in dir.entries.iter() {
-                    entries.push(entry.clone());
+                    entries.push(entry);
                 }
             }
-            Entry::Symlink(link) => {
-                entries.push(Entry::Symlink(link.clone()));
+            _ => {
+                entries.push(entry);
             }
         }
+
+        println!("total {} entries", entries.len());
 
         let rendered_entries = render_entries(&entries);
         println!("{}", rendered_entries);
     } else if path.components().all(|c| c.as_os_str() == ".") {
-        let rendered_entries = render_entries(archive.entries());
+        println!("total {} entries", archive.entries().len());
+
+        let rendered_entries = render_entries(&archive.entries().iter().collect::<Vec<_>>());
         println!("{}", rendered_entries);
     } else {
         println!(

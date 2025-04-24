@@ -1,5 +1,5 @@
 use crate::{
-    archive::{Archive, CompressionFormat, Entry, ProgressCallback},
+    archive::{Archive, CompressionFormat, ProgressCallback, entries::Entry},
     chunks::ChunkIndex,
 };
 use std::{
@@ -62,6 +62,7 @@ impl Repository {
         }
     }
 
+    #[inline]
     fn archive_path(&self, name: &str) -> PathBuf {
         self.directory
             .join(".ddup-bak/archives")
@@ -73,7 +74,8 @@ impl Repository {
     /// If set to false, the repository will not save changes when dropped.
     /// This is useful for testing purposes, where you may want to discard changes.
     /// By default, this flag is set to true and should NOT be changed.
-    pub fn set_save_on_drop(&mut self, save_on_drop: bool) -> &mut Self {
+    #[inline]
+    pub const fn set_save_on_drop(&mut self, save_on_drop: bool) -> &mut Self {
         self.save_on_drop = save_on_drop;
         self.chunk_index.set_save_on_drop(save_on_drop);
 
@@ -83,6 +85,7 @@ impl Repository {
     /// Adds a file to the ignored list.
     /// If the file is already in the list, it does nothing.
     /// The file is added as a relative path from the repository directory.
+    #[inline]
     pub fn add_ignored_file(&mut self, file: &str) -> &mut Self {
         if !self.ignored_files.contains(&file.to_string()) {
             self.ignored_files.push(file.to_string());
@@ -93,6 +96,7 @@ impl Repository {
 
     /// Removes a file from the ignored list.
     /// If the file is not in the list, it does nothing.
+    #[inline]
     pub fn remove_ignored_file(&mut self, file: &str) {
         if let Some(pos) = self.ignored_files.iter().position(|x| x == file) {
             self.ignored_files.remove(pos);
@@ -106,6 +110,7 @@ impl Repository {
     }
 
     /// Returns a reference to the list of ignored files.
+    #[inline]
     pub fn get_ignored_files(&self) -> &[String] {
         &self.ignored_files
     }
@@ -290,11 +295,9 @@ impl Repository {
 
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let mut chunk_index = self.chunk_index.clone();
+                    let chunk_index = self.chunk_index.clone();
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
                     let progress_chunking = progress_chunking.clone();
-
-                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
@@ -378,7 +381,7 @@ impl Repository {
         }
     }
 
-    pub fn recursive_restore_archive(
+    fn recursive_restore_archive(
         chunk_index: &ChunkIndex,
         entry: Entry,
         directory: &Path,
@@ -530,11 +533,9 @@ impl Repository {
             for entry in archive.into_entries() {
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let mut chunk_index = self.chunk_index.clone();
+                    let chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
                     let progress = progress.clone();
-
-                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_restore_archive(
@@ -595,11 +596,9 @@ impl Repository {
             for entry in entries {
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let mut chunk_index = self.chunk_index.clone();
+                    let chunk_index = self.chunk_index.clone();
                     let destination = destination.clone();
                     let progress = progress.clone();
-
-                    chunk_index.set_save_on_drop(false);
 
                     move |scope| {
                         if let Err(err) = Self::recursive_restore_archive(

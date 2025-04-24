@@ -1,7 +1,7 @@
 use crate::commands::open_repository;
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::archive::Entry;
+use ddup_bak::archive::entries::Entry;
 use std::path::Path;
 
 pub fn cat(name: &str, matches: &ArgMatches) -> i32 {

@@ -2,7 +2,7 @@ use std::io::Read;
 
 #[inline]
 pub fn encode_u32(value: u32) -> Vec<u8> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(5);
     let mut value = value;
 
     while value > 0x7F {
@@ -38,7 +38,7 @@ pub fn decode_u32<S: Read>(stream: &mut S) -> u32 {
 
 #[inline]
 pub fn encode_u64(value: u64) -> Vec<u8> {
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(10);
     let mut value = value;
 
     while value > 0x7F {

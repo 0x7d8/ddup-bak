@@ -14,7 +14,7 @@ use std::{
 
 pub type ChunkHash = [u8; 32];
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ChunkIndex {
     pub directory: PathBuf,
     pub save_on_drop: bool,
@@ -24,6 +24,20 @@ pub struct ChunkIndex {
     chunks: Arc<RwLock<HashMap<u64, (ChunkHash, u64)>>>,
     chunk_hashes: Arc<RwLock<HashMap<ChunkHash, u64>>>,
     chunk_size: usize,
+}
+
+impl Clone for ChunkIndex {
+    fn clone(&self) -> Self {
+        ChunkIndex {
+            directory: self.directory.clone(),
+            save_on_drop: false,
+            next_id: Arc::clone(&self.next_id),
+            deleted_chunks: Arc::clone(&self.deleted_chunks),
+            chunks: Arc::clone(&self.chunks),
+            chunk_hashes: Arc::clone(&self.chunk_hashes),
+            chunk_size: self.chunk_size,
+        }
+    }
 }
 
 impl ChunkIndex {
@@ -103,7 +117,7 @@ impl ChunkIndex {
     }
 
     #[inline]
-    pub fn set_save_on_drop(&mut self, save_on_drop: bool) {
+    pub const fn set_save_on_drop(&mut self, save_on_drop: bool) {
         self.save_on_drop = save_on_drop;
     }
 

@@ -1,18 +1,20 @@
 use crate::varint;
 use flate2::{
-    read::{DeflateDecoder, GzDecoder},
+    read::DeflateDecoder,
     write::{DeflateEncoder, GzEncoder},
 };
 use positioned_io::ReadAt;
 use std::{
     ffi::OsStr,
     fmt::{Debug, Formatter},
-    fs::{DirEntry, File, Permissions},
+    fs::{DirEntry, File, Metadata, Permissions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::Arc,
     time::SystemTime,
 };
+
+pub mod entries;
 
 pub const FILE_SIGNATURE: [u8; 7] = *b"DDUPBAK";
 pub const FILE_VERSION: u8 = 1;
@@ -78,7 +80,7 @@ fn decode_file_permissions(mode: u32) -> Permissions {
 }
 
 #[inline]
-fn metadata_owner(_metadata: &std::fs::Metadata) -> (u32, u32) {
+fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -91,234 +93,16 @@ fn metadata_owner(_metadata: &std::fs::Metadata) -> (u32, u32) {
     }
 }
 
-pub struct FileEntry {
-    pub name: String,
-    pub mode: Permissions,
-    pub owner: (u32, u32),
-    pub mtime: SystemTime,
-
-    pub compression: CompressionFormat,
-    pub size_compressed: Option<u64>,
-    pub size: u64,
-
-    file: Arc<File>,
-    decoder: Option<Box<dyn Read + Send>>,
-    offset: u64,
-    consumed: u64,
-}
-
-impl Clone for FileEntry {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            mode: self.mode.clone(),
-            owner: self.owner,
-            mtime: self.mtime,
-            compression: self.compression,
-            size_compressed: self.size_compressed,
-            size: self.size,
-            file: self.file.clone(),
-            decoder: None,
-            offset: self.offset,
-            consumed: 0,
-        }
-    }
-}
-
-impl Debug for FileEntry {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FileEntry")
-            .field("name", &self.name)
-            .field("mode", &self.mode)
-            .field("owner", &self.owner)
-            .field("mtime", &self.mtime)
-            .field("offset", &self.offset)
-            .field("compression", &self.compression)
-            .field("size", &self.size)
-            .finish()
-    }
-}
-
-impl Read for FileEntry {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.consumed >= self.size {
-            return Ok(0);
-        }
-
-        let remaining = self.size - self.consumed;
-
-        match self.compression {
-            CompressionFormat::None => {
-                let bytes_read = self.file.read_at(self.offset + self.consumed, buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            CompressionFormat::Gzip => {
-                if self.decoder.is_none() {
-                    let reader = BoundedReader {
-                        file: Arc::clone(&self.file),
-                        offset: self.offset,
-                        position: 0,
-                        compressed_size: self.size_compressed.unwrap(),
-                    };
-
-                    let decoder = Box::new(GzDecoder::new(reader));
-
-                    self.decoder = Some(decoder);
-                }
-
-                let decoder = self.decoder.as_mut().unwrap();
-                let bytes_read = decoder.read(buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.decoder = None;
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            CompressionFormat::Deflate => {
-                if self.decoder.is_none() {
-                    let reader = BoundedReader {
-                        file: Arc::clone(&self.file),
-                        offset: self.offset,
-                        position: 0,
-                        compressed_size: self.size_compressed.unwrap(),
-                    };
-
-                    let decoder = Box::new(DeflateDecoder::new(reader));
-
-                    self.decoder = Some(decoder);
-                }
-
-                let decoder = self.decoder.as_mut().unwrap();
-                let bytes_read = decoder.read(buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.decoder = None;
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-        }
-    }
-}
-
-struct BoundedReader {
-    file: Arc<File>,
-    offset: u64,
-    position: u64,
-    compressed_size: u64,
-}
-
-impl Read for BoundedReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.position >= self.compressed_size {
-            return Ok(0);
-        }
-
-        let remaining = self.compressed_size - self.position;
-        let to_read = std::cmp::min(buf.len(), remaining as usize);
-
-        let bytes_read = self
-            .file
-            .read_at(self.offset + self.position, &mut buf[0..to_read])?;
-        self.position += bytes_read as u64;
-
-        Ok(bytes_read)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DirectoryEntry {
-    pub name: String,
-    pub mode: Permissions,
-    pub owner: (u32, u32),
-    pub mtime: SystemTime,
-    pub entries: Vec<Entry>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SymlinkEntry {
-    pub name: String,
-    pub mode: Permissions,
-    pub owner: (u32, u32),
-    pub mtime: SystemTime,
-    pub target: String,
-    pub target_dir: bool,
-}
-
-#[derive(Clone, Debug)]
-pub enum Entry {
-    File(Box<FileEntry>),
-    Directory(Box<DirectoryEntry>),
-    Symlink(Box<SymlinkEntry>),
-}
-
-impl Entry {
-    /// Returns the name of the entry.
-    /// This is the name of the file or directory, not the full path.
-    /// For example, if the entry is under `path/to/file.txt`, this will return `file.txt`.
-    pub fn name(&self) -> &str {
-        match self {
-            Entry::File(entry) => &entry.name,
-            Entry::Directory(entry) => &entry.name,
-            Entry::Symlink(entry) => &entry.name,
-        }
-    }
-
-    /// Returns the mode of the entry.
-    /// This is the file permissions of the entry.
-    pub fn mode(&self) -> &Permissions {
-        match self {
-            Entry::File(entry) => &entry.mode,
-            Entry::Directory(entry) => &entry.mode,
-            Entry::Symlink(entry) => &entry.mode,
-        }
-    }
-
-    /// Returns the owner of the entry.
-    /// This is the user ID and group ID of the entry.
-    pub fn owner(&self) -> (u32, u32) {
-        match self {
-            Entry::File(entry) => entry.owner,
-            Entry::Directory(entry) => entry.owner,
-            Entry::Symlink(entry) => entry.owner,
-        }
-    }
-
-    /// Returns the modification time of the entry.
-    /// This is the time the entry was last modified.
-    pub fn mtime(&self) -> SystemTime {
-        match self {
-            Entry::File(entry) => entry.mtime,
-            Entry::Directory(entry) => entry.mtime,
-            Entry::Symlink(entry) => entry.mtime,
-        }
-    }
-}
-
 pub type ProgressCallback = Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>;
 type CompressionFormatCallback =
-    Option<fn(&std::path::PathBuf, &std::fs::Metadata) -> CompressionFormat>;
+    Option<Arc<dyn Fn(&Path, &Metadata) -> CompressionFormat + Send + Sync + 'static>>;
 
 pub struct Archive {
     file: Arc<File>,
     version: u8,
     compression_callback: CompressionFormatCallback,
 
-    entries: Vec<Entry>,
+    entries: Vec<entries::Entry>,
     entries_offset: u64,
 }
 
@@ -393,6 +177,7 @@ impl Archive {
     /// Sets the compression callback for the archive.
     /// This callback is called for each added file entry in the archive.
     /// The callback should return the compression format to use for the file.
+    #[inline]
     pub fn set_compression_callback(&mut self, callback: CompressionFormatCallback) -> &mut Self {
         self.compression_callback = callback;
 
@@ -423,12 +208,14 @@ impl Archive {
     }
 
     /// Returns the entries in the archive.
-    pub fn entries(&self) -> &[Entry] {
+    #[inline]
+    pub fn entries(&self) -> &[entries::Entry] {
         &self.entries
     }
 
     /// Consumes the archive and returns the entries.
-    pub fn into_entries(self) -> Vec<Entry> {
+    #[inline]
+    pub fn into_entries(self) -> Vec<entries::Entry> {
         self.entries
     }
 
@@ -456,9 +243,9 @@ impl Archive {
     }
 
     fn recursive_find_archive_entry<'a>(
-        entry: &'a crate::archive::Entry,
+        entry: &'a entries::Entry,
         entry_parts: &[&OsStr],
-    ) -> std::io::Result<Option<&'a crate::archive::Entry>> {
+    ) -> std::io::Result<Option<&'a entries::Entry>> {
         if entry_parts.is_empty() {
             return Ok(None);
         }
@@ -467,7 +254,7 @@ impl Archive {
             return Ok(Some(entry));
         }
 
-        if let crate::archive::Entry::Directory(dir_entry) = entry {
+        if let entries::Entry::Directory(dir_entry) = entry {
             for sub_entry in &dir_entry.entries {
                 if let Some(found) =
                     Self::recursive_find_archive_entry(sub_entry, &entry_parts[1..])?
@@ -487,7 +274,7 @@ impl Archive {
     pub fn find_archive_entry(
         &self,
         entry_name: &Path,
-    ) -> std::io::Result<Option<&crate::archive::Entry>> {
+    ) -> std::io::Result<Option<&entries::Entry>> {
         let entry_parts = entry_name
             .components()
             .map(|c| c.as_os_str())
@@ -534,7 +321,7 @@ impl Archive {
 
     fn encode_entry_metadata<S: Write>(
         writer: &mut S,
-        entry: &Entry,
+        entry: &entries::Entry,
     ) -> Result<(), std::io::Error> {
         let name = entry.name();
         let name_length = name.len() as u8;
@@ -546,13 +333,13 @@ impl Archive {
 
         let mode = encode_file_permissions(entry.mode().clone());
         let compression = match entry {
-            Entry::File(file_entry) => file_entry.compression,
+            entries::Entry::File(file_entry) => file_entry.compression,
             _ => CompressionFormat::None,
         };
         let entry_type = match entry {
-            Entry::File(_) => 0,
-            Entry::Directory(_) => 1,
-            Entry::Symlink(_) => 2,
+            entries::Entry::File(_) => 0,
+            entries::Entry::Directory(_) => 1,
+            entries::Entry::Symlink(_) => 2,
         };
 
         let type_compression_mode =
@@ -572,7 +359,7 @@ impl Archive {
         writer.write_all(&varint::encode_u64(mtime.as_secs()))?;
 
         match entry {
-            Entry::File(file_entry) => {
+            entries::Entry::File(file_entry) => {
                 writer.write_all(&varint::encode_u64(file_entry.size))?;
 
                 if let Some(size_compressed) = file_entry.size_compressed {
@@ -581,14 +368,14 @@ impl Archive {
 
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
             }
-            Entry::Directory(dir_entry) => {
+            entries::Entry::Directory(dir_entry) => {
                 writer.write_all(&varint::encode_u64(dir_entry.entries.len() as u64))?;
 
                 for sub_entry in &dir_entry.entries {
                     Self::encode_entry_metadata(writer, sub_entry)?;
                 }
             }
-            Entry::Symlink(link_entry) => {
+            entries::Entry::Symlink(link_entry) => {
                 writer.write_all(&varint::encode_u64(link_entry.target.len() as u64))?;
                 writer.write_all(link_entry.target.as_bytes())?;
                 writer.write_all(&[link_entry.target_dir as u8])?;
@@ -600,7 +387,7 @@ impl Archive {
 
     fn encode_entry(
         &mut self,
-        entries: Option<&mut Vec<Entry>>,
+        entries: Option<&mut Vec<entries::Entry>>,
         fs_entry: DirEntry,
         progress: ProgressCallback,
     ) -> Result<(), std::io::Error> {
@@ -614,14 +401,16 @@ impl Archive {
             let mut buffer = [0; 4096];
             let mut bytes_read = file.read(&mut buffer)?;
 
-            let compression = self.compression_callback.map_or(
-                if metadata.len() > 16 {
-                    CompressionFormat::Deflate
-                } else {
-                    CompressionFormat::None
-                },
-                |f| f(&path, &metadata),
-            );
+            let compression = match self.compression_callback {
+                Some(ref f) => f(&path, &metadata),
+                None => {
+                    if metadata.len() > 16 {
+                        CompressionFormat::Deflate
+                    } else {
+                        CompressionFormat::None
+                    }
+                }
+            };
 
             match compression {
                 CompressionFormat::None => {
@@ -668,7 +457,7 @@ impl Archive {
                 }
             }
 
-            let entry = FileEntry {
+            let entry = entries::FileEntry {
                 name: file_name,
                 mode: metadata.permissions(),
                 file: self.file.clone(),
@@ -688,9 +477,9 @@ impl Archive {
             self.entries_offset = self.file.stream_position()?;
 
             if let Some(entries) = entries {
-                entries.push(Entry::File(Box::new(entry)));
+                entries.push(entries::Entry::File(Box::new(entry)));
             } else {
-                self.entries.push(Entry::File(Box::new(entry)));
+                self.entries.push(entries::Entry::File(Box::new(entry)));
             }
         } else if metadata.is_dir() {
             let mut dir_entries = Vec::new();
@@ -698,7 +487,7 @@ impl Archive {
                 self.encode_entry(Some(&mut dir_entries), entry, progress.clone())?;
             }
 
-            let dir_entry = DirectoryEntry {
+            let dir_entry = entries::DirectoryEntry {
                 name: file_name,
                 mode: metadata.permissions(),
                 owner: metadata_owner(&metadata),
@@ -707,15 +496,16 @@ impl Archive {
             };
 
             if let Some(entries) = entries {
-                entries.push(Entry::Directory(Box::new(dir_entry)));
+                entries.push(entries::Entry::Directory(Box::new(dir_entry)));
             } else {
-                self.entries.push(Entry::Directory(Box::new(dir_entry)));
+                self.entries
+                    .push(entries::Entry::Directory(Box::new(dir_entry)));
             }
         } else if metadata.is_symlink() {
             if let Ok(Ok(target)) = std::fs::read_link(&path).map(|p| p.canonicalize()) {
                 let target = target.to_string_lossy().to_string();
 
-                let link_entry = SymlinkEntry {
+                let link_entry = entries::SymlinkEntry {
                     name: file_name,
                     mode: metadata.permissions(),
                     owner: metadata_owner(&metadata),
@@ -725,9 +515,10 @@ impl Archive {
                 };
 
                 if let Some(entries) = entries {
-                    entries.push(Entry::Symlink(Box::new(link_entry)));
+                    entries.push(entries::Entry::Symlink(Box::new(link_entry)));
                 } else {
-                    self.entries.push(Entry::Symlink(Box::new(link_entry)));
+                    self.entries
+                        .push(entries::Entry::Symlink(Box::new(link_entry)));
                 }
             }
         }
@@ -739,7 +530,10 @@ impl Archive {
         Ok(())
     }
 
-    fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> Result<Entry, std::io::Error> {
+    fn decode_entry<S: Read>(
+        decoder: &mut S,
+        file: Arc<File>,
+    ) -> Result<entries::Entry, std::io::Error> {
         let name_length = varint::decode_u32(decoder) as usize;
 
         let mut name_bytes = vec![0; name_length];
@@ -770,7 +564,7 @@ impl Archive {
                 };
                 let offset = varint::decode_u64(decoder);
 
-                Ok(Entry::File(Box::new(FileEntry {
+                Ok(entries::Entry::File(Box::new(entries::FileEntry {
                     name,
                     mode,
                     owner: (uid, gid),
@@ -785,19 +579,21 @@ impl Archive {
                 })))
             }
             1 => {
-                let mut entries: Vec<Entry> = Vec::with_capacity(size as usize);
+                let mut entries: Vec<entries::Entry> = Vec::with_capacity(size as usize);
                 for _ in 0..size {
                     let entry = Self::decode_entry(decoder, file.clone())?;
                     entries.push(entry);
                 }
 
-                Ok(Entry::Directory(Box::new(DirectoryEntry {
-                    name,
-                    mode,
-                    owner: (uid, gid),
-                    mtime,
-                    entries,
-                })))
+                Ok(entries::Entry::Directory(Box::new(
+                    entries::DirectoryEntry {
+                        name,
+                        mode,
+                        owner: (uid, gid),
+                        mtime,
+                        entries,
+                    },
+                )))
             }
             2 => {
                 let mut target_bytes = vec![0; size as usize];
@@ -809,7 +605,7 @@ impl Archive {
                 decoder.read_exact(&mut target_dir_bytes)?;
                 let target_dir = target_dir_bytes[0] != 0;
 
-                Ok(Entry::Symlink(Box::new(SymlinkEntry {
+                Ok(entries::Entry::Symlink(Box::new(entries::SymlinkEntry {
                     name,
                     mode,
                     owner: (uid, gid),

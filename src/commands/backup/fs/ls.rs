@@ -2,7 +2,7 @@ use crate::commands::open_repository;
 use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::archive::Entry;
+use ddup_bak::archive::entries::Entry;
 use std::{collections::HashMap, fs::Permissions, path::Path, time::SystemTime};
 
 fn render_unix_permissions(mode: &Permissions) -> String {
@@ -157,25 +157,33 @@ fn calculate_column_widths(
     entries: &[&Entry],
     users: &mut HashMap<u32, String>,
     groups: &mut HashMap<u32, String>,
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
+    let mut max_link_count_len = 0;
     let mut max_user_len = 0;
     let mut max_group_len = 0;
 
     for entry in entries {
+        let link_count = match entry {
+            Entry::Directory(dir) => dir.entries.len(),
+            _ => 1,
+        };
+
         let (uid, gid) = entry.owner();
 
         let username = users.entry(uid).or_insert_with(|| get_username(uid));
         let groupname = groups.entry(gid).or_insert_with(|| get_groupname(gid));
 
+        max_link_count_len = max_link_count_len.max(link_count.to_string().len());
         max_user_len = max_user_len.max(username.len());
         max_group_len = max_group_len.max(groupname.len());
     }
 
-    (max_user_len, max_group_len)
+    (max_link_count_len, max_user_len, max_group_len)
 }
 
 fn render_entry(
     entry: &Entry,
+    link_count_width: usize,
     user_width: usize,
     group_width: usize,
     users: &HashMap<u32, String>,
@@ -199,7 +207,7 @@ fn render_entry(
             };
 
             format!(
-                "{}{} {:>4} {:<width_user$} {:<width_group$}     {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {}",
                 file_type,
                 perms,
                 1,
@@ -207,16 +215,17 @@ fn render_entry(
                 groupname,
                 time_str,
                 name,
+                width_link_count = link_count_width,
                 width_user = user_width,
                 width_group = group_width
             )
         }
         Entry::Directory(dir) => {
             let name = dir.name.blue().bold();
-            let link_count = (dir.entries.len() + 2).to_string();
+            let link_count = dir.entries.len();
 
             format!(
-                "{}{} {:>4} {:<width_user$} {:<width_group$}     {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {}",
                 file_type,
                 perms,
                 link_count,
@@ -224,6 +233,7 @@ fn render_entry(
                 groupname,
                 time_str,
                 name,
+                width_link_count = link_count_width,
                 width_user = user_width,
                 width_group = group_width
             )
@@ -240,7 +250,7 @@ fn render_entry(
             );
 
             format!(
-                "{}{} {:>4} {:<width_user$} {:<width_group$}     {} {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {} {}",
                 file_type,
                 perms,
                 1,
@@ -249,6 +259,7 @@ fn render_entry(
                 time_str,
                 name,
                 target,
+                width_link_count = link_count_width,
                 width_user = user_width,
                 width_group = group_width
             )
@@ -256,17 +267,35 @@ fn render_entry(
     }
 }
 
-fn render_entries(entries: &[&Entry]) -> String {
+fn render_entries(mut entries: Vec<&Entry>) {
     let mut users: HashMap<u32, String> = HashMap::new();
     let mut groups: HashMap<u32, String> = HashMap::new();
 
-    let (user_width, group_width) = calculate_column_widths(entries, &mut users, &mut groups);
+    let (link_count_width, user_width, group_width) =
+        calculate_column_widths(&entries, &mut users, &mut groups);
 
-    entries
-        .iter()
-        .map(|entry| render_entry(entry, user_width, group_width, &users, &groups))
-        .collect::<Vec<_>>()
-        .join("\n")
+    entries.sort_by(|a, b| {
+        let a_name = a.name();
+        let b_name = b.name();
+
+        if a_name == b_name {
+            return a.mtime().cmp(&b.mtime());
+        }
+
+        a_name.cmp(b_name)
+    });
+
+    for entry in entries {
+        let rendered_entry = render_entry(
+            entry,
+            link_count_width,
+            user_width,
+            group_width,
+            &users,
+            &groups,
+        );
+        println!("{}", rendered_entry);
+    }
 }
 
 pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
@@ -292,7 +321,7 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
     let archive = repository.get_archive(name).unwrap();
 
     let path = Path::new(path.map_or(".", |s| s.as_str()));
-    if let Some(entry) = archive.find_archive_entry(Path::new(path)).unwrap() {
+    if let Some(entry) = archive.find_archive_entry(path).unwrap() {
         let mut entries = Vec::new();
 
         match entry {
@@ -308,13 +337,11 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
 
         println!("total {} entries", entries.len());
 
-        let rendered_entries = render_entries(&entries);
-        println!("{}", rendered_entries);
+        render_entries(entries);
     } else if path.components().all(|c| c.as_os_str() == ".") {
         println!("total {} entries", archive.entries().len());
 
-        let rendered_entries = render_entries(&archive.entries().iter().collect::<Vec<_>>());
-        println!("{}", rendered_entries);
+        render_entries(archive.entries().iter().collect::<Vec<_>>());
     } else {
         println!(
             "{} {}",

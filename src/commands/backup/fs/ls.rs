@@ -3,7 +3,7 @@ use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::archive::entries::Entry;
-use std::{collections::HashMap, fs::Permissions, path::Path, time::SystemTime};
+use std::{collections::HashMap, fs::Permissions, io::Write, path::Path, time::SystemTime};
 
 fn render_unix_permissions(mode: &Permissions) -> String {
     #[cfg(unix)]
@@ -11,7 +11,7 @@ fn render_unix_permissions(mode: &Permissions) -> String {
         use std::os::unix::fs::PermissionsExt;
 
         let mode_bits = mode.mode();
-        let mut result = String::new();
+        let mut result = String::with_capacity(10);
 
         result.push(if mode_bits & 0o400 != 0 { 'r' } else { '-' });
         result.push(if mode_bits & 0o200 != 0 { 'w' } else { '-' });
@@ -32,34 +32,25 @@ fn render_unix_permissions(mode: &Permissions) -> String {
         if mode.readonly() {
             "r--".to_string()
         } else {
-            "r-x".to_string()
+            "rw-".to_string()
         }
     }
 }
 
 fn format_time(time: SystemTime) -> String {
     let datetime: DateTime<Local> = time.into();
-    datetime.format("%b %e %H:%M").to_string()
-}
 
-fn get_file_type_char(entry: &Entry) -> &'static str {
-    match entry {
-        Entry::File(_) => "-",
-        Entry::Directory(_) => "d",
-        Entry::Symlink(_) => "l",
-    }
+    datetime.format("%b %e %H:%M").to_string()
 }
 
 #[cfg(unix)]
 fn get_username(uid: u32) -> String {
     use libc::{getpwuid, getpwuid_r, passwd, uid_t};
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
-    use std::ptr;
+    use std::{ffi::CStr, mem::MaybeUninit};
 
     let mut buf = [0; 2048];
     let mut result = MaybeUninit::<passwd>::uninit();
-    let mut passwd_ptr = ptr::null_mut();
+    let mut passwd_ptr = std::ptr::null_mut();
 
     unsafe {
         let ret = getpwuid_r(
@@ -75,6 +66,7 @@ fn get_username(uid: u32) -> String {
             let username = CStr::from_ptr(passwd.pw_name)
                 .to_string_lossy()
                 .into_owned();
+
             return username;
         }
     }
@@ -85,23 +77,22 @@ fn get_username(uid: u32) -> String {
             let username = CStr::from_ptr((*passwd).pw_name)
                 .to_string_lossy()
                 .into_owned();
+
             return username;
         }
     }
 
-    format!("{}", uid)
+    uid.to_string()
 }
 
 #[cfg(unix)]
 fn get_groupname(gid: u32) -> String {
     use libc::{getgrgid, getgrgid_r, gid_t, group};
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
-    use std::ptr;
+    use std::{ffi::CStr, mem::MaybeUninit};
 
     let mut buf = [0; 2048];
     let mut result = MaybeUninit::<group>::uninit();
-    let mut group_ptr = ptr::null_mut();
+    let mut group_ptr = std::ptr::null_mut();
 
     unsafe {
         let ret = getgrgid_r(
@@ -115,6 +106,7 @@ fn get_groupname(gid: u32) -> String {
         if ret == 0 && !group_ptr.is_null() {
             let group = result.assume_init();
             let groupname = CStr::from_ptr(group.gr_name).to_string_lossy().into_owned();
+
             return groupname;
         }
     }
@@ -125,32 +117,34 @@ fn get_groupname(gid: u32) -> String {
             let groupname = CStr::from_ptr((*group).gr_name)
                 .to_string_lossy()
                 .into_owned();
+
             return groupname;
         }
     }
 
-    format!("{}", gid)
+    gid.to_string()
 }
 
 #[cfg(not(unix))]
 fn get_username(uid: u32) -> String {
-    format!("{}", uid)
+    uid.to_string()
 }
 
 #[cfg(not(unix))]
 fn get_groupname(gid: u32) -> String {
-    format!("{}", gid)
+    gid.to_string()
 }
 
 #[cfg(unix)]
 fn is_executable(mode: &Permissions) -> bool {
     use std::os::unix::fs::PermissionsExt;
+
     mode.mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
 fn is_executable(_mode: &Permissions) -> bool {
-    !_mode.readonly()
+    false
 }
 
 fn calculate_column_widths(
@@ -189,7 +183,11 @@ fn render_entry(
     users: &HashMap<u32, String>,
     groups: &HashMap<u32, String>,
 ) -> String {
-    let file_type = get_file_type_char(entry);
+    let file_type = match entry {
+        Entry::File(_) => '-',
+        Entry::Directory(_) => 'd',
+        Entry::Symlink(_) => 'l',
+    };
 
     let (uid, gid) = entry.owner();
     let username = users.get(&uid).unwrap();
@@ -285,6 +283,8 @@ fn render_entries(mut entries: Vec<&Entry>) {
         a_name.cmp(b_name)
     });
 
+    let mut lock = std::io::stdout().lock();
+
     for entry in entries {
         let rendered_entry = render_entry(
             entry,
@@ -294,7 +294,8 @@ fn render_entries(mut entries: Vec<&Entry>) {
             &users,
             &groups,
         );
-        println!("{}", rendered_entry);
+
+        writeln!(lock, "{}", rendered_entry).unwrap();
     }
 }
 

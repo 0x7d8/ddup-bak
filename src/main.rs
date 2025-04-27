@@ -24,8 +24,20 @@ fn cli() -> Command {
                 .arg(
                     Arg::new("chunk_size")
                         .help("The chunk size to use for the repository (bytes)")
+                        .short('c')
+                        .long("chunk-size")
                         .num_args(1)
                         .default_value("1048576")
+                        .value_parser(clap::value_parser!(usize))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("max_chunk_count")
+                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value")
+                        .short('m')
+                        .long("max-chunk-size")
+                        .num_args(1)
+                        .default_value("1000")
                         .value_parser(clap::value_parser!(usize))
                         .required(false),
                 )

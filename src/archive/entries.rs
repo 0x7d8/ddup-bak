@@ -84,7 +84,7 @@ impl Read for FileEntry {
                         file: Arc::clone(&self.file),
                         offset: self.offset,
                         position: 0,
-                        compressed_size: self.size_compressed.unwrap(),
+                        size: self.size_compressed.unwrap(),
                     };
 
                     let decoder = Box::new(GzDecoder::new(reader));
@@ -110,7 +110,7 @@ impl Read for FileEntry {
                         file: Arc::clone(&self.file),
                         offset: self.offset,
                         position: 0,
-                        compressed_size: self.size_compressed.unwrap(),
+                        size: self.size_compressed.unwrap(),
                     };
 
                     let decoder = Box::new(DeflateDecoder::new(reader));
@@ -210,22 +210,22 @@ impl Entry {
 struct BoundedReader {
     file: Arc<File>,
     offset: u64,
+    size: u64,
     position: u64,
-    compressed_size: u64,
 }
 
 impl Read for BoundedReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.position >= self.compressed_size {
+        if self.position >= self.size {
             return Ok(0);
         }
 
-        let remaining = self.compressed_size - self.position;
+        let remaining = self.size - self.position;
         let to_read = std::cmp::min(buf.len(), remaining as usize);
 
         let bytes_read = self
             .file
-            .read_at(self.offset + self.position, &mut buf[0..to_read])?;
+            .read_at(self.offset + self.position, &mut buf[..to_read])?;
         self.position += bytes_read as u64;
 
         Ok(bytes_read)

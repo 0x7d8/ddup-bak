@@ -23,7 +23,9 @@ pub struct ChunkIndex {
     deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
     chunks: Arc<RwLock<HashMap<u64, (ChunkHash, u64)>>>,
     chunk_hashes: Arc<RwLock<HashMap<ChunkHash, u64>>>,
+
     chunk_size: usize,
+    max_chunk_count: usize,
 }
 
 impl Clone for ChunkIndex {
@@ -35,13 +37,15 @@ impl Clone for ChunkIndex {
             deleted_chunks: Arc::clone(&self.deleted_chunks),
             chunks: Arc::clone(&self.chunks),
             chunk_hashes: Arc::clone(&self.chunk_hashes),
+
             chunk_size: self.chunk_size,
+            max_chunk_count: self.max_chunk_count,
         }
     }
 }
 
 impl ChunkIndex {
-    pub fn new(directory: PathBuf, chunk_size: usize) -> Self {
+    pub fn new(directory: PathBuf, chunk_size: usize, max_chunk_count: usize) -> Self {
         ChunkIndex {
             directory,
             save_on_drop: true,
@@ -49,7 +53,9 @@ impl ChunkIndex {
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
             chunks: Arc::new(RwLock::new(HashMap::new())),
             chunk_hashes: Arc::new(RwLock::new(HashMap::new())),
+
             chunk_size,
+            max_chunk_count,
         }
     }
 
@@ -57,13 +63,14 @@ impl ChunkIndex {
         let file = File::open(directory.join("chunks/index"))?;
         let mut decoder = DeflateDecoder::new(file);
 
-        let mut buffer = [0; 28];
+        let mut buffer = [0; 32];
         decoder.read_exact(&mut buffer)?;
 
         let deleted_chunks = u64::from_le_bytes(buffer[0..8].try_into().unwrap()) as usize;
         let chunk_size = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
-        let chunk_count = u64::from_le_bytes(buffer[12..20].try_into().unwrap()) as usize;
-        let next_id = u64::from_le_bytes(buffer[20..28].try_into().unwrap());
+        let max_chunk_count = u32::from_le_bytes(buffer[12..16].try_into().unwrap()) as usize;
+        let chunk_count = u64::from_le_bytes(buffer[16..24].try_into().unwrap()) as usize;
+        let next_id = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
 
         let mut result_deleted_chunks = VecDeque::with_capacity(deleted_chunks);
         let mut result_chunks = HashMap::with_capacity(chunk_count);
@@ -94,7 +101,9 @@ impl ChunkIndex {
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
             chunks: Arc::new(RwLock::new(result_chunks)),
             chunk_hashes: Arc::new(RwLock::new(result_chunk_hashes)),
+
             chunk_size,
+            max_chunk_count,
         })
     }
 
@@ -317,11 +326,18 @@ impl ChunkIndex {
         compression: CompressionFormat,
     ) -> std::io::Result<Vec<u64>> {
         let mut file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let len = file.metadata()?.len() as usize;
 
-        let mut chunks = Vec::with_capacity(len as usize / self.chunk_size);
-        let mut chunk_ids = Vec::with_capacity(len as usize / self.chunk_size);
-        let mut buffer = vec![0; self.chunk_size];
+        let mut chunk_count = len / self.chunk_size;
+        let mut chunk_size = self.chunk_size;
+        while chunk_count > self.max_chunk_count {
+            chunk_count /= 2;
+            chunk_size *= 2;
+        }
+
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut chunk_ids = Vec::with_capacity(chunk_count);
+        let mut buffer = vec![0; chunk_size];
         let mut hasher = Blake2b::<U32>::new();
 
         loop {
@@ -366,6 +382,9 @@ impl Drop for ChunkIndex {
             .unwrap();
         encoder
             .write_all(&(self.chunk_size as u32).to_le_bytes())
+            .unwrap();
+        encoder
+            .write_all(&(self.max_chunk_count as u32).to_le_bytes())
             .unwrap();
         encoder
             .write_all(&(self.chunks.read().unwrap().len() as u64).to_le_bytes())

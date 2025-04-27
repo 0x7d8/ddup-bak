@@ -5,7 +5,10 @@ use std::path::Path;
 
 pub fn init(matches: &ArgMatches) -> i32 {
     let directory = matches.get_one::<String>("directory").expect("required");
-    let chunk_size = matches.get_one::<usize>("chunk_size").expect("required");
+    let chunk_size = *matches.get_one::<usize>("chunk_size").expect("required");
+    let max_chunk_count = *matches
+        .get_one::<usize>("max_chunk_count")
+        .expect("required");
 
     if std::path::Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "already exists!".red());
@@ -20,7 +23,12 @@ pub fn init(matches: &ArgMatches) -> i32 {
         "...".bright_black()
     );
 
-    Repository::new(Path::new(directory), *chunk_size, Vec::new());
+    Repository::new(
+        Path::new(directory),
+        chunk_size,
+        max_chunk_count,
+        Vec::new(),
+    );
 
     println!(
         "{} {} {} {}",

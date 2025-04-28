@@ -3,6 +3,7 @@ use crate::{
     chunks::ChunkIndex,
 };
 use std::{
+    collections::HashMap,
     fs::{File, FileTimes},
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -161,6 +162,7 @@ impl Repository {
         progress_chunking: ProgressCallback,
         scope: &rayon::Scope,
         error: Arc<RwLock<Option<std::io::Error>>>,
+        sizes: Arc<RwLock<HashMap<PathBuf, u64>>>,
     ) -> std::io::Result<()> {
         let path = entry.path();
         let destination = temp_path.join(path.file_name().unwrap());
@@ -197,6 +199,8 @@ impl Repository {
                 let (uid, gid) = (metadata.uid(), metadata.gid());
                 std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
             }
+
+            sizes.write().unwrap().insert(destination, metadata.len());
         } else if metadata.is_dir() {
             std::fs::create_dir_all(&destination)?;
 
@@ -211,6 +215,7 @@ impl Repository {
             for sub_entry in std::fs::read_dir(&path)?.flatten() {
                 scope.spawn({
                     let error = Arc::clone(&error);
+                    let sizes = Arc::clone(&sizes);
                     let destination = destination.clone();
                     let chunk_index = chunk_index.clone();
                     let progress_chunking = progress_chunking.clone();
@@ -223,11 +228,9 @@ impl Repository {
                             progress_chunking,
                             scope,
                             Arc::clone(&error),
+                            Arc::clone(&sizes),
                         ) {
-                            let mut error = error.write().unwrap();
-                            if error.is_none() {
-                                *error = Some(err);
-                            }
+                            *error.write().unwrap() = Some(err);
                         }
                     }
                 });
@@ -285,6 +288,7 @@ impl Repository {
                 .unwrap(),
         );
         let error = Arc::new(RwLock::new(None));
+        let sizes = Arc::new(RwLock::new(HashMap::new()));
 
         worker_pool.in_place_scope(|scope| {
             for entry in std::fs::read_dir(directory.unwrap_or(&self.directory))
@@ -300,6 +304,7 @@ impl Repository {
 
                 scope.spawn({
                     let error = Arc::clone(&error);
+                    let sizes = Arc::clone(&sizes);
                     let chunk_index = self.chunk_index.clone();
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
                     let progress_chunking = progress_chunking.clone();
@@ -312,6 +317,7 @@ impl Repository {
                             progress_chunking,
                             scope,
                             Arc::clone(&error),
+                            Arc::clone(&sizes),
                         ) {
                             let mut error = error.write().unwrap();
                             if error.is_none() {
@@ -328,6 +334,16 @@ impl Repository {
         }
 
         let mut archive = Archive::new(File::create(&archive_path)?);
+
+        archive.set_real_size_callback(Some(Arc::new(move |entry| {
+            let sizes = sizes.read().unwrap();
+
+            if let Some(size) = sizes.get(&entry.to_path_buf()) {
+                *size
+            } else {
+                0
+            }
+        })));
 
         let entries = std::fs::read_dir(&archive_tmp_path)?
             .flatten()

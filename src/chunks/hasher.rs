@@ -18,7 +18,7 @@ impl Hasher for RandomizingHasher {
             let randomized = id.wrapping_mul(0x9E3779B97F4A7C15);
             self.base_hasher.write(&randomized.to_ne_bytes());
         } else if bytes.len() == 32 {
-            let mut mixed = [0u8; 32];
+            let mut mixed = [0; 32];
             for i in 0..32 {
                 mixed[i] = bytes[(i * 13) % 32];
             }

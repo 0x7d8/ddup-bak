@@ -5,6 +5,21 @@ use colored::Colorize;
 use ddup_bak::archive::entries::Entry;
 use std::{collections::HashMap, fs::Permissions, io::Write, path::Path, time::SystemTime};
 
+#[inline]
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes < 1024 * 1024 * 1024 * 1024 {
+        format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.1}T", bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn render_unix_permissions(mode: &Permissions) -> String {
     #[cfg(unix)]
     {
@@ -151,14 +166,21 @@ fn calculate_column_widths(
     entries: &[&Entry],
     users: &mut HashMap<u32, String>,
     groups: &mut HashMap<u32, String>,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     let mut max_link_count_len = 0;
     let mut max_user_len = 0;
     let mut max_group_len = 0;
+    let mut max_size_len = 0;
 
     for entry in entries {
         let link_count = match entry {
             Entry::Directory(dir) => dir.entries.len(),
+            _ => 1,
+        };
+
+        let size = match entry {
+            Entry::File(file) => format_bytes(file.size_real).len(),
+            Entry::Symlink(link) => format_bytes(link.target.len() as u64).len(),
             _ => 1,
         };
 
@@ -170,9 +192,15 @@ fn calculate_column_widths(
         max_link_count_len = max_link_count_len.max(link_count.to_string().len());
         max_user_len = max_user_len.max(username.len());
         max_group_len = max_group_len.max(groupname.len());
+        max_size_len = max_size_len.max(size);
     }
 
-    (max_link_count_len, max_user_len, max_group_len)
+    (
+        max_link_count_len,
+        max_user_len,
+        max_group_len,
+        max_size_len,
+    )
 }
 
 fn render_entry(
@@ -180,6 +208,7 @@ fn render_entry(
     link_count_width: usize,
     user_width: usize,
     group_width: usize,
+    size_width: usize,
     users: &HashMap<u32, String>,
     groups: &HashMap<u32, String>,
 ) -> String {
@@ -205,17 +234,19 @@ fn render_entry(
             };
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}",
                 file_type,
                 perms,
                 1,
                 username,
                 groupname,
+                format_bytes(file.size_real),
                 time_str,
                 name,
                 width_link_count = link_count_width,
                 width_user = user_width,
-                width_group = group_width
+                width_group = group_width,
+                width_size = size_width
             )
         }
         Entry::Directory(dir) => {
@@ -223,17 +254,19 @@ fn render_entry(
             let link_count = dir.entries.len();
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}",
                 file_type,
                 perms,
                 link_count,
                 username,
                 groupname,
+                0,
                 time_str,
                 name,
                 width_link_count = link_count_width,
                 width_user = user_width,
-                width_group = group_width
+                width_group = group_width,
+                width_size = size_width
             )
         }
         Entry::Symlink(link) => {
@@ -248,18 +281,20 @@ fn render_entry(
             );
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$}   {} {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {} {}",
                 file_type,
                 perms,
                 1,
                 username,
                 groupname,
+                format_bytes(link.target.len() as u64),
                 time_str,
                 name,
                 target,
                 width_link_count = link_count_width,
                 width_user = user_width,
-                width_group = group_width
+                width_group = group_width,
+                width_size = size_width
             )
         }
     }
@@ -269,7 +304,7 @@ fn render_entries(mut entries: Vec<&Entry>) {
     let mut users: HashMap<u32, String> = HashMap::new();
     let mut groups: HashMap<u32, String> = HashMap::new();
 
-    let (link_count_width, user_width, group_width) =
+    let (link_count_width, user_width, group_width, size_width) =
         calculate_column_widths(&entries, &mut users, &mut groups);
 
     entries.sort_by(|a, b| {
@@ -291,6 +326,7 @@ fn render_entries(mut entries: Vec<&Entry>) {
             link_count_width,
             user_width,
             group_width,
+            size_width,
             &users,
             &groups,
         );
@@ -336,11 +372,38 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
             }
         }
 
-        println!("total {} entries", entries.len());
+        println!(
+            "total {} entries, {}",
+            entries.len(),
+            format_bytes(
+                entries
+                    .iter()
+                    .map(|e| match e {
+                        Entry::File(f) => f.size_real,
+                        Entry::Symlink(s) => s.target.len() as u64,
+                        _ => 0,
+                    })
+                    .sum()
+            )
+        );
 
         render_entries(entries);
     } else if path.components().all(|c| c.as_os_str() == ".") {
-        println!("total {} entries", archive.entries().len());
+        println!(
+            "total {} entries, {}",
+            archive.entries().len(),
+            format_bytes(
+                archive
+                    .entries()
+                    .iter()
+                    .map(|e| match e {
+                        Entry::File(f) => f.size_real,
+                        Entry::Symlink(s) => s.target.len() as u64,
+                        _ => 0,
+                    })
+                    .sum()
+            )
+        );
 
         render_entries(archive.entries().iter().collect::<Vec<_>>());
     } else {

@@ -96,11 +96,13 @@ fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
 pub type ProgressCallback = Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>;
 type CompressionFormatCallback =
     Option<Arc<dyn Fn(&Path, &Metadata) -> CompressionFormat + Send + Sync + 'static>>;
+type RealSizeCallback = Option<Arc<dyn Fn(&Path) -> u64 + Send + Sync + 'static>>;
 
 pub struct Archive {
     file: Arc<File>,
     version: u8,
     compression_callback: CompressionFormatCallback,
+    real_size_callback: RealSizeCallback,
 
     entries: Vec<entries::Entry>,
     entries_offset: u64,
@@ -129,6 +131,7 @@ impl Archive {
             file: Arc::new(file),
             version: FILE_VERSION,
             compression_callback: None,
+            real_size_callback: None,
             entries: Vec::new(),
             entries_offset: 8,
         }
@@ -169,6 +172,7 @@ impl Archive {
             file,
             version,
             compression_callback: None,
+            real_size_callback: None,
             entries,
             entries_offset,
         })
@@ -180,6 +184,16 @@ impl Archive {
     #[inline]
     pub fn set_compression_callback(&mut self, callback: CompressionFormatCallback) -> &mut Self {
         self.compression_callback = callback;
+
+        self
+    }
+
+    /// Sets the "real" size callback for the archive.
+    /// This callback is called for each added file entry in the archive.
+    /// The callback should return the "real" size of the file.
+    #[inline]
+    pub fn set_real_size_callback(&mut self, callback: RealSizeCallback) -> &mut Self {
+        self.real_size_callback = callback;
 
         self
     }
@@ -469,7 +483,10 @@ impl Archive {
                     CompressionFormat::None => None,
                     _ => Some(self.file.stream_position()? - self.entries_offset),
                 },
-                size_real: metadata.len(),
+                size_real: match self.real_size_callback {
+                    Some(ref f) => f(&path),
+                    None => metadata.len(),
+                },
                 size: metadata.len(),
                 offset: self.entries_offset,
                 consumed: 0,

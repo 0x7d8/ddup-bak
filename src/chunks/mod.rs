@@ -8,7 +8,7 @@ use flate2::{
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
@@ -436,13 +436,9 @@ impl ChunkIndex {
         chunk_count: usize,
         threads: usize,
     ) -> std::io::Result<Vec<u64>> {
-        use std::io::{Seek, SeekFrom};
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-
         let file_size = std::fs::metadata(path)?.len() as usize;
 
-        let mut chunk_boundaries = Vec::with_capacity(chunk_count);
+        let mut chunk_boundaries = VecDeque::with_capacity(chunk_count);
         for i in 0..chunk_count {
             let start = i * chunk_size;
             let end = if i == chunk_count - 1 {
@@ -452,7 +448,7 @@ impl ChunkIndex {
             };
 
             if start < file_size {
-                chunk_boundaries.push((i, start, end.min(file_size)));
+                chunk_boundaries.push_back((i, start, end.min(file_size)));
             }
         }
 
@@ -460,33 +456,27 @@ impl ChunkIndex {
 
         let pool_size = threads.min(expected_chunks);
         let path = path.clone();
-        let self_clone = self.clone();
 
         let chunk_queue = Arc::new(Mutex::new(chunk_boundaries));
         let results = Arc::new(Mutex::new(Vec::with_capacity(expected_chunks)));
         let error = Arc::new(RwLock::new(None));
 
         let mut handles = Vec::with_capacity(pool_size);
-
         for _ in 0..pool_size {
             let chunk_queue = Arc::clone(&chunk_queue);
             let results = Arc::clone(&results);
             let error = Arc::clone(&error);
             let path = path.clone();
-            let self_clone = self_clone.clone();
+            let self_clone = self.clone();
 
-            let handle = thread::spawn(move || {
+            let handle = std::thread::spawn(move || {
                 loop {
-                    let chunk_info = {
-                        let mut queue = chunk_queue.lock().unwrap();
-                        if queue.is_empty() {
+                    let (idx, start, end) =
+                        if let Some(chunk) = chunk_queue.lock().unwrap().pop_front() {
+                            chunk
+                        } else {
                             break;
-                        }
-
-                        queue.remove(0)
-                    };
-
-                    let (idx, start, end) = chunk_info;
+                        };
 
                     if error.read().unwrap().is_some() {
                         continue;
@@ -575,7 +565,7 @@ impl ChunkIndex {
         drop(results_lock);
 
         for (i, chunk_id) in chunk_ids.iter().enumerate() {
-            let mut entry = self_clone
+            let mut entry = self
                 .chunks
                 .entry(*chunk_id)
                 .or_insert_with(|| (chunks[i], 0));

@@ -1,3 +1,3 @@
 # ddup-bak
 
-very experimental archive format that can use multiple different compression formats per file
+very experimental archive/dedup format that can use multiple different compression formats per file/chunk

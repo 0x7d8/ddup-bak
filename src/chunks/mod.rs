@@ -8,7 +8,7 @@ use flate2::{
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
@@ -357,62 +357,90 @@ impl ChunkIndex {
             chunk_threshold = self.max_chunk_count / 2;
         }
 
-        if chunk_count > chunk_threshold {
+        if chunk_count > chunk_threshold && scope.is_some() {
+            let threads = rayon::current_num_threads();
+
             if let Some(scope) = scope {
-                return self.chunk_file_with_scope(
-                    path,
-                    compression,
-                    chunk_size,
-                    chunk_count,
-                    scope,
-                );
+                let path = path.clone();
+                let self_clone = self.clone();
+
+                let (sender, receiver) = std::sync::mpsc::channel();
+
+                scope.spawn(move |_| {
+                    match self_clone.chunk_file_parallel(
+                        &path,
+                        compression,
+                        chunk_size,
+                        chunk_count,
+                        threads,
+                    ) {
+                        Ok(chunk_ids) => {
+                            let _ = sender.send(Ok(chunk_ids));
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(e));
+                        }
+                    }
+                });
+
+                match receiver.recv() {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to receive result from parallel chunking task",
+                    )),
+                }
+            } else {
+                self.chunk_file_parallel(path, compression, chunk_size, chunk_count, threads)
             }
-        }
+        } else {
+            let mut file = File::open(path)?;
+            let mut chunks = Vec::with_capacity(chunk_count);
+            let mut chunk_ids = Vec::with_capacity(chunk_count);
+            let mut buffer = vec![0; chunk_size];
+            let mut hasher = Blake2b::<U32>::new();
 
-        let mut file = File::open(path)?;
-        let mut chunks = Vec::with_capacity(chunk_count);
-        let mut chunk_ids = Vec::with_capacity(chunk_count);
-        let mut buffer = vec![0; chunk_size];
-        let mut hasher = Blake2b::<U32>::new();
+            loop {
+                let bytes_read = file.read(&mut buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
 
-        loop {
-            let bytes_read = file.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
+                hasher.update(&buffer[..bytes_read]);
+                let hash = hasher.finalize_reset();
+                let mut hash_array = [0; 32];
+                hash_array.copy_from_slice(&hash);
+
+                chunk_ids.push(self.add_chunk(&hash_array, &buffer[..bytes_read], compression)?);
+                chunks.push(hash_array);
             }
 
-            hasher.update(&buffer[..bytes_read]);
-            let hash = hasher.finalize_reset();
-            let mut hash_array = [0; 32];
-            hash_array.copy_from_slice(&hash);
+            for (i, chunk_id) in chunk_ids.iter().enumerate() {
+                let mut entry = self
+                    .chunks
+                    .entry(*chunk_id)
+                    .or_insert_with(|| (chunks[i], 0));
 
-            chunk_ids.push(self.add_chunk(&hash_array, &buffer[..bytes_read], compression)?);
-            chunks.push(hash_array);
+                entry.1 += 1;
+            }
+
+            Ok(chunk_ids)
         }
-
-        for (i, chunk_id) in chunk_ids.iter().enumerate() {
-            let mut entry = self
-                .chunks
-                .entry(*chunk_id)
-                .or_insert_with(|| (chunks[i], 0));
-
-            entry.1 += 1;
-        }
-
-        Ok(chunk_ids)
     }
 
-    fn chunk_file_with_scope(
+    fn chunk_file_parallel(
         &self,
         path: &PathBuf,
         compression: CompressionFormat,
         chunk_size: usize,
         chunk_count: usize,
-        scope: &rayon::Scope<'_>,
+        threads: usize,
     ) -> std::io::Result<Vec<u64>> {
+        use std::io::{Seek, SeekFrom};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
         let file_size = std::fs::metadata(path)?.len() as usize;
-        let path = path.clone();
-        let self_clone = self.clone();
 
         let mut chunk_boundaries = Vec::with_capacity(chunk_count);
         for i in 0..chunk_count {
@@ -428,19 +456,40 @@ impl ChunkIndex {
             }
         }
 
-        let results = Arc::new(Mutex::new(Vec::with_capacity(chunk_count)));
+        let expected_chunks = chunk_boundaries.len();
+
+        let pool_size = threads.min(expected_chunks);
+        let path = path.clone();
+        let self_clone = self.clone();
+
+        let chunk_queue = Arc::new(Mutex::new(chunk_boundaries));
+        let results = Arc::new(Mutex::new(Vec::with_capacity(expected_chunks)));
         let error = Arc::new(RwLock::new(None));
 
-        for (idx, start, end) in chunk_boundaries {
-            scope.spawn({
-                let path = path.clone();
-                let self_clone = self_clone.clone();
-                let results = Arc::clone(&results);
-                let error = Arc::clone(&error);
+        let mut handles = Vec::with_capacity(pool_size);
 
-                move |_| {
+        for _ in 0..pool_size {
+            let chunk_queue = Arc::clone(&chunk_queue);
+            let results = Arc::clone(&results);
+            let error = Arc::clone(&error);
+            let path = path.clone();
+            let self_clone = self_clone.clone();
+
+            let handle = thread::spawn(move || {
+                loop {
+                    let chunk_info = {
+                        let mut queue = chunk_queue.lock().unwrap();
+                        if queue.is_empty() {
+                            break;
+                        }
+
+                        queue.remove(0)
+                    };
+
+                    let (idx, start, end) = chunk_info;
+
                     if error.read().unwrap().is_some() {
-                        return;
+                        continue;
                     }
 
                     let result = (|| {
@@ -450,6 +499,17 @@ impl ChunkIndex {
                         let chunk_size = end - start;
                         let mut buffer = vec![0; chunk_size];
                         let bytes_read = file.read(&mut buffer[0..chunk_size])?;
+
+                        if bytes_read == 0 && start < file_size {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "Read 0 bytes at position {} (expected up to {})",
+                                    start, chunk_size
+                                ),
+                            ));
+                        }
+
                         buffer.truncate(bytes_read);
 
                         let mut hasher = Blake2b::<U32>::new();
@@ -474,6 +534,17 @@ impl ChunkIndex {
                     }
                 }
             });
+
+            handles.push(handle);
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            if let Err(e) = handle.join() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Worker thread {} panicked: {:?}", i, e),
+                ));
+            }
         }
 
         if let Some(err) = error.write().unwrap().take() {
@@ -481,6 +552,17 @@ impl ChunkIndex {
         }
 
         let mut results_lock = results.lock().unwrap();
+        if results_lock.len() != expected_chunks {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Missing chunks: got {} out of {}",
+                    results_lock.len(),
+                    expected_chunks
+                ),
+            ));
+        }
+
         results_lock.sort_by_key(|(idx, _, _)| *idx);
 
         let mut chunk_ids = Vec::with_capacity(results_lock.len());

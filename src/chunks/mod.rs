@@ -1,16 +1,19 @@
 use crate::{archive::CompressionFormat, repository::DeletionProgressCallback, varint};
 use blake2::{Blake2b, Digest, digest::consts::U32};
+use dashmap::DashMap;
 use flate2::{
     read::{DeflateDecoder, GzDecoder},
     write::{DeflateEncoder, GzEncoder},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
+
+mod hasher;
 
 pub type ChunkHash = [u8; 32];
 
@@ -21,8 +24,8 @@ pub struct ChunkIndex {
 
     next_id: Arc<AtomicU64>,
     deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
-    chunks: Arc<RwLock<HashMap<u64, (ChunkHash, u64)>>>,
-    chunk_hashes: Arc<RwLock<HashMap<ChunkHash, u64>>>,
+    chunks: Arc<DashMap<u64, (ChunkHash, u64), hasher::RandomizingHasherBuilder>>,
+    chunk_hashes: Arc<DashMap<ChunkHash, u64, hasher::RandomizingHasherBuilder>>,
 
     chunk_size: usize,
     max_chunk_count: usize,
@@ -51,9 +54,16 @@ impl ChunkIndex {
             save_on_drop: true,
             next_id: Arc::new(AtomicU64::new(1)),
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
-            chunks: Arc::new(RwLock::new(HashMap::new())),
-            chunk_hashes: Arc::new(RwLock::new(HashMap::new())),
-
+            chunks: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
+                10_000,
+                hasher::RandomizingHasherBuilder,
+                1024,
+            )),
+            chunk_hashes: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
+                10_000,
+                hasher::RandomizingHasherBuilder,
+                1024,
+            )),
             chunk_size,
             max_chunk_count,
         }
@@ -73,8 +83,16 @@ impl ChunkIndex {
         let next_id = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
 
         let mut result_deleted_chunks = VecDeque::with_capacity(deleted_chunks);
-        let mut result_chunks = HashMap::with_capacity(chunk_count);
-        let mut result_chunk_hashes = HashMap::with_capacity(chunk_count);
+        let result_chunks = DashMap::with_capacity_and_hasher_and_shard_amount(
+            chunk_count,
+            hasher::RandomizingHasherBuilder,
+            1024,
+        );
+        let result_chunk_hashes = DashMap::with_capacity_and_hasher_and_shard_amount(
+            chunk_count,
+            hasher::RandomizingHasherBuilder,
+            1024,
+        );
 
         for _ in 0..deleted_chunks {
             let id = varint::decode_u64(&mut decoder);
@@ -99,8 +117,8 @@ impl ChunkIndex {
             save_on_drop: true,
             next_id: Arc::new(AtomicU64::new(next_id)),
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
-            chunks: Arc::new(RwLock::new(result_chunks)),
-            chunk_hashes: Arc::new(RwLock::new(result_chunk_hashes)),
+            chunks: Arc::new(result_chunks),
+            chunk_hashes: Arc::new(result_chunk_hashes),
 
             chunk_size,
             max_chunk_count,
@@ -132,73 +150,76 @@ impl ChunkIndex {
 
     #[inline]
     pub fn references(&self, chunk: &ChunkHash) -> u64 {
-        let id = self.chunk_hashes.read().unwrap();
-        let id = id.get(chunk);
+        if let Some(id) = self.chunk_hashes.get(chunk) {
+            let id = *id.value();
 
-        let id = match id {
-            Some(id) => id,
-            None => return 0,
-        };
-
-        self.chunks
-            .read()
-            .unwrap()
-            .get(id)
-            .copied()
-            .map_or(0, |(_, count)| count)
-    }
-
-    pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
-        for (id, (chunk, count)) in self.chunks.read().unwrap().iter() {
-            if *count == 0 {
-                if let Some(f) = progress.clone() {
-                    f(*id, true)
-                }
-
-                let mut path = self.path_from_chunk(chunk);
-                std::fs::remove_file(&path)?;
-
-                self.chunk_hashes.write().unwrap().remove(chunk);
-
-                while let Some(parent) = path.parent() {
-                    if parent == self.directory {
-                        break;
-                    }
-
-                    if std::fs::read_dir(parent)?.count() == 0 {
-                        std::fs::remove_dir(parent)?;
-                    } else {
-                        break;
-                    }
-
-                    path = parent.to_path_buf();
-                }
-
-                self.deleted_chunks.lock().unwrap().push_back(*id);
+            if let Some(entry) = self.chunks.get(&id) {
+                let (_, count) = entry.value();
+                return *count;
             }
         }
 
-        self.chunks
-            .write()
-            .unwrap()
-            .retain(|_, (_, count)| *count > 0);
+        0
+    }
+
+    pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
+        let chunks_to_delete: Vec<_> = self
+            .chunks
+            .iter()
+            .filter_map(|entry| {
+                let (id, (chunk, count)) = (entry.key(), entry.value());
+                if *count == 0 {
+                    Some((*id, *chunk))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (id, chunk) in chunks_to_delete {
+            if let Some(f) = progress.clone() {
+                f(id, true);
+            }
+
+            let mut path = self.path_from_chunk(&chunk);
+            std::fs::remove_file(&path)?;
+
+            self.chunk_hashes.remove(&chunk);
+            self.chunks.remove(&id);
+
+            while let Some(parent) = path.parent() {
+                if parent == self.directory {
+                    break;
+                }
+
+                if std::fs::read_dir(parent)?.count() == 0 {
+                    std::fs::remove_dir(parent)?;
+                } else {
+                    break;
+                }
+
+                path = parent.to_path_buf();
+            }
+
+            self.deleted_chunks.lock().unwrap().push_back(id);
+        }
 
         Ok(())
     }
 
     #[inline]
     pub fn dereference_chunk_id(&mut self, chunk_id: u64, clean: bool) -> Option<bool> {
-        let mut chunks = self.chunks.write().unwrap();
-        let (_, count) = chunks.get_mut(&chunk_id)?;
+        let mut entry = self.chunks.get_mut(&chunk_id)?;
+        let (chunk, count) = entry.value_mut();
+        let chunk = *chunk;
+
         *count -= 1;
 
         if *count == 0 && clean {
-            drop(chunks);
+            drop(entry);
 
-            let (chunk, _) = *self.chunks.read().unwrap().get(&chunk_id)?;
-
-            self.chunks.write().unwrap().remove(&chunk_id);
-            self.chunk_hashes.write().unwrap().remove(&chunk);
+            self.chunks.remove(&chunk_id);
+            self.chunk_hashes.remove(&chunk);
 
             let mut path = self.path_from_chunk(&chunk);
             std::fs::remove_file(&path).ok()?;
@@ -227,10 +248,12 @@ impl ChunkIndex {
 
     #[inline]
     pub fn read_chunk_id_content(&self, chunk_id: u64) -> Option<Box<dyn Read + Send>> {
-        let chunk = self.chunks.read().unwrap();
-        let (chunk, _) = chunk.get(&chunk_id)?;
-        let path = self.path_from_chunk(chunk);
+        let entry = self.chunks.get(&chunk_id)?;
+        let (chunk, _) = entry.value();
+        let chunk = *chunk;
+        drop(entry);
 
+        let path = self.path_from_chunk(&chunk);
         let mut file = File::open(path).ok()?;
 
         let mut compression_bytes = [0; 1];
@@ -239,22 +262,14 @@ impl ChunkIndex {
 
         match compression {
             CompressionFormat::None => Some(Box::new(file)),
-            CompressionFormat::Gzip => {
-                let decoder = GzDecoder::new(file);
-
-                Some(Box::new(decoder))
-            }
-            CompressionFormat::Deflate => {
-                let decoder = DeflateDecoder::new(file);
-
-                Some(Box::new(decoder))
-            }
+            CompressionFormat::Gzip => Some(Box::new(GzDecoder::new(file))),
+            CompressionFormat::Deflate => Some(Box::new(DeflateDecoder::new(file))),
         }
     }
 
     #[inline]
     pub fn get_chunk_id(&self, chunk: &ChunkHash) -> Option<u64> {
-        self.chunk_hashes.read().unwrap().get(chunk).copied()
+        self.chunk_hashes.get(chunk).map(|v| *v)
     }
 
     #[inline]
@@ -273,24 +288,25 @@ impl ChunkIndex {
         data: &[u8],
         compression: CompressionFormat,
     ) -> std::io::Result<u64> {
-        let id = self.chunk_hashes.read().unwrap().get(chunk).copied();
+        let id = self.chunk_hashes.get(chunk).map(|v| *v);
         let id = match id {
             Some(id) => id,
             None => {
                 let id = self.next_id();
-                self.chunk_hashes.write().unwrap().insert(*chunk, id);
+                self.chunk_hashes.insert(*chunk, id);
 
                 id
             }
         };
 
-        let count = self.chunks.read().unwrap().get(&id).copied();
-        let count = match count {
-            Some((_, count)) => count,
-            None => 0,
+        let has_references = if let Some(entry) = self.chunks.get(&id) {
+            let (_, count) = entry.value();
+            *count > 0
+        } else {
+            false
         };
 
-        if count > 0 {
+        if has_references {
             return Ok(id);
         }
 
@@ -324,24 +340,43 @@ impl ChunkIndex {
         &self,
         path: &PathBuf,
         compression: CompressionFormat,
+        scope: Option<&rayon::Scope<'_>>,
     ) -> std::io::Result<Vec<u64>> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
 
         let mut chunk_count = len / self.chunk_size;
         let mut chunk_size = self.chunk_size;
-        while chunk_count > self.max_chunk_count {
-            chunk_count /= 2;
-            chunk_size *= 2;
+        let mut chunk_threshold = 50;
+        if self.max_chunk_count > 0 {
+            while chunk_count > self.max_chunk_count {
+                chunk_count /= 2;
+                chunk_size *= 2;
+            }
+
+            chunk_threshold = self.max_chunk_count / 2;
         }
 
+        if chunk_count > chunk_threshold {
+            if let Some(scope) = scope {
+                return self.chunk_file_with_scope(
+                    path,
+                    compression,
+                    chunk_size,
+                    chunk_count,
+                    scope,
+                );
+            }
+        }
+
+        let mut file = File::open(path)?;
         let mut chunks = Vec::with_capacity(chunk_count);
         let mut chunk_ids = Vec::with_capacity(chunk_count);
         let mut buffer = vec![0; chunk_size];
         let mut hasher = Blake2b::<U32>::new();
 
         loop {
-            let bytes_read = file.read(&mut buffer).unwrap();
+            let bytes_read = file.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
@@ -355,10 +390,115 @@ impl ChunkIndex {
             chunks.push(hash_array);
         }
 
-        let mut chunks_write = self.chunks.write().unwrap();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let (_, count) = chunks_write.entry(chunk_ids[i]).or_insert((chunk, 0));
-            *count += 1;
+        for (i, chunk_id) in chunk_ids.iter().enumerate() {
+            let mut entry = self
+                .chunks
+                .entry(*chunk_id)
+                .or_insert_with(|| (chunks[i], 0));
+
+            entry.1 += 1;
+        }
+
+        Ok(chunk_ids)
+    }
+
+    fn chunk_file_with_scope(
+        &self,
+        path: &PathBuf,
+        compression: CompressionFormat,
+        chunk_size: usize,
+        chunk_count: usize,
+        scope: &rayon::Scope<'_>,
+    ) -> std::io::Result<Vec<u64>> {
+        let file_size = std::fs::metadata(path)?.len() as usize;
+        let path = path.clone();
+        let self_clone = self.clone();
+
+        let mut chunk_boundaries = Vec::with_capacity(chunk_count);
+        for i in 0..chunk_count {
+            let start = i * chunk_size;
+            let end = if i == chunk_count - 1 {
+                file_size
+            } else {
+                (i + 1) * chunk_size
+            };
+
+            if start < file_size {
+                chunk_boundaries.push((i, start, end.min(file_size)));
+            }
+        }
+
+        let results = Arc::new(Mutex::new(Vec::with_capacity(chunk_count)));
+        let error = Arc::new(RwLock::new(None));
+
+        for (idx, start, end) in chunk_boundaries {
+            scope.spawn({
+                let path = path.clone();
+                let self_clone = self_clone.clone();
+                let results = Arc::clone(&results);
+                let error = Arc::clone(&error);
+
+                move |_| {
+                    if error.read().unwrap().is_some() {
+                        return;
+                    }
+
+                    let result = (|| {
+                        let mut file = File::open(&path)?;
+                        file.seek(SeekFrom::Start(start as u64))?;
+
+                        let chunk_size = end - start;
+                        let mut buffer = vec![0; chunk_size];
+                        let bytes_read = file.read(&mut buffer[0..chunk_size])?;
+                        buffer.truncate(bytes_read);
+
+                        let mut hasher = Blake2b::<U32>::new();
+                        hasher.update(&buffer);
+                        let hash = hasher.finalize();
+
+                        let mut hash_array = [0; 32];
+                        hash_array.copy_from_slice(&hash);
+
+                        let chunk_id = self_clone.add_chunk(&hash_array, &buffer, compression)?;
+
+                        Ok((idx, chunk_id, hash_array))
+                    })();
+
+                    match result {
+                        Ok(data) => {
+                            results.lock().unwrap().push(data);
+                        }
+                        Err(e) => {
+                            *error.write().unwrap() = Some(e);
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Some(err) = error.write().unwrap().take() {
+            return Err(err);
+        }
+
+        let mut results_lock = results.lock().unwrap();
+        results_lock.sort_by_key(|(idx, _, _)| *idx);
+
+        let mut chunk_ids = Vec::with_capacity(results_lock.len());
+        let mut chunks = Vec::with_capacity(results_lock.len());
+
+        for (_, chunk_id, hash) in results_lock.iter() {
+            chunk_ids.push(*chunk_id);
+            chunks.push(*hash);
+        }
+        drop(results_lock);
+
+        for (i, chunk_id) in chunk_ids.iter().enumerate() {
+            let mut entry = self_clone
+                .chunks
+                .entry(*chunk_id)
+                .or_insert_with(|| (chunks[i], 0));
+
+            entry.1 += 1;
         }
 
         Ok(chunk_ids)
@@ -375,7 +515,6 @@ impl Drop for ChunkIndex {
         let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
 
         let deleted_chunks = self.deleted_chunks.lock().unwrap();
-        let chunks = self.chunks.read().unwrap();
 
         encoder
             .write_all(&(deleted_chunks.len() as u64).to_le_bytes())
@@ -387,7 +526,7 @@ impl Drop for ChunkIndex {
             .write_all(&(self.max_chunk_count as u32).to_le_bytes())
             .unwrap();
         encoder
-            .write_all(&(self.chunks.read().unwrap().len() as u64).to_le_bytes())
+            .write_all(&(self.chunks.len() as u64).to_le_bytes())
             .unwrap();
         encoder
             .write_all(
@@ -402,7 +541,9 @@ impl Drop for ChunkIndex {
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
         }
 
-        for (id, (chunk, count)) in chunks.iter() {
+        for entry in self.chunks.iter() {
+            let (id, (chunk, count)) = (entry.key(), entry.value());
+
             encoder.write_all(chunk).unwrap();
             encoder.write_all(&varint::encode_u64(*id)).unwrap();
             encoder.write_all(&varint::encode_u64(*count)).unwrap();

@@ -365,6 +365,7 @@ impl Archive {
                 if let Some(size_compressed) = file_entry.size_compressed {
                     writer.write_all(&varint::encode_u64(size_compressed))?;
                 }
+                writer.write_all(&varint::encode_u64(file_entry.size_real))?;
 
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
             }
@@ -468,6 +469,7 @@ impl Archive {
                     CompressionFormat::None => None,
                     _ => Some(self.file.stream_position()? - self.entries_offset),
                 },
+                size_real: metadata.len(),
                 size: metadata.len(),
                 offset: self.entries_offset,
                 consumed: 0,
@@ -562,6 +564,7 @@ impl Archive {
                     CompressionFormat::None => None,
                     _ => Some(varint::decode_u64(decoder)),
                 };
+                let size_real = varint::decode_u64(decoder);
                 let offset = varint::decode_u64(decoder);
 
                 Ok(entries::Entry::File(Box::new(entries::FileEntry {
@@ -572,6 +575,7 @@ impl Archive {
                     file,
                     decoder: None,
                     size_compressed,
+                    size_real,
                     size,
                     offset,
                     consumed: 0,

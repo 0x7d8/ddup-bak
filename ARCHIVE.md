@@ -78,6 +78,7 @@ all entries have a few base properties that will always be available
 
 `...varint(u64)` - Byte Length of Uncompressed file content<br>
 `...varint(u64)` - Byte Length of Compressed file content (**ONLY AVAILABLE IF `compression_format` IS NOT 0**)<br>
+`...varint(u64)` - Byte Lenght of "Real" file size, this is mainly used by the dedup part of this repo<br>
 `...varint(u64)` - Byte Offset (signature included) at which to read the file content in the archive
 
 #### directory_entry (0x1)

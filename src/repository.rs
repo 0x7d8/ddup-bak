@@ -175,7 +175,7 @@ impl Repository {
         }
 
         if metadata.is_file() {
-            let chunks = chunk_index.chunk_file(&path, CompressionFormat::Deflate)?;
+            let chunks = chunk_index.chunk_file(&path, CompressionFormat::Deflate, Some(scope))?;
 
             let file = File::create(&destination)?;
 

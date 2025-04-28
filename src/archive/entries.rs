@@ -17,6 +17,7 @@ pub struct FileEntry {
 
     pub compression: CompressionFormat,
     pub size_compressed: Option<u64>,
+    pub size_real: u64,
     pub size: u64,
 
     pub(crate) file: Arc<File>,
@@ -34,6 +35,7 @@ impl Clone for FileEntry {
             mtime: self.mtime,
             compression: self.compression,
             size_compressed: self.size_compressed,
+            size_real: self.size_real,
             size: self.size,
             file: Arc::clone(&self.file),
             decoder: None,
@@ -53,6 +55,7 @@ impl Debug for FileEntry {
             .field("offset", &self.offset)
             .field("compression", &self.compression)
             .field("size", &self.size)
+            .field("size_real", &self.size_real)
             .field("size_compressed", &self.size_compressed)
             .finish()
     }

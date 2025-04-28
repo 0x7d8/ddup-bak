@@ -33,11 +33,11 @@ fn cli() -> Command {
                 )
                 .arg(
                     Arg::new("max_chunk_count")
-                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value")
+                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value, 0 means no limit")
                         .short('m')
-                        .long("max-chunk-size")
+                        .long("max-chunk-count")
                         .num_args(1)
-                        .default_value("1000")
+                        .default_value("0")
                         .value_parser(clap::value_parser!(usize))
                         .required(false),
                 )

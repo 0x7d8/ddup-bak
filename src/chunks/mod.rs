@@ -10,7 +10,10 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64},
+    },
 };
 
 mod hasher;
@@ -21,6 +24,7 @@ pub type ChunkHash = [u8; 32];
 pub struct ChunkIndex {
     pub directory: PathBuf,
     pub save_on_drop: bool,
+    pub locked: Arc<AtomicBool>,
 
     next_id: Arc<AtomicU64>,
     deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
@@ -36,6 +40,7 @@ impl Clone for ChunkIndex {
         ChunkIndex {
             directory: self.directory.clone(),
             save_on_drop: false,
+            locked: Arc::clone(&self.locked),
             next_id: Arc::clone(&self.next_id),
             deleted_chunks: Arc::clone(&self.deleted_chunks),
             chunks: Arc::clone(&self.chunks),
@@ -52,6 +57,7 @@ impl ChunkIndex {
         ChunkIndex {
             directory,
             save_on_drop: true,
+            locked: Arc::new(AtomicBool::new(false)),
             next_id: Arc::new(AtomicU64::new(1)),
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
             chunks: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
@@ -70,8 +76,15 @@ impl ChunkIndex {
     }
 
     pub fn open(directory: PathBuf) -> std::io::Result<Self> {
-        let file = File::open(directory.join("chunks/index"))?;
+        let file = File::open(directory.join("index"))?;
         let mut decoder = DeflateDecoder::new(file);
+
+        if directory.join("index.lock").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Chunk Index is locked",
+            ));
+        }
 
         let mut buffer = [0; 32];
         decoder.read_exact(&mut buffer)?;
@@ -115,6 +128,7 @@ impl ChunkIndex {
         Ok(Self {
             directory,
             save_on_drop: true,
+            locked: Arc::new(AtomicBool::new(false)),
             next_id: Arc::new(AtomicU64::new(next_id)),
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
             chunks: Arc::new(result_chunks),
@@ -125,9 +139,72 @@ impl ChunkIndex {
         })
     }
 
+    pub fn save(&self) -> std::io::Result<()> {
+        let file = File::create(self.directory.join("index"))?;
+        let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
+
+        let deleted_chunks = self.deleted_chunks.lock().unwrap();
+
+        encoder.write_all(&(deleted_chunks.len() as u64).to_le_bytes())?;
+        encoder.write_all(&(self.chunk_size as u32).to_le_bytes())?;
+        encoder.write_all(&(self.max_chunk_count as u32).to_le_bytes())?;
+        encoder.write_all(&(self.chunks.len() as u64).to_le_bytes())?;
+        encoder.write_all(
+            &self
+                .next_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .to_le_bytes(),
+        )?;
+
+        for id in deleted_chunks.iter() {
+            encoder.write_all(&varint::encode_u64(*id))?;
+        }
+
+        for entry in self.chunks.iter() {
+            let (id, (chunk, count)) = entry.pair();
+
+            encoder.write_all(chunk)?;
+            encoder.write_all(&varint::encode_u64(*id))?;
+            encoder.write_all(&varint::encode_u64(*count))?;
+        }
+
+        encoder.finish()?;
+
+        Ok(())
+    }
+
+    #[inline]
+    pub fn lock(&self) -> std::io::Result<()> {
+        let lock_path = self.directory.join("index.lock");
+        if lock_path.exists() && !self.locked.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Chunk Index is locked",
+            ));
+        }
+
+        File::create(lock_path)?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn unlock(&self) -> std::io::Result<bool> {
+        self.locked
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let lock_path = self.directory.join("index.lock");
+        if lock_path.exists() {
+            std::fs::remove_file(lock_path)?;
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     #[inline]
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
-        let mut path = self.directory.join("chunks");
+        let mut path = self.directory.to_path_buf();
         for byte in chunk.iter().take(2) {
             path.push(format!("{:02x}", byte));
         }
@@ -579,48 +656,8 @@ impl ChunkIndex {
 
 impl Drop for ChunkIndex {
     fn drop(&mut self) {
-        if !self.save_on_drop {
-            return;
+        if self.save_on_drop {
+            self.save().ok();
         }
-
-        let file = File::create(self.directory.join("chunks/index")).unwrap();
-        let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
-
-        let deleted_chunks = self.deleted_chunks.lock().unwrap();
-
-        encoder
-            .write_all(&(deleted_chunks.len() as u64).to_le_bytes())
-            .unwrap();
-        encoder
-            .write_all(&(self.chunk_size as u32).to_le_bytes())
-            .unwrap();
-        encoder
-            .write_all(&(self.max_chunk_count as u32).to_le_bytes())
-            .unwrap();
-        encoder
-            .write_all(&(self.chunks.len() as u64).to_le_bytes())
-            .unwrap();
-        encoder
-            .write_all(
-                &self
-                    .next_id
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_le_bytes(),
-            )
-            .unwrap();
-
-        for id in deleted_chunks.iter() {
-            encoder.write_all(&varint::encode_u64(*id)).unwrap();
-        }
-
-        for entry in self.chunks.iter() {
-            let (id, (chunk, count)) = (entry.key(), entry.value());
-
-            encoder.write_all(chunk).unwrap();
-            encoder.write_all(&varint::encode_u64(*id)).unwrap();
-            encoder.write_all(&varint::encode_u64(*count)).unwrap();
-        }
-
-        encoder.finish().unwrap();
     }
 }

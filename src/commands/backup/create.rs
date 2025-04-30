@@ -1,11 +1,12 @@
 use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 pub fn create(matches: &ArgMatches) -> i32 {
     let mut repository = open_repository();
     let name = matches.get_one::<String>("name").expect("required");
+    let directory = matches.get_one::<String>("directory");
     let threads = matches.get_one::<usize>("threads").expect("required");
 
     if repository
@@ -39,7 +40,7 @@ pub fn create(matches: &ArgMatches) -> i32 {
     repository
         .create_archive(
             name,
-            None,
+            directory.map(Path::new),
             Some({
                 let progress = progress.clone();
 

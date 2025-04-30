@@ -24,8 +24,10 @@ impl Repository {
     /// Opens an existing repository.
     /// The repository must be initialized with `new` before use.
     /// The repository directory must contain a `.ddup-bak` directory.
-    pub fn open(directory: &Path) -> std::io::Result<Self> {
-        let chunk_index = ChunkIndex::open(directory.join(".ddup-bak"))?;
+    pub fn open(directory: &Path, chunks_directory: Option<&Path>) -> std::io::Result<Self> {
+        let chunk_index = ChunkIndex::open(
+            chunks_directory.map_or(directory.join(".ddup-bak/chunks"), |p| p.to_path_buf()),
+        )?;
         let mut ignored_files = Vec::new();
 
         let ignored_files_path = directory.join(".ddup-bak/ignored_files");
@@ -66,6 +68,17 @@ impl Repository {
             chunk_index,
             ignored_files,
         }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let ignored_files_path = self.directory.join(".ddup-bak/ignored_files");
+        let mut file = File::create(&ignored_files_path)?;
+
+        for entry in &self.ignored_files {
+            writeln!(file, "{}", entry)?;
+        }
+
+        Ok(())
     }
 
     #[inline]
@@ -276,6 +289,8 @@ impl Repository {
             ));
         }
 
+        self.chunk_index.lock()?;
+
         let archive_path = self.archive_path(name);
         let archive_tmp_path = self.directory.join(".ddup-bak/archives-tmp").join(name);
 
@@ -351,6 +366,7 @@ impl Repository {
         archive.add_entries(entries, progress_archiving)?;
 
         std::fs::remove_dir_all(&archive_tmp_path)?;
+        self.chunk_index.unlock()?;
 
         Ok(archive)
     }
@@ -688,6 +704,8 @@ impl Repository {
             ));
         }
 
+        self.chunk_index.lock()?;
+
         let archive_path = self.archive_path(name);
         let archive = Archive::open(archive_path.to_str().unwrap())?;
 
@@ -696,6 +714,7 @@ impl Repository {
         }
 
         std::fs::remove_file(archive_path)?;
+        self.chunk_index.unlock()?;
 
         Ok(())
     }
@@ -703,15 +722,8 @@ impl Repository {
 
 impl Drop for Repository {
     fn drop(&mut self) {
-        if !self.save_on_drop {
-            return;
-        }
-
-        let ignored_files_path = self.directory.join(".ddup-bak/ignored_files");
-        let mut file = File::create(&ignored_files_path).unwrap();
-
-        for entry in &self.ignored_files {
-            writeln!(file, "{}", entry).unwrap();
+        if self.save_on_drop {
+            self.save().ok();
         }
     }
 }

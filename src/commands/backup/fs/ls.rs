@@ -20,13 +20,14 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[inline]
 fn render_unix_permissions(mode: &Permissions) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         let mode_bits = mode.mode();
-        let mut result = String::with_capacity(10);
+        let mut result = String::with_capacity(9);
 
         result.push(if mode_bits & 0o400 != 0 { 'r' } else { '-' });
         result.push(if mode_bits & 0o200 != 0 { 'w' } else { '-' });
@@ -52,6 +53,7 @@ fn render_unix_permissions(mode: &Permissions) -> String {
     }
 }
 
+#[inline]
 fn format_time(time: SystemTime) -> String {
     let datetime: DateTime<Local> = time.into();
 
@@ -150,16 +152,18 @@ fn get_groupname(gid: u32) -> String {
     gid.to_string()
 }
 
-#[cfg(unix)]
-fn is_executable(mode: &Permissions) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    mode.mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
+#[inline]
 fn is_executable(_mode: &Permissions) -> bool {
-    false
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        _mode.mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 fn calculate_column_widths(
@@ -234,7 +238,7 @@ fn render_entry(
             };
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}\n",
                 file_type,
                 perms,
                 1,
@@ -254,7 +258,7 @@ fn render_entry(
             let link_count = dir.entries.len();
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {}\n",
                 file_type,
                 perms,
                 link_count,
@@ -281,7 +285,7 @@ fn render_entry(
             );
 
             format!(
-                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {} {}",
+                "{}{} {:>width_link_count$} {:<width_user$} {:<width_group$} {:>width_size$} {} {} {}\n",
                 file_type,
                 perms,
                 1,
@@ -301,25 +305,24 @@ fn render_entry(
 }
 
 fn render_entries(mut entries: Vec<&Entry>) {
-    let mut users: HashMap<u32, String> = HashMap::new();
-    let mut groups: HashMap<u32, String> = HashMap::new();
+    let mut users = HashMap::new();
+    let mut groups = HashMap::new();
 
     let (link_count_width, user_width, group_width, size_width) =
         calculate_column_widths(&entries, &mut users, &mut groups);
 
-    entries.sort_by(|a, b| {
-        let a_name = a.name();
-        let b_name = b.name();
+    entries.sort_unstable_by(|a, b| {
+        let a_name = a.name().to_lowercase();
+        let b_name = b.name().to_lowercase();
 
         if a_name == b_name {
             return a.mtime().cmp(&b.mtime());
         }
 
-        a_name.cmp(b_name)
+        a_name.cmp(&b_name)
     });
 
     let mut lock = std::io::stdout().lock();
-
     for entry in entries {
         let rendered_entry = render_entry(
             entry,
@@ -331,7 +334,7 @@ fn render_entries(mut entries: Vec<&Entry>) {
             &groups,
         );
 
-        writeln!(lock, "{}", rendered_entry).unwrap();
+        lock.write_all(rendered_entry.as_bytes()).unwrap();
     }
 }
 
@@ -359,18 +362,18 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
 
     let path = Path::new(path.map_or(".", |s| s.as_str()));
     if let Some(entry) = archive.find_archive_entry(path).unwrap() {
-        let mut entries = Vec::new();
-
-        match entry {
+        let entries = match entry {
             Entry::Directory(dir) => {
+                let mut entries = Vec::with_capacity(dir.entries.len());
+
                 for entry in dir.entries.iter() {
                     entries.push(entry);
                 }
+
+                entries
             }
-            _ => {
-                entries.push(entry);
-            }
-        }
+            _ => Vec::from([entry]),
+        };
 
         println!(
             "total {} entries, {}",

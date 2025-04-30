@@ -12,7 +12,7 @@ pub mod backup;
 pub mod init;
 
 pub fn open_repository() -> Repository {
-    if let Ok(repository) = Repository::open(Path::new(".")) {
+    if let Ok(repository) = Repository::open(Path::new("."), None) {
         repository
     } else {
         println!("{}", "repository is not initialized!".red());

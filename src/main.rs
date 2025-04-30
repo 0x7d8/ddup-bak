@@ -56,6 +56,12 @@ fn cli() -> Command {
                                 .required(true),
                         )
                         .arg(
+                            Arg::new("directory")
+                                .help("The directory to backup")
+                                .num_args(1)
+                                .required(false),
+                        )
+                        .arg(
                             Arg::new("threads")
                                 .help("The number of threads to use for the backup")
                                 .short('t')

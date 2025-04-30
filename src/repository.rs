@@ -54,7 +54,7 @@ impl Repository {
         max_chunk_count: usize,
         ignored_files: Vec<String>,
     ) -> Self {
-        let chunk_index = ChunkIndex::new(directory.join(".ddup-bak"), chunk_size, max_chunk_count);
+        let chunk_index = ChunkIndex::new(directory.join(".ddup-bak/chunks"), chunk_size, max_chunk_count);
 
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();

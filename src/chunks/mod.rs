@@ -10,13 +10,11 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64},
-    },
+    sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
 
 mod hasher;
+pub mod lock;
 pub mod reader;
 
 pub type ChunkHash = [u8; 32];
@@ -25,7 +23,8 @@ pub type ChunkHash = [u8; 32];
 pub struct ChunkIndex {
     pub directory: PathBuf,
     pub save_on_drop: bool,
-    pub locked: Arc<AtomicBool>,
+
+    pub lock: Arc<lock::RwLock>,
 
     next_id: Arc<AtomicU64>,
     deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
@@ -41,7 +40,7 @@ impl Clone for ChunkIndex {
         ChunkIndex {
             directory: self.directory.clone(),
             save_on_drop: false,
-            locked: Arc::clone(&self.locked),
+            lock: Arc::clone(&self.lock),
             next_id: Arc::clone(&self.next_id),
             deleted_chunks: Arc::clone(&self.deleted_chunks),
             chunks: Arc::clone(&self.chunks),
@@ -55,10 +54,12 @@ impl Clone for ChunkIndex {
 
 impl ChunkIndex {
     pub fn new(directory: PathBuf, chunk_size: usize, max_chunk_count: usize) -> Self {
+        let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap()).unwrap();
+
         ChunkIndex {
             directory,
             save_on_drop: true,
-            locked: Arc::new(AtomicBool::new(false)),
+            lock: Arc::new(lock),
             next_id: Arc::new(AtomicU64::new(1)),
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
             chunks: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
@@ -79,13 +80,6 @@ impl ChunkIndex {
     pub fn open(directory: PathBuf) -> std::io::Result<Self> {
         let file = File::open(directory.join("index"))?;
         let mut decoder = DeflateDecoder::new(file);
-
-        if directory.join("index.lock").exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Chunk Index is locked",
-            ));
-        }
 
         let mut buffer = [0; 32];
         decoder.read_exact(&mut buffer)?;
@@ -126,10 +120,12 @@ impl ChunkIndex {
             result_chunk_hashes.insert(buffer, id);
         }
 
+        let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap())?;
+
         Ok(Self {
             directory,
             save_on_drop: true,
-            locked: Arc::new(AtomicBool::new(false)),
+            lock: Arc::new(lock),
             next_id: Arc::new(AtomicU64::new(next_id)),
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
             chunks: Arc::new(result_chunks),
@@ -172,35 +168,6 @@ impl ChunkIndex {
         encoder.finish()?;
 
         Ok(())
-    }
-
-    #[inline]
-    pub fn lock(&self) -> std::io::Result<()> {
-        let lock_path = self.directory.join("index.lock");
-        if lock_path.exists() && !self.locked.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Chunk Index is locked",
-            ));
-        }
-
-        File::create(lock_path)?;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn unlock(&self) -> std::io::Result<bool> {
-        self.locked
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-
-        let lock_path = self.directory.join("index.lock");
-        if lock_path.exists() {
-            std::fs::remove_file(lock_path)?;
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     #[inline]

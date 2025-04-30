@@ -1,6 +1,6 @@
 use crate::{
     archive::{Archive, CompressionFormat, ProgressCallback, entries::Entry},
-    chunks::{ChunkIndex, reader::EntryReader},
+    chunks::{ChunkIndex, lock::LockMode, reader::EntryReader},
 };
 use std::{
     collections::HashMap,
@@ -54,17 +54,17 @@ impl Repository {
         max_chunk_count: usize,
         ignored_files: Vec<String>,
     ) -> Self {
-        let chunk_index = ChunkIndex::new(
-            directory.join(".ddup-bak/chunks"),
-            chunk_size,
-            max_chunk_count,
-        );
-
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-restored")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/chunks")).unwrap();
         std::fs::write(directory.join(".ddup-bak/ignored_files"), "").unwrap();
+
+        let chunk_index = ChunkIndex::new(
+            directory.join(".ddup-bak/chunks"),
+            chunk_size,
+            max_chunk_count,
+        );
 
         Self {
             directory: directory.to_path_buf(),
@@ -167,7 +167,10 @@ impl Repository {
     }
 
     pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
+        let mut w = self.chunk_index.lock.write_lock(LockMode::Destructive)?;
         self.chunk_index.clean(progress)?;
+
+        w.unlock()?;
 
         Ok(())
     }
@@ -303,7 +306,7 @@ impl Repository {
             ));
         }
 
-        self.chunk_index.lock()?;
+        let mut w = self.chunk_index.lock.write_lock(LockMode::NonDestructive)?;
 
         let archive_path = self.archive_path(name);
         let archive_tmp_path = self.directory.join(".ddup-bak/archives-tmp").join(name);
@@ -380,7 +383,8 @@ impl Repository {
         archive.add_entries(entries, progress_archiving)?;
 
         std::fs::remove_dir_all(&archive_tmp_path)?;
-        self.chunk_index.unlock()?;
+
+        w.unlock()?;
 
         Ok(archive)
     }
@@ -563,6 +567,8 @@ impl Repository {
             ));
         }
 
+        let mut r = self.chunk_index.lock.read_lock()?;
+
         let archive_path = self.archive_path(name);
         let archive = Archive::open(archive_path.to_str().unwrap())?;
         let destination = self
@@ -611,6 +617,8 @@ impl Repository {
             return Err(err);
         }
 
+        r.unlock()?;
+
         Ok(destination)
     }
 
@@ -627,6 +635,8 @@ impl Repository {
                 format!("Archive {} not found", name),
             ));
         }
+
+        let mut r = self.chunk_index.lock.read_lock()?;
 
         let destination = self
             .directory
@@ -674,6 +684,8 @@ impl Repository {
             return Err(err);
         }
 
+        r.unlock()?;
+
         Ok(destination)
     }
 
@@ -718,7 +730,7 @@ impl Repository {
             ));
         }
 
-        self.chunk_index.lock()?;
+        let mut w = self.chunk_index.lock.write_lock(LockMode::Destructive)?;
 
         let archive_path = self.archive_path(name);
         let archive = Archive::open(archive_path.to_str().unwrap())?;
@@ -728,7 +740,8 @@ impl Repository {
         }
 
         std::fs::remove_file(archive_path)?;
-        self.chunk_index.unlock()?;
+
+        w.unlock()?;
 
         Ok(())
     }

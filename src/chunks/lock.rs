@@ -132,10 +132,10 @@ impl RwLock {
 
         file.seek(SeekFrom::Current(7))?;
 
-        for i in 0..3 {
+        for reader_count in reader_counts.iter_mut() {
             let mut count_buf = [0; 8];
-            if let Ok(_) = file.read_exact(&mut count_buf) {
-                reader_counts[i] = u64::from_le_bytes(count_buf);
+            if file.read_exact(&mut count_buf).is_ok() {
+                *reader_count = u64::from_le_bytes(count_buf);
             } else {
                 break;
             }

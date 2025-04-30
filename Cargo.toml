@@ -18,6 +18,7 @@ flate2 = "1.1.1"
 positioned-io = "0.3.4"
 rayon = "1.10.0"
 dashmap = { version = "6.1.0", features = ["inline"] }
+atomicwrites = "0.4.4"
 
 # CLI
 clap = "4.5.37"
@@ -25,4 +26,3 @@ colored = "3.0.0"
 chrono = "0.4.40"
 libc = "0.2.172"
 tar = "0.4.44"
-atomicwrites = "0.4.4"

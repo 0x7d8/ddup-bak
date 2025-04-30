@@ -17,6 +17,7 @@ use std::{
 };
 
 mod hasher;
+pub mod reader;
 
 pub type ChunkHash = [u8; 32];
 

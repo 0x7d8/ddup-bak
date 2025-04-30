@@ -112,6 +112,34 @@ fn cli() -> Command {
                         .arg_required_else_help(false),
                 )
                 .subcommand(
+                    Command::new("convert")
+                        .about("Converts a backup")
+                        .arg(
+                            Arg::new("name")
+                                .help("The name of the backup to convert")
+                                .num_args(1)
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("output")
+                                .help("The output file to convert to")
+                                .num_args(1)
+                                .required(false),
+                        )
+                        .arg(
+                            Arg::new("format")
+                                .help("The format to convert to")
+                                .short('f')
+                                .long("format")
+                                .num_args(1)
+                                .required(true)
+                                .value_parser(["tar", "tar.gz", "zip"])
+                                .default_value("tar")
+                                .required(false),
+                        )
+                        .arg_required_else_help(false),
+                )
+                .subcommand(
                     Command::new("list")
                         .about("Lists all backups")
                         .arg_required_else_help(false),
@@ -167,6 +195,9 @@ fn main() {
             }
             Some(("restore", sub_matches)) => {
                 std::process::exit(commands::backup::restore::restore(sub_matches))
+            }
+            Some(("convert", sub_matches)) => {
+                std::process::exit(commands::backup::convert::convert(sub_matches))
             }
             Some(("list", sub_matches)) => {
                 std::process::exit(commands::backup::list::list(sub_matches))

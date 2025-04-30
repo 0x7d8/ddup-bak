@@ -1,6 +1,6 @@
 use crate::{
     archive::{Archive, CompressionFormat, ProgressCallback, entries::Entry},
-    chunks::ChunkIndex,
+    chunks::{ChunkIndex, reader::EntryReader},
 };
 use std::{
     collections::HashMap,
@@ -54,7 +54,11 @@ impl Repository {
         max_chunk_count: usize,
         ignored_files: Vec<String>,
     ) -> Self {
-        let chunk_index = ChunkIndex::new(directory.join(".ddup-bak/chunks"), chunk_size, max_chunk_count);
+        let chunk_index = ChunkIndex::new(
+            directory.join(".ddup-bak/chunks"),
+            chunk_size,
+            max_chunk_count,
+        );
 
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
@@ -166,6 +170,16 @@ impl Repository {
         self.chunk_index.clean(progress)?;
 
         Ok(())
+    }
+
+    pub fn entry_reader(&self, entry: Entry) -> std::io::Result<EntryReader> {
+        match entry {
+            Entry::File(file_entry) => Ok(EntryReader::new(file_entry, self.chunk_index.clone())),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Entry is not a file",
+            )),
+        }
     }
 
     fn recursive_create_archive(

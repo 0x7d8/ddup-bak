@@ -259,8 +259,5 @@ pub unsafe extern "C" fn archive_entries(archive: *const CArchive) -> *mut *cons
         entry_ptrs.push(crate::entries::entry_to_c(entry));
     }
 
-    let ptr = entry_ptrs.as_mut_ptr();
-    std::mem::forget(entry_ptrs);
-
-    ptr
+    Box::into_raw(entry_ptrs.into_boxed_slice()) as *mut *const CEntry
 }

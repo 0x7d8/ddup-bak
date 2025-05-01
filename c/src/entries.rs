@@ -228,8 +228,7 @@ pub fn entry_to_c(entry: &Entry) -> *mut CEntry {
                 entries.push(entry_to_c(sub_entry));
             }
 
-            let entries_ptr = entries.as_ptr() as *mut *mut CEntry;
-            std::mem::forget(entries);
+            let entries_ptr = Box::into_raw(entries.into_boxed_slice()) as *mut *mut CEntry;
 
             let dir_entry_ptr = Box::into_raw(Box::new(CDirectoryEntry {
                 common,

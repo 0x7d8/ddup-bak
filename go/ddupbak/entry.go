@@ -6,7 +6,6 @@ package ddupbak
 import "C"
 import (
 	"errors"
-	"runtime"
 	"time"
 	"unsafe"
 )
@@ -161,7 +160,6 @@ func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
 		ptr := (**C.struct_CEntry)(unsafe.Pointer(uintptr(unsafe.Pointer(cDir.entries)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
 		if *ptr != nil {
 			entry := &Entry{entry: *ptr}
-			runtime.SetFinalizer(entry, (*Entry).Free)
 			entries[i] = entry
 		}
 	}

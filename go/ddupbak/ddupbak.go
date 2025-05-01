@@ -1,10 +1,10 @@
 package ddupbak
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../c/target/release -lddupbak
+#cgo LDFLAGS: -lddupbak
 #include <stdlib.h>
 #include <stdint.h>
-#include "../../c/include/libddupbak.h"
+#include "../include/libddupbak.h"
 */
 import "C"
 import (

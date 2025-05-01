@@ -3,7 +3,7 @@ package ddupbak
 /*
 #include <stdlib.h>
 #include <stdint.h>
-#include "../../c/include/libddupbak.h"
+#include "../include/libddupbak.h"
 
 extern enum CCompressionFormat goCompressionCallback(char* path, uint64_t size);
 extern uint64_t goRealSizeCallback(char* path);

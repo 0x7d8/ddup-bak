@@ -3,7 +3,7 @@ package ddupbak
 /*
 #include <stdlib.h>
 #include <stdint.h>
-#include "../../c/include/libddupbak.h"
+#include "../include/libddupbak.h"
 
 // Forward declarations for callback handling
 extern void goProgressChunkingCallback(char* path);

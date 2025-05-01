@@ -5,7 +5,7 @@ use ddup_bak::archive::entries::Entry;
 use std::path::Path;
 
 pub fn cat(name: &str, matches: &ArgMatches) -> i32 {
-    let repository = open_repository();
+    let repository = open_repository(false);
     let path = matches.get_one::<String>("path").expect("required");
 
     if !repository

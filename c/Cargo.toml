@@ -1,0 +1,14 @@
+[package]
+name = "libddupbak"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ddupbak"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+ddup-bak = { path = ".." }
+
+[build-dependencies]
+cbindgen = "0.24.0"

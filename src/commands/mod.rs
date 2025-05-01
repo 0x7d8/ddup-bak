@@ -11,8 +11,10 @@ use std::{
 pub mod backup;
 pub mod init;
 
-pub fn open_repository() -> Repository {
-    if let Ok(repository) = Repository::open(Path::new("."), None) {
+pub fn open_repository(save: bool) -> Repository {
+    if let Ok(mut repository) = Repository::open(Path::new("."), None) {
+        repository.set_save_on_drop(save);
+
         repository
     } else {
         println!("{}", "repository is not initialized!".red());

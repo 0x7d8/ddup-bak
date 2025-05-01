@@ -3,7 +3,7 @@ use clap::ArgMatches;
 use colored::Colorize;
 
 pub fn list(_matches: &ArgMatches) -> i32 {
-    let repository = open_repository();
+    let repository = open_repository(false);
 
     println!("{}", "listing backups...".bright_black());
 

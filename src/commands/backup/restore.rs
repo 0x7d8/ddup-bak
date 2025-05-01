@@ -5,7 +5,8 @@ use ddup_bak::archive::entries::Entry;
 use std::sync::Arc;
 
 pub fn restore(matches: &ArgMatches) -> i32 {
-    let repository = open_repository();
+    let repository = open_repository(false);
+
     let name = matches.get_one::<String>("name").expect("required");
     let destination = matches.get_one::<String>("destination");
     let threads = matches.get_one::<usize>("threads").expect("required");

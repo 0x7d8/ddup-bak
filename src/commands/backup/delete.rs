@@ -4,7 +4,7 @@ use colored::Colorize;
 use std::sync::Arc;
 
 pub fn delete(matches: &ArgMatches) -> i32 {
-    let mut repository = open_repository();
+    let mut repository = open_repository(true);
     let name = matches.get_one::<String>("name").expect("required");
 
     if !repository

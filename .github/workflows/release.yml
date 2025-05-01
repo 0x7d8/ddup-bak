@@ -74,6 +74,13 @@ jobs:
           command: build
           args: --release --target ${{ matrix.target }}
 
+      - name: Build C library
+        uses: actions-rs/cargo@v1
+        with:
+          use-cross: ${{ matrix.cross }}
+          command: build
+          args: --release --target ${{ matrix.target }} --manifest-path c/Cargo.toml
+
       - name: Strip release binary (linux and macos)
         if: matrix.build == 'x86_64-linux' || matrix.build == 'x86_64-macos'
         run: strip "target/${{ matrix.target }}/release/$BIN_NAME"
@@ -81,17 +88,35 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
-          mkdir dist
+          mkdir -p dist/lib
           if [ "${{ matrix.os }}" = "windows-2019" ]; then
             cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/"
+            cp "target/${{ matrix.target }}/release/ddupbak.dll" "dist/lib/"
+            cp "target/${{ matrix.target }}/release/ddupbak.lib" "dist/lib/"
+            cp "c/include/libddupbak.h" "dist/lib/"
           else
             cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/"
+            if [ "${{ matrix.os }}" = "macos-latest" ]; then
+              cp "target/${{ matrix.target }}/release/libddupbak.dylib" "dist/lib/"
+              cp "target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
+            else
+              cp "target/${{ matrix.target }}/release/libddupbak.so" "dist/lib/"
+              cp "target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
+            fi
+            cp "c/include/libddupbak.h" "dist/lib/"
           fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: bins-${{ matrix.build }}
           path: dist
+          
+      - name: Upload header file
+        if: matrix.build == 'x86_64-linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libddupbak-headers
+          path: c/include/libddupbak.h
 
   publish:
     name: Publish
@@ -124,6 +149,9 @@ jobs:
           mkdir tmp
           mkdir dist
 
+          # Copy the header file directly to dist
+          cp libddupbak-headers/libddupbak.h dist/
+
           for dir in bins-* ; do
               platform=${dir#"bins-"}
               unset exe
@@ -131,9 +159,9 @@ jobs:
                   exe=".exe"
               fi
               pkgname=$PROJECT_NAME-$platform
-              mkdir tmp/$pkgname
+              mkdir -p tmp/$pkgname
               # cp LICENSE README.md tmp/$pkgname
-              mv bins-$platform/$BIN_NAME$exe tmp/$pkgname
+              cp -r bins-$platform/* tmp/$pkgname/
               chmod +x tmp/$pkgname/$BIN_NAME$exe
 
               if [ "$exe" = "" ]; then

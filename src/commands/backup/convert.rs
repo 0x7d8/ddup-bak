@@ -10,7 +10,8 @@ enum Format {
 }
 
 pub fn convert(matches: &ArgMatches) -> i32 {
-    let mut repository = open_repository();
+    let mut repository = open_repository(false);
+
     let name = matches.get_one::<String>("name").expect("required");
     let output = matches.get_one::<String>("output");
     let format = matches.get_one::<String>("format").expect("required");

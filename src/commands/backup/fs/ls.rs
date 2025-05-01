@@ -339,7 +339,7 @@ fn render_entries(mut entries: Vec<&Entry>) {
 }
 
 pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
-    let repository = open_repository();
+    let repository = open_repository(false);
     let path = matches.get_one::<String>("path");
 
     if !repository

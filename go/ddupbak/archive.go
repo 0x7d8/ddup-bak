@@ -208,7 +208,6 @@ func (a *Archive) GetEntry(index uint) (*Entry, error) {
 	}
 
 	entry := &Entry{entry: cEntry}
-	runtime.SetFinalizer(entry, (*Entry).Free)
 
 	return entry, nil
 }

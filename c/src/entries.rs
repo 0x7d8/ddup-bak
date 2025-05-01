@@ -235,6 +235,8 @@ pub fn entry_to_c(entry: &Entry) -> *mut CEntry {
                 entries: entries_ptr,
             }));
 
+            println!("dir_entry_ptr: {:?}", dir_entry_ptr);
+
             Box::into_raw(Box::new(CEntry {
                 entry_type: CEntryType::Directory,
                 entry: dir_entry_ptr as *mut c_void,

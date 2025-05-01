@@ -156,10 +156,11 @@ func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
 	entriesCount := int(cDir.entries_count)
 	entries := make([]*Entry, entriesCount)
 
-	cEntries := (*[1 << 30]*C.struct_CEntry)(unsafe.Pointer(cDir.entries))[:entriesCount:entriesCount]
-	for i, cEntry := range cEntries {
-		if cEntry != nil {
-			entries[i] = &Entry{entry: cEntry}
+	for i := 0; i < entriesCount; i++ {
+		ptr := (**C.struct_CEntry)(unsafe.Pointer(uintptr(unsafe.Pointer(cDir.entries)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
+		if *ptr != nil {
+			entry := &Entry{entry: *ptr}
+			entries[i] = entry
 		}
 	}
 

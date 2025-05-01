@@ -2,7 +2,7 @@ package ddupbak
 
 // #include <stdlib.h>
 // #include <stdint.h>
-// #include "../include/libddupbak.h"
+// #include <libddupbak.h>
 import "C"
 import (
 	"errors"

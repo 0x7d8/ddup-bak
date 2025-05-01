@@ -4,7 +4,7 @@ package ddupbak
 #cgo LDFLAGS: -lddupbak
 #include <stdlib.h>
 #include <stdint.h>
-#include "../include/libddupbak.h"
+#include <libddupbak.h>
 */
 import "C"
 import (

@@ -1,7 +1,7 @@
 package ddupbak
 
 /*
-#cgo LDFLAGS: -lddupbak
+#cgo LDFLAGS: -static -lddupbak
 #include <stdlib.h>
 #include <stdint.h>
 #include <libddupbak.h>

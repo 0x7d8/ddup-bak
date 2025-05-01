@@ -91,17 +91,17 @@ jobs:
           mkdir -p dist/lib
           if [ "${{ matrix.os }}" = "windows-2019" ]; then
             cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/"
-            cp "target/${{ matrix.target }}/release/ddupbak.dll" "dist/lib/"
-            cp "target/${{ matrix.target }}/release/ddupbak.lib" "dist/lib/"
+            cp "c/target/${{ matrix.target }}/release/ddupbak.dll" "dist/lib/"
+            cp "c/target/${{ matrix.target }}/release/ddupbak.lib" "dist/lib/"
             cp "c/include/libddupbak.h" "dist/lib/"
           else
             cp "target/${{ matrix.target }}/release/$BIN_NAME" "dist/"
             if [ "${{ matrix.os }}" = "macos-latest" ]; then
-              cp "target/${{ matrix.target }}/release/libddupbak.dylib" "dist/lib/"
-              cp "target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
+              cp "c/target/${{ matrix.target }}/release/libddupbak.dylib" "dist/lib/"
+              cp "c/target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
             else
-              cp "target/${{ matrix.target }}/release/libddupbak.so" "dist/lib/"
-              cp "target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
+              cp "c/target/${{ matrix.target }}/release/libddupbak.so" "dist/lib/"
+              cp "c/target/${{ matrix.target }}/release/libddupbak.a" "dist/lib/"
             fi
             cp "c/include/libddupbak.h" "dist/lib/"
           fi

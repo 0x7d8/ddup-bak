@@ -91,6 +91,8 @@ unsigned int archive_entries_count(const struct CArchive *archive);
 
 const struct CEntry **archive_entries(const struct CArchive *archive);
 
+struct CEntry *archive_find_entry(const struct CArchive *archive, const char *path);
+
 enum CEntryType get_entry_type(const struct CEntry *entry);
 
 const struct CEntryCommon *entry_get_common(const struct CEntry *entry);
@@ -104,10 +106,6 @@ const struct CFileEntry *entry_as_file(const struct CEntry *entry);
 const struct CDirectoryEntry *entry_as_directory(const struct CEntry *entry);
 
 const struct CSymlinkEntry *entry_as_symlink(const struct CEntry *entry);
-
-struct CEntry *archive_get_entry(struct CArchive *archive, unsigned int index);
-
-struct CEntry *archive_find_entry(const struct CArchive *archive, const char *path);
 
 struct CRepository *new_repository(const char *directory,
                                    unsigned int chunk_size,

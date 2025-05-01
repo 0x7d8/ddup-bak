@@ -261,3 +261,22 @@ pub unsafe extern "C" fn archive_entries(archive: *const CArchive) -> *mut *cons
 
     Box::into_raw(entry_ptrs.into_boxed_slice()) as *mut *const CEntry
 }
+
+#[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn archive_find_entry(
+    archive: *const CArchive,
+    path: *const c_char,
+) -> *mut CEntry {
+    if archive.is_null() || path.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let archive = unsafe { &*archive };
+    let path_str = unsafe { CStr::from_ptr(path).to_string_lossy().into_owned() };
+
+    match archive.find_archive_entry(Path::new(&path_str)) {
+        Ok(Some(entry)) => crate::entries::entry_to_c(entry),
+        _ => std::ptr::null_mut(),
+    }
+}

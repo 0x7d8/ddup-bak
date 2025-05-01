@@ -1,7 +1,6 @@
-use crate::archive::{CArchive, CCompressionFormat};
+use crate::archive::CCompressionFormat;
 use ddup_bak::archive::entries::Entry;
 use std::ffi::*;
-use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 #[repr(C)]
@@ -306,40 +305,4 @@ pub unsafe extern "C" fn entry_as_symlink(entry: *const CEntry) -> *const CSymli
     }
 
     unsafe { (*entry).entry as *const CSymlinkEntry }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn archive_get_entry(archive: *mut CArchive, index: c_uint) -> *mut CEntry {
-    if archive.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let archive = unsafe { &*archive };
-    let entries = archive.entries();
-
-    if index as usize >= entries.len() {
-        return std::ptr::null_mut();
-    }
-
-    entry_to_c(&entries[index as usize])
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn archive_find_entry(
-    archive: *const CArchive,
-    path: *const c_char,
-) -> *mut CEntry {
-    if archive.is_null() || path.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let archive = unsafe { &*archive };
-    let path_str = unsafe { CStr::from_ptr(path).to_string_lossy().into_owned() };
-
-    match archive.find_archive_entry(Path::new(&path_str)) {
-        Ok(Some(entry)) => entry_to_c(entry),
-        _ => std::ptr::null_mut(),
-    }
 }

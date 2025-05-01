@@ -179,37 +179,25 @@ func (a *Archive) Entries() ([]*Entry, error) {
 		return nil, errors.New("archive is closed")
 	}
 
-	count, err := a.EntriesCount()
-	if err != nil {
-		return nil, err
+	raw_entries := C.archive_entries(a.archive)
+	if raw_entries == nil {
+		return nil, errors.New("failed to get entries")
 	}
 
-	entries := make([]*Entry, count)
-	for i := uint(0); i < count; i++ {
-		entry, err := a.GetEntry(i)
-		if err != nil {
-			return nil, err
+	entriesCount := C.archive_entries_count(a.archive)
+	entries := make([]*Entry, entriesCount)
+
+	for i := 0; i < int(entriesCount); i++ {
+		cEntry := *(**C.struct_CEntry)(unsafe.Pointer(uintptr(unsafe.Pointer(raw_entries)) + uintptr(i)*unsafe.Sizeof(*raw_entries)))
+		if cEntry == nil {
+			return nil, errors.New("failed to get entry")
 		}
+
+		entry := &Entry{entry: cEntry}
 		entries[i] = entry
 	}
 
 	return entries, nil
-}
-
-// GetEntry returns an entry by index
-func (a *Archive) GetEntry(index uint) (*Entry, error) {
-	if a.archive == nil {
-		return nil, errors.New("archive is closed")
-	}
-
-	cEntry := C.archive_get_entry(a.archive, C.uint(index))
-	if cEntry == nil {
-		return nil, errors.New("entry not found")
-	}
-
-	entry := &Entry{entry: cEntry}
-
-	return entry, nil
 }
 
 // FindEntry finds an entry by path

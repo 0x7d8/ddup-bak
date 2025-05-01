@@ -22,7 +22,6 @@ pub type ChunkHash = [u8; 32];
 #[derive(Debug)]
 pub struct ChunkIndex {
     pub directory: PathBuf,
-    pub save_on_drop: bool,
 
     pub lock: Arc<lock::RwLock>,
 
@@ -39,7 +38,6 @@ impl Clone for ChunkIndex {
     fn clone(&self) -> Self {
         ChunkIndex {
             directory: self.directory.clone(),
-            save_on_drop: false,
             lock: Arc::clone(&self.lock),
             next_id: Arc::clone(&self.next_id),
             deleted_chunks: Arc::clone(&self.deleted_chunks),
@@ -58,7 +56,6 @@ impl ChunkIndex {
 
         ChunkIndex {
             directory,
-            save_on_drop: true,
             lock: Arc::new(lock),
             next_id: Arc::new(AtomicU64::new(1)),
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
@@ -124,7 +121,6 @@ impl ChunkIndex {
 
         Ok(Self {
             directory,
-            save_on_drop: true,
             lock: Arc::new(lock),
             next_id: Arc::new(AtomicU64::new(next_id)),
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
@@ -186,11 +182,6 @@ impl ChunkIndex {
         path.push(file_name);
 
         path
-    }
-
-    #[inline]
-    pub const fn set_save_on_drop(&mut self, save_on_drop: bool) {
-        self.save_on_drop = save_on_drop;
     }
 
     #[inline]
@@ -619,13 +610,5 @@ impl ChunkIndex {
         }
 
         Ok(chunk_ids)
-    }
-}
-
-impl Drop for ChunkIndex {
-    fn drop(&mut self) {
-        if self.save_on_drop {
-            self.save().ok();
-        }
     }
 }

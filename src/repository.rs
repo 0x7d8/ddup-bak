@@ -82,6 +82,8 @@ impl Repository {
             writeln!(file, "{}", entry)?;
         }
 
+        self.chunk_index.save()?;
+
         Ok(())
     }
 
@@ -100,7 +102,6 @@ impl Repository {
     #[inline]
     pub const fn set_save_on_drop(&mut self, save_on_drop: bool) -> &mut Self {
         self.save_on_drop = save_on_drop;
-        self.chunk_index.set_save_on_drop(save_on_drop);
 
         self
     }

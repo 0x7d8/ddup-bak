@@ -497,11 +497,11 @@ impl RwLock {
             Ok(()) => {
                 self.process_has_writer.store(1, Ordering::SeqCst);
 
-                return Ok(Some(WriteGuard {
+                Ok(Some(WriteGuard {
                     lock: self.clone(),
                     mode,
                     active: true,
-                }));
+                }))
             }
             Err(e) => Err(e),
         }

@@ -567,7 +567,7 @@ impl Repository {
             ));
         }
 
-        let mut r = self.chunk_index.lock.read_lock()?;
+        let mut r = self.chunk_index.lock.read_lock(LockMode::NonDestructive)?;
 
         let archive_path = self.archive_path(name);
         let archive = Archive::open(archive_path.to_str().unwrap())?;
@@ -636,7 +636,7 @@ impl Repository {
             ));
         }
 
-        let mut r = self.chunk_index.lock.read_lock()?;
+        let mut r = self.chunk_index.lock.read_lock(LockMode::NonDestructive)?;
 
         let destination = self
             .directory

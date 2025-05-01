@@ -38,15 +38,19 @@ pub struct RwLock {
     path: Arc<String>,
     writer_mode: Arc<AtomicU64>,
     writer_present: Arc<AtomicU64>,
+    writer_pid: Arc<AtomicU64>,
     reader_counts: Arc<Vec<AtomicU64>>,
     refresh: Arc<Mutex<Option<JoinHandle<()>>>>,
     running: Arc<AtomicU64>,
+    process_reader_counts: Arc<Vec<AtomicU64>>,
+    process_has_writer: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
 struct LockState {
     writer_mode: u8,
     writer_present: u8,
+    writer_pid: u64,
     reader_counts: [u64; 3],
 }
 
@@ -59,6 +63,7 @@ impl RwLock {
             let initial_state = LockState {
                 writer_mode: LockMode::None.as_u8(),
                 writer_present: 0,
+                writer_pid: 0,
                 reader_counts: [0; 3],
             };
             Self::write_state(&path_str, &initial_state)?;
@@ -75,12 +80,17 @@ impl RwLock {
 
         let writer_mode = Arc::new(AtomicU64::new(state.writer_mode as u64));
         let writer_present = Arc::new(AtomicU64::new(state.writer_present as u64));
+        let writer_pid = Arc::new(AtomicU64::new(state.writer_pid));
+
+        let process_reader_counts = Arc::new((0..3).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+        let process_has_writer = Arc::new(AtomicU64::new(0));
 
         let running = Arc::new(AtomicU64::new(1));
         let running_clone = Arc::clone(&running);
         let path_clone = Arc::clone(&path_arc);
         let writer_mode_clone = Arc::clone(&writer_mode);
         let writer_present_clone = Arc::clone(&writer_present);
+        let writer_pid_clone = Arc::clone(&writer_pid);
         let reader_counts_clone = Arc::clone(&reader_counts);
 
         let refresh = thread::spawn(move || {
@@ -91,6 +101,7 @@ impl RwLock {
                     Ok(state) => {
                         writer_mode_clone.store(state.writer_mode as u64, Ordering::SeqCst);
                         writer_present_clone.store(state.writer_present as u64, Ordering::SeqCst);
+                        writer_pid_clone.store(state.writer_pid, Ordering::SeqCst);
 
                         for (i, count) in state.reader_counts.iter().enumerate() {
                             if i < reader_counts_clone.len() {
@@ -109,9 +120,12 @@ impl RwLock {
             path: path_arc,
             writer_mode,
             writer_present,
+            writer_pid,
             reader_counts,
             refresh: Arc::new(Mutex::new(Some(refresh))),
             running,
+            process_reader_counts,
+            process_has_writer,
         })
     }
 
@@ -132,6 +146,10 @@ impl RwLock {
 
         file.seek(SeekFrom::Current(7))?;
 
+        let mut writer_pid_buf = [0; 8];
+        file.read_exact(&mut writer_pid_buf)?;
+        let writer_pid = u64::from_le_bytes(writer_pid_buf);
+
         for reader_count in reader_counts.iter_mut() {
             let mut count_buf = [0; 8];
             if file.read_exact(&mut count_buf).is_ok() {
@@ -144,6 +162,7 @@ impl RwLock {
         Ok(LockState {
             writer_mode,
             writer_present,
+            writer_pid,
             reader_counts,
         })
     }
@@ -159,6 +178,8 @@ impl RwLock {
 
             f.write_all(&[state.writer_present])?;
             f.write_all(&[0; 7])?; // Padding
+
+            f.write_all(&state.writer_pid.to_le_bytes())?;
 
             for count in &state.reader_counts {
                 f.write_all(&count.to_le_bytes())?;
@@ -183,6 +204,8 @@ impl RwLock {
             .store(new_state.writer_mode as u64, Ordering::SeqCst);
         self.writer_present
             .store(new_state.writer_present as u64, Ordering::SeqCst);
+        self.writer_pid
+            .store(new_state.writer_pid, Ordering::SeqCst);
 
         for (i, count) in new_state.reader_counts.iter().enumerate() {
             if i < self.reader_counts.len() {
@@ -194,10 +217,12 @@ impl RwLock {
             f.seek(SeekFrom::Start(0))?;
 
             f.write_all(&[new_state.writer_mode])?;
-            f.write_all(&[0; 7])?; // Padding
+            f.write_all(&[0; 7])?;
 
             f.write_all(&[new_state.writer_present])?;
-            f.write_all(&[0; 7])?; // Padding
+            f.write_all(&[0; 7])?;
+
+            f.write_all(&new_state.writer_pid.to_le_bytes())?;
 
             for count in &new_state.reader_counts {
                 f.write_all(&count.to_le_bytes())?;
@@ -209,8 +234,31 @@ impl RwLock {
         Ok(())
     }
 
-    pub fn read_lock(&self) -> std::io::Result<ReadGuard> {
-        const READ_MODE: LockMode = LockMode::NonDestructive;
+    fn current_pid() -> u64 {
+        std::process::id() as u64
+    }
+
+    fn process_owns_writer(&self) -> bool {
+        self.process_has_writer.load(Ordering::SeqCst) > 0
+    }
+
+    pub fn read_lock(&self, mode: LockMode) -> std::io::Result<ReadGuard> {
+        if mode == LockMode::None {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cannot acquire read lock with None mode",
+            ));
+        }
+
+        if self.process_owns_writer() {
+            self.process_reader_counts[mode as usize].fetch_add(1, Ordering::SeqCst);
+
+            return Ok(ReadGuard {
+                lock: self.clone(),
+                mode,
+                active: true,
+            });
+        }
 
         let mut backoff = Duration::from_millis(1);
         let max_backoff = Duration::from_secs(1);
@@ -219,41 +267,43 @@ impl RwLock {
             let current_writer_mode =
                 LockMode::from_u8(self.writer_mode.load(Ordering::SeqCst) as u8);
             let writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+            let writer_pid = self.writer_pid.load(Ordering::SeqCst);
+            let current_pid = Self::current_pid();
 
-            if writer_present && current_writer_mode != READ_MODE {
-                thread::sleep(backoff);
-                backoff = std::cmp::min(backoff * 2, max_backoff);
-                continue;
-            }
+            if !writer_present || current_writer_mode == mode || writer_pid == current_pid {
+                match self.update_state(|mut state| {
+                    if state.writer_present != 0
+                        && LockMode::from_u8(state.writer_mode) != mode
+                        && state.writer_pid != current_pid
+                    {
+                        return state;
+                    }
 
-            match self.update_state(|mut state| {
-                let writer_mode = LockMode::from_u8(state.writer_mode);
-                if state.writer_present != 0 && writer_mode != READ_MODE {
-                    return state;
-                }
+                    state.reader_counts[mode as usize] += 1;
+                    state
+                }) {
+                    Ok(()) => {
+                        self.process_reader_counts[mode as usize].fetch_add(1, Ordering::SeqCst);
 
-                state.reader_counts[READ_MODE as usize] += 1;
-                state
-            }) {
-                Ok(()) => {
-                    if self.reader_counts[READ_MODE as usize].load(Ordering::SeqCst) > 0 {
                         return Ok(ReadGuard {
                             lock: self.clone(),
-                            mode: READ_MODE,
+                            mode,
                             active: true,
                         });
                     }
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        thread::sleep(backoff);
-                        backoff = std::cmp::min(backoff * 2, max_backoff);
-                        continue;
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            thread::sleep(backoff);
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            continue;
+                        }
+                        return Err(e);
                     }
-
-                    return Err(e);
                 }
             }
+
+            thread::sleep(backoff);
+            backoff = std::cmp::min(backoff * 2, max_backoff);
         }
     }
 
@@ -265,11 +315,23 @@ impl RwLock {
             ));
         }
 
+        if self.process_owns_writer() {
+            self.process_has_writer.fetch_add(1, Ordering::SeqCst);
+
+            return Ok(WriteGuard {
+                lock: self.clone(),
+                mode,
+                active: true,
+            });
+        }
+
         let mut backoff = Duration::from_millis(1);
         let max_backoff = Duration::from_secs(1);
+        let current_pid = Self::current_pid();
 
         loop {
             let writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+            let writer_pid = self.writer_pid.load(Ordering::SeqCst);
 
             let incompatible_readers = (0..3).any(|i| {
                 if i == mode as usize {
@@ -279,7 +341,7 @@ impl RwLock {
                 }
             });
 
-            if writer_present || incompatible_readers {
+            if (writer_present && writer_pid != current_pid) || incompatible_readers {
                 thread::sleep(backoff);
                 backoff = std::cmp::min(backoff * 2, max_backoff);
                 continue;
@@ -294,26 +356,25 @@ impl RwLock {
                     }
                 });
 
-                if state.writer_present != 0 || incompatible_readers {
+                if (state.writer_present != 0 && state.writer_pid != current_pid)
+                    || incompatible_readers
+                {
                     return state;
                 }
 
                 state.writer_mode = mode.as_u8();
                 state.writer_present = 1;
+                state.writer_pid = current_pid;
                 state
             }) {
                 Ok(()) => {
-                    let new_writer_mode =
-                        LockMode::from_u8(self.writer_mode.load(Ordering::SeqCst) as u8);
-                    let new_writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+                    self.process_has_writer.store(1, Ordering::SeqCst);
 
-                    if new_writer_mode == mode && new_writer_present {
-                        return Ok(WriteGuard {
-                            lock: self.clone(),
-                            mode,
-                            active: true,
-                        });
-                    }
+                    return Ok(WriteGuard {
+                        lock: self.clone(),
+                        mode,
+                        active: true,
+                    });
                 }
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -329,35 +390,54 @@ impl RwLock {
     }
 
     pub fn try_read_lock(&self, mode: LockMode) -> std::io::Result<Option<ReadGuard>> {
-        let current_writer_mode = LockMode::from_u8(self.writer_mode.load(Ordering::SeqCst) as u8);
-        let writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
-
-        if writer_present && current_writer_mode != mode {
-            return Ok(None);
+        if mode == LockMode::None {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cannot acquire read lock with None mode",
+            ));
         }
 
-        match self.update_state(|mut state| {
-            let writer_mode = LockMode::from_u8(state.writer_mode);
-            if state.writer_present != 0 && writer_mode != mode {
-                return state;
-            }
+        if self.process_owns_writer() {
+            self.process_reader_counts[mode as usize].fetch_add(1, Ordering::SeqCst);
 
-            state.reader_counts[mode as usize] += 1;
-            state
-        }) {
-            Ok(()) => {
-                if self.reader_counts[mode as usize].load(Ordering::SeqCst) > 0 {
+            return Ok(Some(ReadGuard {
+                lock: self.clone(),
+                mode,
+                active: true,
+            }));
+        }
+
+        let current_writer_mode = LockMode::from_u8(self.writer_mode.load(Ordering::SeqCst) as u8);
+        let writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+        let writer_pid = self.writer_pid.load(Ordering::SeqCst);
+        let current_pid = Self::current_pid();
+
+        if !writer_present || current_writer_mode == mode || writer_pid == current_pid {
+            match self.update_state(|mut state| {
+                if state.writer_present != 0
+                    && LockMode::from_u8(state.writer_mode) != mode
+                    && state.writer_pid != current_pid
+                {
+                    return state;
+                }
+
+                state.reader_counts[mode as usize] += 1;
+                state
+            }) {
+                Ok(()) => {
+                    self.process_reader_counts[mode as usize].fetch_add(1, Ordering::SeqCst);
+
                     return Ok(Some(ReadGuard {
                         lock: self.clone(),
                         mode,
                         active: true,
                     }));
                 }
-
-                Ok(None)
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
+
+        Ok(None)
     }
 
     pub fn try_write_lock(&self, mode: LockMode) -> std::io::Result<Option<WriteGuard>> {
@@ -368,7 +448,19 @@ impl RwLock {
             ));
         }
 
+        if self.process_owns_writer() {
+            self.process_has_writer.fetch_add(1, Ordering::SeqCst);
+
+            return Ok(Some(WriteGuard {
+                lock: self.clone(),
+                mode,
+                active: true,
+            }));
+        }
+
         let writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+        let writer_pid = self.writer_pid.load(Ordering::SeqCst);
+        let current_pid = Self::current_pid();
 
         let incompatible_readers = (0..3).any(|i| {
             if i == mode as usize {
@@ -378,7 +470,7 @@ impl RwLock {
             }
         });
 
-        if writer_present || incompatible_readers {
+        if (writer_present && writer_pid != current_pid) || incompatible_readers {
             return Ok(None);
         }
 
@@ -391,28 +483,25 @@ impl RwLock {
                 }
             });
 
-            if state.writer_present != 0 || incompatible_readers {
+            if (state.writer_present != 0 && state.writer_pid != current_pid)
+                || incompatible_readers
+            {
                 return state;
             }
 
             state.writer_mode = mode.as_u8();
             state.writer_present = 1;
+            state.writer_pid = current_pid;
             state
         }) {
             Ok(()) => {
-                let new_writer_mode =
-                    LockMode::from_u8(self.writer_mode.load(Ordering::SeqCst) as u8);
-                let new_writer_present = self.writer_present.load(Ordering::SeqCst) != 0;
+                self.process_has_writer.store(1, Ordering::SeqCst);
 
-                if new_writer_mode == mode && new_writer_present {
-                    return Ok(Some(WriteGuard {
-                        lock: self.clone(),
-                        mode,
-                        active: true,
-                    }));
-                }
-
-                Ok(None)
+                return Ok(Some(WriteGuard {
+                    lock: self.clone(),
+                    mode,
+                    active: true,
+                }));
             }
             Err(e) => Err(e),
         }
@@ -441,6 +530,14 @@ impl RwLock {
             None
         }
     }
+
+    pub fn writer_pid(&self) -> Option<u64> {
+        if self.has_writer() {
+            Some(self.writer_pid.load(Ordering::SeqCst))
+        } else {
+            None
+        }
+    }
 }
 
 pub struct ReadGuard {
@@ -456,12 +553,17 @@ impl ReadGuard {
 
     pub fn unlock(&mut self) -> std::io::Result<()> {
         if self.active {
-            self.lock.update_state(|mut state| {
-                if state.reader_counts[self.mode as usize] > 0 {
-                    state.reader_counts[self.mode as usize] -= 1;
-                }
-                state
-            })?;
+            let prev_count =
+                self.lock.process_reader_counts[self.mode as usize].fetch_sub(1, Ordering::SeqCst);
+
+            if prev_count == 1 && !self.lock.process_owns_writer() {
+                self.lock.update_state(|mut state| {
+                    if state.reader_counts[self.mode as usize] > 0 {
+                        state.reader_counts[self.mode as usize] -= 1;
+                    }
+                    state
+                })?;
+            }
 
             self.active = false;
         }
@@ -492,14 +594,19 @@ impl WriteGuard {
 
     pub fn unlock(&mut self) -> std::io::Result<()> {
         if self.active {
-            self.lock.update_state(|mut state| {
-                let current_mode = LockMode::from_u8(state.writer_mode);
-                if state.writer_present != 0 && current_mode == self.mode {
-                    state.writer_present = 0;
-                    state.writer_mode = LockMode::None.as_u8();
-                }
-                state
-            })?;
+            let prev_count = self.lock.process_has_writer.fetch_sub(1, Ordering::SeqCst);
+
+            if prev_count == 1 {
+                self.lock.update_state(|mut state| {
+                    let current_pid = RwLock::current_pid();
+                    if state.writer_present != 0 && state.writer_pid == current_pid {
+                        state.writer_present = 0;
+                        state.writer_mode = LockMode::None.as_u8();
+                        state.writer_pid = 0;
+                    }
+                    state
+                })?;
+            }
 
             self.active = false;
         }

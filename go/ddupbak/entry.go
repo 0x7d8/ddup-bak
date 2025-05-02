@@ -37,7 +37,7 @@ type FileEntry struct {
 // DirectoryEntry represents a directory in an archive
 type DirectoryEntry struct {
 	Common  EntryCommon
-	Entries []*Entry
+	Entries []*Entry // Keeping the original type
 }
 
 // SymlinkEntry represents a symbolic link in an archive
@@ -154,13 +154,18 @@ func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
 	}
 
 	entriesCount := int(cDir.entries_count)
-	entries := make([]*Entry, entriesCount)
+	entries := make([]*Entry, 0, entriesCount)
 
 	for i := 0; i < entriesCount; i++ {
-		ptr := (**C.struct_CEntry)(unsafe.Pointer(uintptr(unsafe.Pointer(cDir.entries)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
-		if *ptr != nil {
-			entry := &Entry{entry: *ptr}
-			entries[i] = entry
+		// Get pointer to the i-th entry
+		entryPtrPtr := (**C.struct_CEntry)(unsafe.Pointer(
+			uintptr(unsafe.Pointer(cDir.entries)) + uintptr(i)*unsafe.Sizeof(uintptr(0)),
+		))
+
+		if *entryPtrPtr != nil {
+			// Create a new Entry wrapper around the C pointer
+			entry := &Entry{entry: *entryPtrPtr}
+			entries = append(entries, entry)
 		}
 	}
 
@@ -199,4 +204,53 @@ func (e *Entry) AsSymlink() (*SymlinkEntry, error) {
 	}
 
 	return result, nil
+}
+
+// RecursiveFree frees an entry and all its children if it's a directory
+func RecursiveFree(e *Entry) {
+	if e == nil {
+		return
+	}
+
+	// If it's a directory, free all its children first
+	if e.Type() == EntryTypeDirectory {
+		dir, err := e.AsDirectory()
+		if err == nil && dir != nil {
+			for _, childEntry := range dir.Entries {
+				RecursiveFree(childEntry)
+			}
+		}
+	}
+
+	// Then free the entry itself
+	e.Free()
+}
+
+// ProcessDirectoryEntries processes all entries in a directory recursively
+// This is a helper function that can be used to traverse directories
+func ProcessDirectoryEntries(dirEntry *DirectoryEntry, processFn func(*Entry) error) error {
+	if dirEntry == nil {
+		return errors.New("directory entry is nil")
+	}
+
+	for _, entry := range dirEntry.Entries {
+		// Process this entry
+		if err := processFn(entry); err != nil {
+			return err
+		}
+
+		// If it's a directory, process its entries recursively
+		if entry.Type() == EntryTypeDirectory {
+			subDir, err := entry.AsDirectory()
+			if err != nil {
+				return err
+			}
+
+			if err := ProcessDirectoryEntries(subDir, processFn); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

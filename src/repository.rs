@@ -405,18 +405,7 @@ impl Repository {
                         break;
                     }
 
-                    let mut chunk = self
-                        .chunk_index
-                        .read_chunk_id_content(chunk_id)
-                        .map_or_else(
-                            || {
-                                Err(std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    format!("Chunk not found: {}", chunk_id),
-                                ))
-                            },
-                            Ok,
-                        )?;
+                    let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
 
                     loop {
                         let bytes_read = chunk.read(&mut buffer)?;
@@ -466,15 +455,7 @@ impl Repository {
                         break;
                     }
 
-                    let mut chunk = chunk_index.read_chunk_id_content(chunk_id).map_or_else(
-                        || {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                format!("Chunk not found: {}", chunk_id),
-                            ))
-                        },
-                        Ok,
-                    )?;
+                    let mut chunk = chunk_index.read_chunk_id_content(chunk_id)?;
 
                     loop {
                         let bytes_read = chunk.read(&mut buffer)?;
@@ -486,7 +467,7 @@ impl Repository {
                     }
                 }
 
-                file.set_permissions(file_entry.mode)?;
+                file.set_permissions(file_entry.mode.into())?;
                 file.set_times(FileTimes::new().set_modified(file_entry.mtime))?;
 
                 #[cfg(unix)]
@@ -499,7 +480,7 @@ impl Repository {
             Entry::Directory(dir_entry) => {
                 std::fs::create_dir_all(&path)?;
 
-                std::fs::set_permissions(&path, dir_entry.mode)?;
+                std::fs::set_permissions(&path, dir_entry.mode.into())?;
 
                 #[cfg(unix)]
                 {
@@ -535,7 +516,7 @@ impl Repository {
             #[cfg(unix)]
             Entry::Symlink(link_entry) => {
                 std::os::unix::fs::symlink(link_entry.target, &path)?;
-                std::fs::set_permissions(&path, link_entry.mode)?;
+                std::fs::set_permissions(&path, link_entry.mode.into())?;
 
                 let (uid, gid) = link_entry.owner;
                 std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;

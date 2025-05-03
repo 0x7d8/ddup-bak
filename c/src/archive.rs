@@ -68,10 +68,12 @@ impl CArchive {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub enum CCompressionFormat {
     None = 0,
     Gzip = 1,
     Deflate = 2,
+    Brotli = 3,
 }
 
 impl From<CCompressionFormat> for CompressionFormat {
@@ -80,6 +82,7 @@ impl From<CCompressionFormat> for CompressionFormat {
             CCompressionFormat::None => CompressionFormat::None,
             CCompressionFormat::Gzip => CompressionFormat::Gzip,
             CCompressionFormat::Deflate => CompressionFormat::Deflate,
+            CCompressionFormat::Brotli => CompressionFormat::Brotli,
         }
     }
 }
@@ -90,6 +93,7 @@ impl From<CompressionFormat> for CCompressionFormat {
             CompressionFormat::None => CCompressionFormat::None,
             CompressionFormat::Gzip => CCompressionFormat::Gzip,
             CompressionFormat::Deflate => CCompressionFormat::Deflate,
+            CompressionFormat::Brotli => CCompressionFormat::Brotli,
         }
     }
 }

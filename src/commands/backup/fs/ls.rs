@@ -2,8 +2,8 @@ use crate::commands::open_repository;
 use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::archive::entries::Entry;
-use std::{collections::HashMap, fs::Permissions, io::Write, path::Path, time::SystemTime};
+use ddup_bak::archive::entries::{Entry, Permissions};
+use std::{collections::HashMap, io::Write, path::Path, time::SystemTime};
 
 #[inline]
 fn format_bytes(bytes: u64) -> String {
@@ -21,36 +21,23 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[inline]
-fn render_unix_permissions(mode: &Permissions) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+fn render_unix_permissions(mode: Permissions) -> String {
+    let mode_bits = mode.bits();
+    let mut result = String::with_capacity(9);
 
-        let mode_bits = mode.mode();
-        let mut result = String::with_capacity(9);
+    result.push(if mode_bits & 0o400 != 0 { 'r' } else { '-' });
+    result.push(if mode_bits & 0o200 != 0 { 'w' } else { '-' });
+    result.push(if mode_bits & 0o100 != 0 { 'x' } else { '-' });
 
-        result.push(if mode_bits & 0o400 != 0 { 'r' } else { '-' });
-        result.push(if mode_bits & 0o200 != 0 { 'w' } else { '-' });
-        result.push(if mode_bits & 0o100 != 0 { 'x' } else { '-' });
+    result.push(if mode_bits & 0o040 != 0 { 'r' } else { '-' });
+    result.push(if mode_bits & 0o020 != 0 { 'w' } else { '-' });
+    result.push(if mode_bits & 0o010 != 0 { 'x' } else { '-' });
 
-        result.push(if mode_bits & 0o040 != 0 { 'r' } else { '-' });
-        result.push(if mode_bits & 0o020 != 0 { 'w' } else { '-' });
-        result.push(if mode_bits & 0o010 != 0 { 'x' } else { '-' });
+    result.push(if mode_bits & 0o004 != 0 { 'r' } else { '-' });
+    result.push(if mode_bits & 0o002 != 0 { 'w' } else { '-' });
+    result.push(if mode_bits & 0o001 != 0 { 'x' } else { '-' });
 
-        result.push(if mode_bits & 0o004 != 0 { 'r' } else { '-' });
-        result.push(if mode_bits & 0o002 != 0 { 'w' } else { '-' });
-        result.push(if mode_bits & 0o001 != 0 { 'x' } else { '-' });
-
-        result
-    }
-    #[cfg(not(unix))]
-    {
-        if mode.readonly() {
-            "r--".to_string()
-        } else {
-            "rw-".to_string()
-        }
-    }
+    result
 }
 
 #[inline]
@@ -153,17 +140,8 @@ fn get_groupname(gid: u32) -> String {
 }
 
 #[inline]
-fn is_executable(_mode: &Permissions) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        _mode.mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+fn is_executable(_mode: Permissions) -> bool {
+    _mode.bits() & 0o111 != 0
 }
 
 fn calculate_column_widths(
@@ -231,7 +209,7 @@ fn render_entry(
 
     match entry {
         Entry::File(file) => {
-            let name = if is_executable(&file.mode) {
+            let name = if is_executable(file.mode) {
                 file.name.green().bold()
             } else {
                 file.name.normal()
@@ -277,7 +255,7 @@ fn render_entry(
             let name = link.name.bright_cyan().bold();
             let target = format!(
                 "-> {}",
-                if is_executable(&link.mode) {
+                if is_executable(link.mode) {
                     link.target.blue().on_green()
                 } else {
                     link.target.blue()

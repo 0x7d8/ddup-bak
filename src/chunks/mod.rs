@@ -283,23 +283,37 @@ impl ChunkIndex {
     }
 
     #[inline]
-    pub fn read_chunk_id_content(&self, chunk_id: u64) -> Option<Box<dyn Read + Send>> {
-        let entry = self.chunks.get(&chunk_id)?;
+    pub fn read_chunk_id_content(&self, chunk_id: u64) -> std::io::Result<Box<dyn Read + Send>> {
+        let entry = self.chunks.get(&chunk_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Chunk ID {} not found", chunk_id),
+            )
+        })?;
+
         let (chunk, _) = entry.value();
         let chunk = *chunk;
         drop(entry);
 
         let path = self.path_from_chunk(&chunk);
-        let mut file = File::open(path).ok()?;
+        let mut file = File::open(path)?;
 
         let mut compression_bytes = [0; 1];
-        file.read_exact(&mut compression_bytes).ok()?;
+        file.read_exact(&mut compression_bytes)?;
         let compression = CompressionFormat::decode(compression_bytes[0]);
 
         match compression {
-            CompressionFormat::None => Some(Box::new(file)),
-            CompressionFormat::Gzip => Some(Box::new(GzDecoder::new(file))),
-            CompressionFormat::Deflate => Some(Box::new(DeflateDecoder::new(file))),
+            CompressionFormat::None => Ok(Box::new(file)),
+            CompressionFormat::Gzip => Ok(Box::new(GzDecoder::new(file))),
+            CompressionFormat::Deflate => Ok(Box::new(DeflateDecoder::new(file))),
+
+            #[cfg(feature = "brotli")]
+            CompressionFormat::Brotli => Ok(Box::new(brotli::Decompressor::new(file, 4096))),
+            #[cfg(not(feature = "brotli"))]
+            CompressionFormat::Brotli => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Brotli support is not enabled. Please enable the 'brotli' feature.",
+            )),
         }
     }
 
@@ -363,6 +377,19 @@ impl ChunkIndex {
                 let mut encoder = DeflateEncoder::new(&file, flate2::Compression::default());
                 encoder.write_all(data)?;
                 encoder.flush()?;
+            }
+            #[cfg(feature = "brotli")]
+            CompressionFormat::Brotli => {
+                let mut encoder = brotli::CompressorWriter::new(&file, 4096, 11, 22);
+                encoder.write_all(data)?;
+                encoder.flush()?;
+            }
+            #[cfg(not(feature = "brotli"))]
+            CompressionFormat::Brotli => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Brotli support is not enabled. Please enable the 'brotli' feature.",
+                ));
             }
         }
 

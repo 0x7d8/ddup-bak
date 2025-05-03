@@ -10,6 +10,7 @@ typedef enum CCompressionFormat {
   None = 0,
   Gzip = 1,
   Deflate = 2,
+  Brotli = 3,
 } CCompressionFormat;
 
 typedef enum CEntryType {
@@ -31,7 +32,7 @@ typedef struct CEntry {
 
 typedef struct CEntryCommon {
   char *name;
-  uint32_t mode;
+  uint16_t mode;
   uint32_t uid;
   uint32_t gid;
   uint64_t mtime;
@@ -44,6 +45,8 @@ typedef struct CFileEntry {
   uint64_t size;
   uint64_t size_real;
   uint64_t size_compressed;
+  void *file;
+  uint64_t offset;
 } CFileEntry;
 
 typedef struct CDirectoryEntry {
@@ -57,6 +60,10 @@ typedef struct CSymlinkEntry {
   char *target;
   bool target_dir;
 } CSymlinkEntry;
+
+typedef struct CEntryReader {
+  uint8_t _private[0];
+} CEntryReader;
 
 typedef struct CRepository {
   uint8_t _private[0];
@@ -106,6 +113,13 @@ const struct CFileEntry *entry_as_file(const struct CEntry *entry);
 const struct CDirectoryEntry *entry_as_directory(const struct CEntry *entry);
 
 const struct CSymlinkEntry *entry_as_symlink(const struct CEntry *entry);
+
+struct CEntryReader *repository_create_entry_reader(struct CRepository *repo,
+                                                    const struct CFileEntry *entry);
+
+int entry_reader_read(struct CEntryReader *reader, char *buffer, uintptr_t buffer_size);
+
+void free_entry_reader(struct CEntryReader *reader);
 
 struct CRepository *new_repository(const char *directory,
                                    unsigned int chunk_size,

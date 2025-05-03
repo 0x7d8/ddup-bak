@@ -1,4 +1,5 @@
 use crate::varint;
+use entries::Permissions;
 use flate2::{
     read::DeflateDecoder,
     write::{DeflateEncoder, GzEncoder},
@@ -7,7 +8,7 @@ use positioned_io::ReadAt;
 use std::{
     ffi::OsStr,
     fmt::{Debug, Formatter},
-    fs::{DirEntry, File, Metadata, Permissions},
+    fs::{DirEntry, File, Metadata},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
     sync::Arc,
@@ -24,6 +25,7 @@ pub enum CompressionFormat {
     None,
     Gzip,
     Deflate,
+    Brotli,
 }
 
 impl CompressionFormat {
@@ -32,6 +34,7 @@ impl CompressionFormat {
             CompressionFormat::None => 0,
             CompressionFormat::Gzip => 1,
             CompressionFormat::Deflate => 2,
+            CompressionFormat::Brotli => 3,
         }
     }
 
@@ -40,42 +43,9 @@ impl CompressionFormat {
             0 => CompressionFormat::None,
             1 => CompressionFormat::Gzip,
             2 => CompressionFormat::Deflate,
+            3 => CompressionFormat::Brotli,
             _ => panic!("Invalid compression format"),
         }
-    }
-}
-
-#[inline]
-fn encode_file_permissions(permissions: Permissions) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        permissions.mode()
-    }
-    #[cfg(windows)]
-    {
-        if permissions.readonly() { 1 } else { 0 }
-    }
-}
-#[inline]
-fn decode_file_permissions(mode: u32) -> Permissions {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        Permissions::from_mode(mode)
-    }
-    #[cfg(windows)]
-    {
-        let mut permissions = unsafe { std::mem::zeroed::<Permissions>() };
-        if mode == 1 {
-            permissions.set_readonly(true);
-        } else {
-            permissions.set_readonly(false);
-        }
-
-        permissions
     }
 }
 
@@ -139,7 +109,7 @@ impl Archive {
 
     /// Opens an existing archive file for reading and writing.
     /// This will not overwrite the file, but append to it.
-    pub fn open(path: &str) -> Result<Self, std::io::Error> {
+    pub fn open(path: &str) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
 
@@ -209,7 +179,7 @@ impl Archive {
         &mut self,
         path: &str,
         progress: ProgressCallback,
-    ) -> Result<&mut Self, std::io::Error> {
+    ) -> std::io::Result<&mut Self> {
         self.trim_end_header()?;
 
         for entry in std::fs::read_dir(path)?.flatten() {
@@ -244,7 +214,7 @@ impl Archive {
         &mut self,
         entries: Vec<DirEntry>,
         progress: ProgressCallback,
-    ) -> Result<&mut Self, std::io::Error> {
+    ) -> std::io::Result<&mut Self> {
         self.trim_end_header()?;
 
         for entry in entries {
@@ -302,7 +272,7 @@ impl Archive {
         Ok(None)
     }
 
-    fn trim_end_header(&mut self) -> Result<(), std::io::Error> {
+    fn trim_end_header(&mut self) -> std::io::Result<()> {
         if self.entries_offset == 0 {
             return Ok(());
         }
@@ -314,7 +284,7 @@ impl Archive {
         Ok(())
     }
 
-    fn write_end_header(&mut self) -> Result<(), std::io::Error> {
+    fn write_end_header(&mut self) -> std::io::Result<()> {
         let mut encoder = DeflateEncoder::new(&mut self.file, flate2::Compression::default());
         for entry in &self.entries {
             Self::encode_entry_metadata(&mut encoder, entry)?;
@@ -336,7 +306,7 @@ impl Archive {
     fn encode_entry_metadata<S: Write>(
         writer: &mut S,
         entry: &entries::Entry,
-    ) -> Result<(), std::io::Error> {
+    ) -> std::io::Result<()> {
         let name = entry.name();
         let name_length = name.len() as u8;
 
@@ -345,7 +315,7 @@ impl Archive {
         let mut buffer = Vec::with_capacity(name.len() + 4);
         buffer.extend_from_slice(name.as_bytes());
 
-        let mode = encode_file_permissions(entry.mode().clone());
+        let mode = entry.mode().bits() as u32;
         let compression = match entry {
             entries::Entry::File(file_entry) => file_entry.compression,
             _ => CompressionFormat::None,
@@ -405,7 +375,7 @@ impl Archive {
         entries: Option<&mut Vec<entries::Entry>>,
         fs_entry: DirEntry,
         progress: ProgressCallback,
-    ) -> Result<(), std::io::Error> {
+    ) -> std::io::Result<()> {
         let path = fs_entry.path();
 
         let file_name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -470,11 +440,31 @@ impl Archive {
                     encoder.flush()?;
                     encoder.finish()?;
                 }
+
+                #[cfg(feature = "brotli")]
+                CompressionFormat::Brotli => {
+                    let mut encoder = brotli::CompressorWriter::new(&mut self.file, 4096, 11, 22);
+                    loop {
+                        encoder.write_all(&buffer[..bytes_read])?;
+
+                        bytes_read = file.read(&mut buffer)?;
+                        if bytes_read == 0 {
+                            break;
+                        }
+                    }
+                }
+                #[cfg(not(feature = "brotli"))]
+                CompressionFormat::Brotli => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "Brotli support is not enabled. Please enable the 'brotli' feature.",
+                    ))?;
+                }
             }
 
             let entry = entries::FileEntry {
                 name: file_name,
-                mode: metadata.permissions(),
+                mode: metadata.permissions().into(),
                 file: self.file.clone(),
                 owner: metadata_owner(&metadata),
                 mtime: metadata.modified()?,
@@ -508,7 +498,7 @@ impl Archive {
 
             let dir_entry = entries::DirectoryEntry {
                 name: file_name,
-                mode: metadata.permissions(),
+                mode: metadata.permissions().into(),
                 owner: metadata_owner(&metadata),
                 mtime: metadata.modified()?,
                 entries: dir_entries,
@@ -526,7 +516,7 @@ impl Archive {
 
                 let link_entry = entries::SymlinkEntry {
                     name: file_name,
-                    mode: metadata.permissions(),
+                    mode: metadata.permissions().into(),
                     owner: metadata_owner(&metadata),
                     mtime: metadata.modified()?,
                     target,
@@ -549,10 +539,7 @@ impl Archive {
         Ok(())
     }
 
-    fn decode_entry<S: Read>(
-        decoder: &mut S,
-        file: Arc<File>,
-    ) -> Result<entries::Entry, std::io::Error> {
+    fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> std::io::Result<entries::Entry> {
         let name_length = varint::decode_u32(decoder) as usize;
 
         let mut name_bytes = vec![0; name_length];
@@ -565,7 +552,7 @@ impl Archive {
 
         let entry_type = (type_compression_mode >> 30) & 0b11;
         let compression = CompressionFormat::decode(((type_compression_mode >> 26) & 0b1111) as u8);
-        let mode = decode_file_permissions(type_compression_mode & 0x3FFFFFFF);
+        let mode = Permissions::from(type_compression_mode & 0x3FFFFFFF);
 
         let uid = varint::decode_u32(decoder);
         let gid = varint::decode_u32(decoder);

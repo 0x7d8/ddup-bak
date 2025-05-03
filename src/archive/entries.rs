@@ -3,11 +3,144 @@ use flate2::read::{DeflateDecoder, GzDecoder};
 use positioned_io::ReadAt;
 use std::{
     fmt::{Debug, Formatter},
-    fs::{File, Permissions},
+    fs::File,
     io::Read,
+    ops::Deref,
     sync::Arc,
     time::SystemTime,
 };
+
+#[derive(Clone, Copy)]
+pub struct Permissions(u16);
+
+impl Permissions {
+    #[inline]
+    pub fn new(mode: u16) -> Self {
+        Self(mode)
+    }
+
+    #[inline]
+    pub fn bits(&self) -> u16 {
+        self.0
+    }
+
+    /// Returns the user permissions (read, write, execute).
+    #[inline]
+    pub fn user(&self) -> (bool, bool, bool) {
+        (
+            self.0 & 0o400 != 0,
+            self.0 & 0o200 != 0,
+            self.0 & 0o100 != 0,
+        )
+    }
+
+    /// Returns the group permissions (read, write, execute).
+    #[inline]
+    pub fn group(&self) -> (bool, bool, bool) {
+        (
+            self.0 & 0o040 != 0,
+            self.0 & 0o020 != 0,
+            self.0 & 0o010 != 0,
+        )
+    }
+
+    /// Returns the other permissions (read, write, execute).
+    #[inline]
+    pub fn other(&self) -> (bool, bool, bool) {
+        (
+            self.0 & 0o004 != 0,
+            self.0 & 0o002 != 0,
+            self.0 & 0o001 != 0,
+        )
+    }
+}
+
+impl Debug for Permissions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut mode = String::with_capacity(9);
+
+        let (user_r, user_w, user_x) = self.user();
+        let (group_r, group_w, group_x) = self.group();
+        let (other_r, other_w, other_x) = self.other();
+
+        mode.push(if user_r { 'r' } else { '-' });
+        mode.push(if user_w { 'w' } else { '-' });
+        mode.push(if user_x { 'x' } else { '-' });
+        mode.push(if group_r { 'r' } else { '-' });
+        mode.push(if group_w { 'w' } else { '-' });
+        mode.push(if group_x { 'x' } else { '-' });
+        mode.push(if other_r { 'r' } else { '-' });
+        mode.push(if other_w { 'w' } else { '-' });
+        mode.push(if other_x { 'x' } else { '-' });
+
+        f.debug_struct("Permissions").field("mode", &mode).finish()
+    }
+}
+
+impl Default for Permissions {
+    #[inline]
+    fn default() -> Self {
+        Self(0o644)
+    }
+}
+
+impl From<u32> for Permissions {
+    #[inline]
+    fn from(mode: u32) -> Self {
+        Self(mode as u16)
+    }
+}
+
+impl From<u16> for Permissions {
+    #[inline]
+    fn from(mode: u16) -> Self {
+        Self(mode)
+    }
+}
+
+impl From<std::fs::Permissions> for Permissions {
+    #[inline]
+    fn from(permissions: std::fs::Permissions) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            Self((permissions.mode() & 0o777) as u16)
+        }
+        #[cfg(not(unix))]
+        {
+            Self(if permissions.readonly() { 0o444 } else { 0o666 })
+        }
+    }
+}
+
+impl From<Permissions> for std::fs::Permissions {
+    #[inline]
+    fn from(permissions: Permissions) -> std::fs::Permissions {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::Permissions::from_mode(permissions.0 as u32)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = unsafe { std::mem::zeroed() };
+            permissions.set_readonly(permissions.0 & 0o444 != 0);
+
+            permissions
+        }
+    }
+}
+
+impl Deref for Permissions {
+    type Target = u16;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 pub struct FileEntry {
     pub name: String,
@@ -20,17 +153,17 @@ pub struct FileEntry {
     pub size_real: u64,
     pub size: u64,
 
-    pub(crate) file: Arc<File>,
-    pub(crate) decoder: Option<Box<dyn Read + Send>>,
-    pub(crate) offset: u64,
-    pub(crate) consumed: u64,
+    pub file: Arc<File>,
+    pub offset: u64,
+    pub decoder: Option<Box<dyn Read + Send>>,
+    pub consumed: u64,
 }
 
 impl Clone for FileEntry {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
-            mode: self.mode.clone(),
+            mode: self.mode,
             owner: self.owner,
             mtime: self.mtime,
             compression: self.compression,
@@ -91,7 +224,6 @@ impl Read for FileEntry {
                     };
 
                     let decoder = Box::new(GzDecoder::new(reader));
-
                     self.decoder = Some(decoder);
                 }
 
@@ -117,7 +249,6 @@ impl Read for FileEntry {
                     };
 
                     let decoder = Box::new(DeflateDecoder::new(reader));
-
                     self.decoder = Some(decoder);
                 }
 
@@ -133,6 +264,38 @@ impl Read for FileEntry {
                 self.consumed += bytes_read as u64;
                 Ok(bytes_read)
             }
+
+            #[cfg(feature = "brotli")]
+            CompressionFormat::Brotli => {
+                if self.decoder.is_none() {
+                    let reader = BoundedReader {
+                        file: Arc::clone(&self.file),
+                        offset: self.offset,
+                        position: 0,
+                        size: self.size_compressed.unwrap(),
+                    };
+
+                    let decoder = Box::new(brotli::Decompressor::new(reader, 4096));
+                    self.decoder = Some(decoder);
+                }
+
+                let decoder = self.decoder.as_mut().unwrap();
+                let bytes_read = decoder.read(buf)?;
+
+                if bytes_read > remaining as usize {
+                    self.decoder = None;
+                    self.consumed += remaining;
+                    return Ok(remaining as usize);
+                }
+
+                self.consumed += bytes_read as u64;
+                Ok(bytes_read)
+            }
+            #[cfg(not(feature = "brotli"))]
+            CompressionFormat::Brotli => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Brotli support is not enabled. Please enable the 'brotli' feature.",
+            )),
         }
     }
 }
@@ -179,11 +342,11 @@ impl Entry {
     /// Returns the mode of the entry.
     /// This is the file permissions of the entry.
     #[inline]
-    pub const fn mode(&self) -> &Permissions {
+    pub const fn mode(&self) -> Permissions {
         match self {
-            Entry::File(entry) => &entry.mode,
-            Entry::Directory(entry) => &entry.mode,
-            Entry::Symlink(entry) => &entry.mode,
+            Entry::File(entry) => entry.mode,
+            Entry::Directory(entry) => entry.mode,
+            Entry::Symlink(entry) => entry.mode,
         }
     }
 

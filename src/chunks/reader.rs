@@ -40,22 +40,8 @@ impl EntryReader {
             return Ok(());
         }
 
-        let mut chunk = self
-            .chunk_index
-            .read_chunk_id_content(chunk_id)
-            .map_or_else(
-                || {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("Chunk not found: {}", chunk_id),
-                    ))
-                },
-                Ok,
-            )?;
-
-        let mut temp_buf = Vec::new();
-        chunk.read_to_end(&mut temp_buf)?;
-        self.buffer.extend_from_slice(&temp_buf);
+        let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
+        chunk.read_to_end(&mut self.buffer)?;
 
         Ok(())
     }

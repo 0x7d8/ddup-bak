@@ -13,16 +13,17 @@ import (
 )
 
 // CompressionFormat defines the compression algorithm used for files
-type CompressionFormat int
+type CompressionFormat uint8
 
 const (
 	CompressionNone    CompressionFormat = 0
 	CompressionGzip    CompressionFormat = 1
 	CompressionDeflate CompressionFormat = 2
+	CompressionBrotli  CompressionFormat = 3
 )
 
 // EntryType defines the type of a filesystem entry
-type EntryType int
+type EntryType uint8
 
 const (
 	EntryTypeFile      EntryType = 0

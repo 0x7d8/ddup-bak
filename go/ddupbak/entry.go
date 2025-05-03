@@ -37,7 +37,7 @@ type FileEntry struct {
 // DirectoryEntry represents a directory in an archive
 type DirectoryEntry struct {
 	Common  EntryCommon
-	Entries []*Entry // Keeping the original type
+	Entries []*Entry
 }
 
 // SymlinkEntry represents a symbolic link in an archive

@@ -1,6 +1,7 @@
 use crate::archive::CCompressionFormat;
 use ddup_bak::archive::entries::Entry;
 use std::ffi::*;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[repr(C)]
@@ -20,7 +21,7 @@ pub struct CEntry {
 #[repr(C)]
 pub struct CEntryCommon {
     pub name: *mut c_char,
-    pub mode: u32,
+    pub mode: u16,
     pub uid: u32,
     pub gid: u32,
     pub mtime: u64,
@@ -34,6 +35,9 @@ pub struct CFileEntry {
     pub size: u64,
     pub size_real: u64,
     pub size_compressed: u64,
+
+    pub file: *mut c_void,
+    pub offset: u64,
 }
 
 #[repr(C)]
@@ -64,21 +68,7 @@ fn create_c_entry_common(entry: &Entry) -> CEntryCommon {
         Entry::Directory(_) => CEntryType::Directory,
         Entry::Symlink(_) => CEntryType::Symlink,
     };
-
-    #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        entry.mode().mode()
-    };
-
-    #[cfg(windows)]
-    let mode = {
-        if entry.mode().readonly() {
-            1
-        } else {
-            0
-        }
-    };
+    let mode = entry.mode().bits();
 
     CEntryCommon {
         name: name.into_raw(),
@@ -210,6 +200,8 @@ pub fn entry_to_c(entry: &Entry) -> *mut CEntry {
                 size: file_entry.size,
                 size_real: file_entry.size_real,
                 size_compressed: file_entry.size_compressed.unwrap_or(0),
+                file: Arc::into_raw(file_entry.file.clone()) as *mut c_void,
+                offset: file_entry.offset,
             }));
 
             Box::into_raw(Box::new(CEntry {

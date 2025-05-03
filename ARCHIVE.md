@@ -24,6 +24,7 @@ the compression format is an enum describing what compression the content of an 
 - **`0`**: No Compression
 - **`1`**: Gzip Compression
 - **`2`**: Deflate Compression
+- **`3`**: Brotli Compression
 
 ### entry_type
 

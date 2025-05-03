@@ -2,6 +2,7 @@ use std::ffi::*;
 
 pub mod archive;
 pub mod entries;
+pub mod reader;
 pub mod repository;
 
 #[no_mangle]

@@ -125,7 +125,7 @@ impl From<Permissions> for std::fs::Permissions {
         }
         #[cfg(not(unix))]
         {
-            let mut permissions = unsafe { std::mem::zeroed() };
+            let mut permissions: std::fs::Permissions = unsafe { std::mem::zeroed() };
             permissions.set_readonly(permissions.0 & 0o444 != 0);
 
             permissions

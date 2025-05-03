@@ -529,7 +529,7 @@ impl Repository {
                     std::os::windows::fs::symlink_file(link_entry.target, &path)?;
                 }
 
-                std::fs::set_permissions(&path, link_entry.mode)?;
+                std::fs::set_permissions(&path, link_entry.mode.into())?;
             }
         }
 

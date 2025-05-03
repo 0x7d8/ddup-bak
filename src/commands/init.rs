@@ -28,6 +28,7 @@ pub fn init(matches: &ArgMatches) -> i32 {
         chunk_size,
         max_chunk_count,
         Vec::new(),
+        None,
     );
 
     println!(

@@ -1,6 +1,6 @@
 use crate::archive::CCompressionFormat;
 use crate::entries::CFileEntry;
-use ddup_bak::archive::entries::{Entry, FileEntry, Permissions};
+use ddup_bak::archive::entries::{Entry, EntryMode, FileEntry};
 use ddup_bak::chunks::reader::EntryReader;
 use std::ffi::*;
 use std::io::Read;
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn repository_create_entry_reader(
 
     let file_entry = FileEntry {
         name,
-        mode: Permissions::from(entry.common.mode),
+        mode: EntryMode::from(entry.common.mode),
         owner: (entry.common.uid, entry.common.gid),
         mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(entry.common.mtime),
         compression: entry.compression.into(),

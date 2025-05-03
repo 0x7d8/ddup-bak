@@ -2,7 +2,7 @@ use crate::commands::open_repository;
 use chrono::{DateTime, Local};
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::archive::entries::{Entry, Permissions};
+use ddup_bak::archive::entries::{Entry, EntryMode};
 use std::{collections::HashMap, io::Write, path::Path, time::SystemTime};
 
 #[inline]
@@ -21,7 +21,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 #[inline]
-fn render_unix_permissions(mode: Permissions) -> String {
+fn render_unix_permissions(mode: EntryMode) -> String {
     let mode_bits = mode.bits();
     let mut result = String::with_capacity(9);
 
@@ -140,7 +140,7 @@ fn get_groupname(gid: u32) -> String {
 }
 
 #[inline]
-fn is_executable(_mode: Permissions) -> bool {
+fn is_executable(_mode: EntryMode) -> bool {
     _mode.bits() & 0o111 != 0
 }
 

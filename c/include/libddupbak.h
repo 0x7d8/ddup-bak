@@ -32,7 +32,7 @@ typedef struct CEntry {
 
 typedef struct CEntryCommon {
   char *name;
-  uint16_t mode;
+  uint32_t mode;
   uint32_t uid;
   uint32_t gid;
   uint64_t mtime;

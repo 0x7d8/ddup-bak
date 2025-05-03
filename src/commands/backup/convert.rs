@@ -153,7 +153,7 @@ fn tar_recursive_convert_entries(
             let mut entry_header = tar::Header::new_gnu();
             entry_header.set_uid(entries.owner.0 as u64);
             entry_header.set_gid(entries.owner.1 as u64);
-            entry_header.set_mode(entries.mode.bits() as u32);
+            entry_header.set_mode(entries.mode.bits());
 
             entry_header.set_mtime(
                 entries
@@ -192,7 +192,7 @@ fn tar_recursive_convert_entries(
             let mut entry_header = tar::Header::new_gnu();
             entry_header.set_uid(file.owner.0 as u64);
             entry_header.set_gid(file.owner.1 as u64);
-            entry_header.set_mode(file.mode.bits() as u32);
+            entry_header.set_mode(file.mode.bits());
 
             entry_header.set_mtime(
                 file.mtime
@@ -223,7 +223,7 @@ fn tar_recursive_convert_entries(
             let mut entry_header = tar::Header::new_gnu();
             entry_header.set_uid(link.owner.0 as u64);
             entry_header.set_gid(link.owner.1 as u64);
-            entry_header.set_mode(link.mode.bits() as u32);
+            entry_header.set_mode(link.mode.bits());
 
             entry_header.set_mtime(
                 link.mtime

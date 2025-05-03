@@ -1,5 +1,5 @@
 use crate::varint;
-use entries::Permissions;
+use entries::EntryMode;
 use flate2::{
     read::DeflateDecoder,
     write::{DeflateEncoder, GzEncoder},
@@ -315,7 +315,7 @@ impl Archive {
         let mut buffer = Vec::with_capacity(name.len() + 4);
         buffer.extend_from_slice(name.as_bytes());
 
-        let mode = entry.mode().bits() as u32;
+        let mode = entry.mode().bits();
         let compression = match entry {
             entries::Entry::File(file_entry) => file_entry.compression,
             _ => CompressionFormat::None,
@@ -552,7 +552,7 @@ impl Archive {
 
         let entry_type = (type_compression_mode >> 30) & 0b11;
         let compression = CompressionFormat::decode(((type_compression_mode >> 26) & 0b1111) as u8);
-        let mode = Permissions::from(type_compression_mode & 0x3FFFFFFF);
+        let mode = EntryMode::from(type_compression_mode & 0x3FFFFFFF);
 
         let uid = varint::decode_u32(decoder);
         let gid = varint::decode_u32(decoder);

@@ -99,6 +99,7 @@ pub unsafe extern "C" fn new_repository(
         chunk_size as usize,
         max_chunk_count as usize,
         ignored_files,
+        None,
     );
 
     CRepository::from_repository(repository)
@@ -124,6 +125,7 @@ pub unsafe extern "C" fn open_repository(
     let repository = Repository::open(
         Path::new(&directory),
         chunks_directory.as_ref().map(Path::new),
+        None,
     );
 
     match repository {

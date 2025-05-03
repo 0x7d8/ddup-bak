@@ -21,7 +21,7 @@ pub struct CEntry {
 #[repr(C)]
 pub struct CEntryCommon {
     pub name: *mut c_char,
-    pub mode: u16,
+    pub mode: u32,
     pub uid: u32,
     pub gid: u32,
     pub mtime: u64,

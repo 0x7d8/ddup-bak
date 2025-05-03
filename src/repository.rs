@@ -1,6 +1,6 @@
 use crate::{
     archive::{Archive, CompressionFormat, ProgressCallback, entries::Entry},
-    chunks::{ChunkIndex, lock::LockMode, reader::EntryReader},
+    chunks::{ChunkIndex, lock::LockMode, reader::EntryReader, storage},
 };
 use std::{
     collections::HashMap,
@@ -24,9 +24,19 @@ impl Repository {
     /// Opens an existing repository.
     /// The repository must be initialized with `new` before use.
     /// The repository directory must contain a `.ddup-bak` directory.
-    pub fn open(directory: &Path, chunks_directory: Option<&Path>) -> std::io::Result<Self> {
+    pub fn open(
+        directory: &Path,
+        chunks_directory: Option<&Path>,
+        storage: Option<Arc<dyn storage::ChunkStorage>>,
+    ) -> std::io::Result<Self> {
         let chunk_index = ChunkIndex::open(
             chunks_directory.map_or(directory.join(".ddup-bak/chunks"), |p| p.to_path_buf()),
+            storage.map_or(
+                Arc::new(storage::ChunkStorageLocal(
+                    directory.join(".ddup-bak/chunks"),
+                )),
+                |s| s,
+            ),
         )?;
         let mut ignored_files = Vec::new();
 
@@ -53,6 +63,7 @@ impl Repository {
         chunk_size: usize,
         max_chunk_count: usize,
         ignored_files: Vec<String>,
+        storage: Option<Arc<dyn storage::ChunkStorage>>,
     ) -> Self {
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
@@ -64,6 +75,12 @@ impl Repository {
             directory.join(".ddup-bak/chunks"),
             chunk_size,
             max_chunk_count,
+            storage.map_or(
+                Arc::new(storage::ChunkStorageLocal(
+                    directory.join(".ddup-bak/chunks"),
+                )),
+                |s| s,
+            ),
         );
 
         Self {

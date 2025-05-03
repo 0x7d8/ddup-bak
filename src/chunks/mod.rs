@@ -8,7 +8,7 @@ use flate2::{
 use std::{
     collections::VecDeque,
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
 };
@@ -16,10 +16,10 @@ use std::{
 mod hasher;
 pub mod lock;
 pub mod reader;
+pub mod storage;
 
 pub type ChunkHash = [u8; 32];
 
-#[derive(Debug)]
 pub struct ChunkIndex {
     pub directory: PathBuf,
 
@@ -32,6 +32,8 @@ pub struct ChunkIndex {
 
     chunk_size: usize,
     max_chunk_count: usize,
+
+    pub storage: Arc<dyn storage::ChunkStorage>,
 }
 
 impl Clone for ChunkIndex {
@@ -46,12 +48,19 @@ impl Clone for ChunkIndex {
 
             chunk_size: self.chunk_size,
             max_chunk_count: self.max_chunk_count,
+
+            storage: Arc::clone(&self.storage),
         }
     }
 }
 
 impl ChunkIndex {
-    pub fn new(directory: PathBuf, chunk_size: usize, max_chunk_count: usize) -> Self {
+    pub fn new(
+        directory: PathBuf,
+        chunk_size: usize,
+        max_chunk_count: usize,
+        storage: Arc<dyn storage::ChunkStorage>,
+    ) -> Self {
         let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap()).unwrap();
 
         ChunkIndex {
@@ -71,10 +80,14 @@ impl ChunkIndex {
             )),
             chunk_size,
             max_chunk_count,
+            storage,
         }
     }
 
-    pub fn open(directory: PathBuf) -> std::io::Result<Self> {
+    pub fn open(
+        directory: PathBuf,
+        storage: Arc<dyn storage::ChunkStorage>,
+    ) -> std::io::Result<Self> {
         let file = File::open(directory.join("index"))?;
         let mut decoder = DeflateDecoder::new(file);
 
@@ -129,6 +142,7 @@ impl ChunkIndex {
 
             chunk_size,
             max_chunk_count,
+            storage,
         })
     }
 
@@ -167,24 +181,6 @@ impl ChunkIndex {
     }
 
     #[inline]
-    fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
-        let mut path = self.directory.to_path_buf();
-        for byte in chunk.iter().take(2) {
-            path.push(format!("{:02x}", byte));
-        }
-
-        let mut file_name = String::with_capacity(32 * 2 - 2 * 2 + 6);
-        for byte in chunk.iter().skip(2) {
-            file_name.push_str(&format!("{:02x}", byte));
-        }
-        file_name.push_str(".chunk");
-
-        path.push(file_name);
-
-        path
-    }
-
-    #[inline]
     pub fn references(&self, chunk: &ChunkHash) -> u64 {
         if let Some(id) = self.chunk_hashes.get(chunk) {
             let id = *id.value();
@@ -217,25 +213,10 @@ impl ChunkIndex {
                 f(id, true);
             }
 
-            let mut path = self.path_from_chunk(&chunk);
-            std::fs::remove_file(&path)?;
+            self.storage.delete_chunk_content(&chunk)?;
 
             self.chunk_hashes.remove(&chunk);
             self.chunks.remove(&id);
-
-            while let Some(parent) = path.parent() {
-                if parent == self.directory {
-                    break;
-                }
-
-                if std::fs::read_dir(parent)?.count() == 0 {
-                    std::fs::remove_dir(parent)?;
-                } else {
-                    break;
-                }
-
-                path = parent.to_path_buf();
-            }
 
             self.deleted_chunks.lock().unwrap().push_back(id);
         }
@@ -257,23 +238,7 @@ impl ChunkIndex {
             self.chunks.remove(&chunk_id);
             self.chunk_hashes.remove(&chunk);
 
-            let mut path = self.path_from_chunk(&chunk);
-            std::fs::remove_file(&path).ok()?;
-
-            while let Some(parent) = path.parent() {
-                if parent == self.directory {
-                    break;
-                }
-
-                if std::fs::read_dir(parent).ok()?.count() == 0 {
-                    std::fs::remove_dir(parent).ok()?;
-                } else {
-                    break;
-                }
-
-                path = parent.to_path_buf();
-            }
-
+            self.storage.delete_chunk_content(&chunk).ok()?;
             self.deleted_chunks.lock().unwrap().push_back(chunk_id);
 
             return Some(true);
@@ -295,20 +260,19 @@ impl ChunkIndex {
         let chunk = *chunk;
         drop(entry);
 
-        let path = self.path_from_chunk(&chunk);
-        let mut file = File::open(path)?;
+        let mut reader = self.storage.read_chunk_content(&chunk)?;
 
         let mut compression_bytes = [0; 1];
-        file.read_exact(&mut compression_bytes)?;
+        reader.read_exact(&mut compression_bytes)?;
         let compression = CompressionFormat::decode(compression_bytes[0]);
 
         match compression {
-            CompressionFormat::None => Ok(Box::new(file)),
-            CompressionFormat::Gzip => Ok(Box::new(GzDecoder::new(file))),
-            CompressionFormat::Deflate => Ok(Box::new(DeflateDecoder::new(file))),
+            CompressionFormat::None => Ok(reader),
+            CompressionFormat::Gzip => Ok(Box::new(GzDecoder::new(reader))),
+            CompressionFormat::Deflate => Ok(Box::new(DeflateDecoder::new(reader))),
 
             #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli => Ok(Box::new(brotli::Decompressor::new(file, 4096))),
+            CompressionFormat::Brotli => Ok(Box::new(brotli::Decompressor::new(reader, 4096))),
             #[cfg(not(feature = "brotli"))]
             CompressionFormat::Brotli => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -360,27 +324,24 @@ impl ChunkIndex {
             return Ok(id);
         }
 
-        let path = self.path_from_chunk(chunk);
-
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut file = File::create(path)?;
-        file.write_all(&[compression.encode()])?;
+        let mut final_data = vec![compression.encode()];
 
         match compression {
-            CompressionFormat::None => file.write_all(data)?,
+            CompressionFormat::None => final_data.extend_from_slice(data),
             CompressionFormat::Gzip => {
-                let mut encoder = GzEncoder::new(&file, flate2::Compression::default());
+                let mut encoder = GzEncoder::new(&mut final_data, flate2::Compression::default());
                 encoder.write_all(data)?;
                 encoder.flush()?;
             }
             CompressionFormat::Deflate => {
-                let mut encoder = DeflateEncoder::new(&file, flate2::Compression::default());
+                let mut encoder =
+                    DeflateEncoder::new(&mut final_data, flate2::Compression::default());
                 encoder.write_all(data)?;
                 encoder.flush()?;
             }
             #[cfg(feature = "brotli")]
             CompressionFormat::Brotli => {
-                let mut encoder = brotli::CompressorWriter::new(&file, 4096, 11, 22);
+                let mut encoder = brotli::CompressorWriter::new(&mut final_data, 4096, 11, 22);
                 encoder.write_all(data)?;
                 encoder.flush()?;
             }
@@ -393,8 +354,8 @@ impl ChunkIndex {
             }
         }
 
-        file.flush()?;
-        file.sync_all()?;
+        self.storage
+            .write_chunk_content(chunk, Box::new(Cursor::new(final_data)))?;
 
         Ok(id)
     }

@@ -11,16 +11,16 @@ use std::{
 };
 
 #[derive(Clone, Copy)]
-pub struct Permissions(u16);
+pub struct EntryMode(u32);
 
-impl Permissions {
+impl EntryMode {
     #[inline]
-    pub fn new(mode: u16) -> Self {
+    pub fn new(mode: u32) -> Self {
         Self(mode)
     }
 
     #[inline]
-    pub fn bits(&self) -> u16 {
+    pub fn bits(&self) -> u32 {
         self.0
     }
 
@@ -55,57 +55,46 @@ impl Permissions {
     }
 }
 
-impl Debug for Permissions {
+impl Debug for EntryMode {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut mode = String::with_capacity(9);
 
-        let (user_r, user_w, user_x) = self.user();
-        let (group_r, group_w, group_x) = self.group();
-        let (other_r, other_w, other_x) = self.other();
+        mode.push(if self.0 & 0o400 != 0 { 'r' } else { '-' });
+        mode.push(if self.0 & 0o200 != 0 { 'w' } else { '-' });
+        mode.push(if self.0 & 0o100 != 0 { 'x' } else { '-' });
+        mode.push(if self.0 & 0o040 != 0 { 'r' } else { '-' });
+        mode.push(if self.0 & 0o020 != 0 { 'w' } else { '-' });
+        mode.push(if self.0 & 0o010 != 0 { 'x' } else { '-' });
+        mode.push(if self.0 & 0o004 != 0 { 'r' } else { '-' });
+        mode.push(if self.0 & 0o002 != 0 { 'w' } else { '-' });
+        mode.push(if self.0 & 0o001 != 0 { 'x' } else { '-' });
 
-        mode.push(if user_r { 'r' } else { '-' });
-        mode.push(if user_w { 'w' } else { '-' });
-        mode.push(if user_x { 'x' } else { '-' });
-        mode.push(if group_r { 'r' } else { '-' });
-        mode.push(if group_w { 'w' } else { '-' });
-        mode.push(if group_x { 'x' } else { '-' });
-        mode.push(if other_r { 'r' } else { '-' });
-        mode.push(if other_w { 'w' } else { '-' });
-        mode.push(if other_x { 'x' } else { '-' });
-
-        f.debug_struct("Permissions").field("mode", &mode).finish()
+        write!(f, "{} ({:o})", mode, self.0)
     }
 }
 
-impl Default for Permissions {
+impl Default for EntryMode {
     #[inline]
     fn default() -> Self {
         Self(0o644)
     }
 }
 
-impl From<u32> for Permissions {
+impl From<u32> for EntryMode {
     #[inline]
     fn from(mode: u32) -> Self {
-        Self(mode as u16)
-    }
-}
-
-impl From<u16> for Permissions {
-    #[inline]
-    fn from(mode: u16) -> Self {
         Self(mode)
     }
 }
 
-impl From<std::fs::Permissions> for Permissions {
+impl From<std::fs::Permissions> for EntryMode {
     #[inline]
     fn from(permissions: std::fs::Permissions) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            Self((permissions.mode() & 0o777) as u16)
+            Self(permissions.mode())
         }
         #[cfg(not(unix))]
         {
@@ -114,27 +103,27 @@ impl From<std::fs::Permissions> for Permissions {
     }
 }
 
-impl From<Permissions> for std::fs::Permissions {
+impl From<EntryMode> for std::fs::Permissions {
     #[inline]
-    fn from(permissions: Permissions) -> std::fs::Permissions {
+    fn from(permissions: EntryMode) -> std::fs::Permissions {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            std::fs::Permissions::from_mode(permissions.0 as u32)
+            std::fs::Permissions::from_mode(permissions.0)
         }
         #[cfg(not(unix))]
         {
             let mut fs_permissions: std::fs::Permissions = unsafe { std::mem::zeroed() };
-            fs_permissions.set_readonly(permissions.bits() & 0o444 != 0);
+            fs_permissions.set_readonly(permissions.0 & 0o444 != 0);
 
             fs_permissions
         }
     }
 }
 
-impl Deref for Permissions {
-    type Target = u16;
+impl Deref for EntryMode {
+    type Target = u32;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -144,7 +133,7 @@ impl Deref for Permissions {
 
 pub struct FileEntry {
     pub name: String,
-    pub mode: Permissions,
+    pub mode: EntryMode,
     pub owner: (u32, u32),
     pub mtime: SystemTime,
 
@@ -303,7 +292,7 @@ impl Read for FileEntry {
 #[derive(Clone, Debug)]
 pub struct DirectoryEntry {
     pub name: String,
-    pub mode: Permissions,
+    pub mode: EntryMode,
     pub owner: (u32, u32),
     pub mtime: SystemTime,
     pub entries: Vec<Entry>,
@@ -312,7 +301,7 @@ pub struct DirectoryEntry {
 #[derive(Clone, Debug)]
 pub struct SymlinkEntry {
     pub name: String,
-    pub mode: Permissions,
+    pub mode: EntryMode,
     pub owner: (u32, u32),
     pub mtime: SystemTime,
     pub target: String,
@@ -340,9 +329,9 @@ impl Entry {
     }
 
     /// Returns the mode of the entry.
-    /// This is the file permissions of the entry.
+    /// This also contains the file permissions of the entry.
     #[inline]
-    pub const fn mode(&self) -> Permissions {
+    pub const fn mode(&self) -> EntryMode {
         match self {
             Entry::File(entry) => entry.mode,
             Entry::Directory(entry) => entry.mode,

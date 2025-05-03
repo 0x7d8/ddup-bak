@@ -18,7 +18,7 @@ type Entry struct {
 // EntryCommon contains common metadata for all entry types
 type EntryCommon struct {
 	Name  string
-	Mode  uint32
+	Mode  uint16
 	UID   uint32
 	GID   uint32
 	MTime time.Time
@@ -92,7 +92,7 @@ func (e *Entry) GetCommon() (EntryCommon, error) {
 
 	result := EntryCommon{
 		Name:  C.GoString(cCommon.name),
-		Mode:  uint32(cCommon.mode),
+		Mode:  uint16(cCommon.mode),
 		UID:   uint32(cCommon.uid),
 		GID:   uint32(cCommon.gid),
 		MTime: time.Unix(int64(cCommon.mtime), 0),

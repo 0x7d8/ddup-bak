@@ -125,10 +125,10 @@ impl From<Permissions> for std::fs::Permissions {
         }
         #[cfg(not(unix))]
         {
-            let mut permissions: std::fs::Permissions = unsafe { std::mem::zeroed() };
-            permissions.set_readonly(permissions.bits() & 0o444 != 0);
+            let mut fs_permissions: std::fs::Permissions = unsafe { std::mem::zeroed() };
+            fs_permissions.set_readonly(permissions.bits() & 0o444 != 0);
 
-            permissions
+            fs_permissions
         }
     }
 }

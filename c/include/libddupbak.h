@@ -73,6 +73,8 @@ typedef void (*CDeletionProgressCallback)(uint64_t chunk_id, bool deleted);
 
 typedef void (*CProgressCallback)(const char*);
 
+typedef enum CCompressionFormat (*CCompressionFormatCallback)(const char*);
+
 void free_string(char *ptr);
 
 void free_string_array(char **ptr);
@@ -149,6 +151,7 @@ struct CArchive *repository_create_archive(struct CRepository *repo,
                                            const char *directory,
                                            CProgressCallback progress_chunking,
                                            CProgressCallback progress_archiving,
+                                           CCompressionFormatCallback compression_callback,
                                            unsigned int threads);
 
 char **repository_list_archives(struct CRepository *repo, unsigned int *count);

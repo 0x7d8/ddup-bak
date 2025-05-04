@@ -1,12 +1,15 @@
-use crate::archive::CArchive;
+use crate::archive::{CArchive, CCompressionFormat};
+use ddup_bak::archive::CompressionFormat;
 use ddup_bak::repository::Repository;
 use std::ffi::*;
+use std::fs::Metadata;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 
 pub type CProgressCallback = Option<extern "C" fn(*const c_char)>;
 pub type CDeletionProgressCallback = Option<extern "C" fn(chunk_id: u64, deleted: bool)>;
+pub type CCompressionFormatCallback = Option<extern "C" fn(*const c_char) -> CCompressionFormat>;
 
 #[repr(C)]
 pub struct CRepository {
@@ -267,6 +270,7 @@ pub unsafe extern "C" fn repository_create_archive(
     directory: *const c_char,
     progress_chunking: CProgressCallback,
     progress_archiving: CProgressCallback,
+    compression_callback: CCompressionFormatCallback,
     threads: c_uint,
 ) -> *mut CArchive {
     if repo.is_null() || name.is_null() {
@@ -302,11 +306,19 @@ pub unsafe extern "C" fn repository_create_archive(
         }) as Arc<dyn Fn(&std::path::Path) + Send + Sync>
     });
 
+    let compression_callback = compression_callback.map(|callback_fn| {
+        Arc::new(move |path: &Path, _: &Metadata| {
+            let c_compression_str = CString::new(path.to_string_lossy().into_owned()).unwrap();
+            callback_fn(c_compression_str.as_ptr()).into()
+        }) as Arc<dyn Fn(&Path, &Metadata) -> CompressionFormat + Send + Sync>
+    });
+
     match repo.create_archive(
         &name,
         directory_path,
         progress_chunking,
         progress_archiving,
+        compression_callback,
         threads as usize,
     ) {
         Ok(archive) => CArchive::from_archive(archive),

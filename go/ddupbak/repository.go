@@ -10,6 +10,7 @@ extern void goProgressChunkingCallback(char* path);
 extern void goProgressArchivingCallback(char* path);
 extern void goProgressRestoringCallback(char* path);
 extern void goProgressCleaningCallback(uint64_t chunkID, _Bool deleted);
+extern CCompressionFormat goCompressionFormatCallback(char* path);
 
 // Define proper function pointers for callbacks
 static CProgressCallback getChunkingCallback() {
@@ -26,6 +27,10 @@ static CProgressCallback getRestoringCallback() {
 
 static CDeletionProgressCallback getCleaningCallback() {
     return (CDeletionProgressCallback)goProgressCleaningCallback;
+}
+
+static CCompressionFormatCallback getCompressionFormatCallback() {
+	return (CCompressionFormatCallback)goCompressionFormatCallback;
 }
 */
 import "C"
@@ -58,6 +63,9 @@ type DeletionProgressCallback func(chunkID uint64, deleted bool)
 
 // CleaningProgressCallback is a callback for tracking cleaning progress
 type CleaningProgressCallback = DeletionProgressCallback
+
+// CompressionFormatCallback is a callback for determining the compression format
+type CompressionFormatCallback func(path string) CompressionFormat
 
 // Callback registry maps
 var (
@@ -114,6 +122,30 @@ func goProgressCleaningCallback(chunkID C.uint64_t, deleted C._Bool) {
 			callback(uint64(chunkID), bool(deleted))
 		}
 	}
+}
+
+//export goCompressionFormatCallback
+func goCompressionFormatCallback(path *C.char) C.CCompressionFormat {
+	pathStr := C.GoString(path)
+	activeCallbacksLock.Lock()
+	defer activeCallbacksLock.Unlock()
+	if cb, ok := activeCallbacks["compression"]; ok {
+		if callback, ok := cb.(CompressionFormatCallback); ok {
+			format := callback(pathStr)
+			switch format {
+			case CompressionNone:
+				return 0
+			case CompressionGzip:
+				return 1
+			case CompressionDeflate:
+				return 2
+			case CompressionBrotli:
+				return 3
+			}
+		}
+	}
+
+	return 0
 }
 
 // NewRepository creates a new repository with the specified parameters
@@ -294,6 +326,7 @@ func (r *Repository) CreateArchive(
 	directory string,
 	chunkingCallback ChunkingProgressCallback,
 	archivingCallback ArchivingProgressCallback,
+	compressionFormatCallback CompressionFormatCallback,
 	threads uint,
 ) (*Archive, error) {
 	if r.repo == nil {
@@ -324,12 +357,21 @@ func (r *Repository) CreateArchive(
 		cArchivingCallback = C.getArchivingCallback()
 	}
 
+	var cCompressionFormatCallback C.CCompressionFormatCallback
+	if compressionFormatCallback != nil {
+		activeCallbacksLock.Lock()
+		activeCallbacks["compression"] = compressionFormatCallback
+		activeCallbacksLock.Unlock()
+		cCompressionFormatCallback = C.getCompressionFormatCallback()
+	}
+
 	cArchive := C.repository_create_archive(
 		r.repo,
 		cName,
 		cDirectory,
 		cChunkingCallback,
 		cArchivingCallback,
+		cCompressionFormatCallback,
 		C.uint(threads),
 	)
 

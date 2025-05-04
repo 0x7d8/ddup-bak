@@ -1,5 +1,7 @@
 use crate::{
-    archive::{Archive, CompressionFormat, ProgressCallback, entries::Entry},
+    archive::{
+        Archive, CompressionFormat, CompressionFormatCallback, ProgressCallback, entries::Entry,
+    },
     chunks::{ChunkIndex, lock::LockMode, reader::EntryReader, storage},
 };
 use std::{
@@ -208,6 +210,7 @@ impl Repository {
         entry: std::fs::DirEntry,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
+        compression_callback: CompressionFormatCallback,
         scope: &rayon::Scope,
         error: Arc<RwLock<Option<std::io::Error>>>,
         sizes: Arc<RwLock<HashMap<PathBuf, u64>>>,
@@ -225,8 +228,12 @@ impl Repository {
         }
 
         if metadata.is_file() {
-            let chunks = chunk_index.chunk_file(&path, CompressionFormat::Deflate, Some(scope))?;
+            let compression = compression_callback
+                .as_ref()
+                .map(|f| f(&path, &metadata))
+                .unwrap_or(CompressionFormat::Deflate);
 
+            let chunks = chunk_index.chunk_file(&path, compression, Some(scope))?;
             let file = File::create(&destination)?;
 
             let mut writer = BufWriter::new(&file);
@@ -267,6 +274,7 @@ impl Repository {
                     let destination = destination.clone();
                     let chunk_index = chunk_index.clone();
                     let progress_chunking = progress_chunking.clone();
+                    let compression_callback = compression_callback.clone();
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
@@ -274,6 +282,7 @@ impl Repository {
                             sub_entry,
                             &destination,
                             progress_chunking,
+                            compression_callback,
                             scope,
                             Arc::clone(&error),
                             Arc::clone(&sizes),
@@ -315,6 +324,7 @@ impl Repository {
         directory: Option<&Path>,
         progress_chunking: ProgressCallback,
         progress_archiving: ProgressCallback,
+        compression_callback: CompressionFormatCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
         if self.list_archives()?.contains(&name.to_string()) {
@@ -358,6 +368,7 @@ impl Repository {
                     let chunk_index = self.chunk_index.clone();
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
                     let progress_chunking = progress_chunking.clone();
+                    let compression_callback = compression_callback.clone();
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
@@ -365,6 +376,7 @@ impl Repository {
                             entry,
                             &archive_tmp_path,
                             progress_chunking,
+                            compression_callback,
                             scope,
                             Arc::clone(&error),
                             Arc::clone(&sizes),

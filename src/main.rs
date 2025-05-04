@@ -71,6 +71,15 @@ fn cli() -> Command {
                                 .value_parser(clap::value_parser!(usize))
                                 .required(false),
                         )
+                        .arg(
+                            Arg::new("compression")
+                                .help("The compression format to use")
+                                .short('c')
+                                .long("compression")
+                                .num_args(1)
+                                .default_value("deflate")
+                                .required(false),
+                        )
                         .arg_required_else_help(true),
                 )
                 .subcommand(

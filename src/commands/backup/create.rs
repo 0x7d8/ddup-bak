@@ -54,6 +54,7 @@ pub fn create(matches: &ArgMatches) -> i32 {
                     .git_global(false)
                     .build()
             }),
+            directory.map(Path::new),
             Some({
                 let progress = progress.clone();
 

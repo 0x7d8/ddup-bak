@@ -153,6 +153,7 @@ impl Repository {
     fn recursive_create_archive(
         chunk_index: &ChunkIndex,
         entry: ignore::DirEntry,
+        root_path: &Path,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
         compression_callback: CompressionFormatCallback,
@@ -161,7 +162,7 @@ impl Repository {
         sizes: Arc<RwLock<HashMap<PathBuf, u64>>>,
     ) -> std::io::Result<()> {
         let path = entry.path();
-        let destination = temp_path.join(path);
+        let destination = temp_path.join(path.strip_prefix(root_path).unwrap());
         let metadata = path.symlink_metadata()?;
 
         if error.read().unwrap().is_some() {
@@ -179,7 +180,9 @@ impl Repository {
                 .unwrap_or(CompressionFormat::Deflate);
 
             if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent)?;
+                }
             }
 
             let chunks = chunk_index.chunk_file(&path.to_path_buf(), compression, Some(scope))?;
@@ -241,10 +244,12 @@ impl Repository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_archive(
         &self,
         name: &str,
         directory: Option<ignore::Walk>,
+        directory_root: Option<&Path>,
         progress_chunking: ProgressCallback,
         progress_archiving: ProgressCallback,
         compression_callback: CompressionFormatCallback,
@@ -287,10 +292,15 @@ impl Repository {
                     continue;
                 }
 
+                if error.read().unwrap().is_some() {
+                    break;
+                }
+
                 scope.spawn({
                     let error = Arc::clone(&error);
                     let sizes = Arc::clone(&sizes);
                     let chunk_index = self.chunk_index.clone();
+                    let directory_root = directory_root.unwrap_or(&self.directory);
                     let archive_tmp_path = archive_tmp_path.to_path_buf();
                     let progress_chunking = progress_chunking.clone();
                     let compression_callback = compression_callback.clone();
@@ -299,6 +309,7 @@ impl Repository {
                         if let Err(err) = Self::recursive_create_archive(
                             &chunk_index,
                             entry,
+                            directory_root,
                             &archive_tmp_path,
                             progress_chunking,
                             compression_callback,

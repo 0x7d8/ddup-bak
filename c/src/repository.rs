@@ -240,6 +240,7 @@ pub unsafe extern "C" fn repository_create_archive(
     match repo.create_archive(
         &name,
         directory_path,
+        directory_str.as_ref().map(Path::new),
         progress_chunking,
         progress_archiving,
         compression_callback,

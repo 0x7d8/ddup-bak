@@ -15,18 +15,25 @@ pub struct EntryMode(u32);
 
 impl EntryMode {
     #[inline]
-    pub fn new(mode: u32) -> Self {
+    pub const fn new(mode: u32) -> Self {
         Self(mode)
     }
 
+    /// Returns the mode bits.
     #[inline]
-    pub fn bits(&self) -> u32 {
+    pub const fn bits(&self) -> u32 {
         self.0
+    }
+
+    /// Sets the mode bits.
+    #[inline]
+    pub const fn set_bits(&mut self, mode: u32) {
+        self.0 = mode;
     }
 
     /// Returns the user permissions (read, write, execute).
     #[inline]
-    pub fn user(&self) -> (bool, bool, bool) {
+    pub const fn user(&self) -> (bool, bool, bool) {
         (
             self.0 & 0o400 != 0,
             self.0 & 0o200 != 0,
@@ -34,9 +41,16 @@ impl EntryMode {
         )
     }
 
+    /// Sets the user permissions (read, write, execute).
+    #[inline]
+    pub const fn set_user(&mut self, read: bool, write: bool, execute: bool) {
+        self.0 &= !0o700;
+        self.0 |= (read as u32) << 6 | (write as u32) << 5 | (execute as u32) << 4;
+    }
+
     /// Returns the group permissions (read, write, execute).
     #[inline]
-    pub fn group(&self) -> (bool, bool, bool) {
+    pub const fn group(&self) -> (bool, bool, bool) {
         (
             self.0 & 0o040 != 0,
             self.0 & 0o020 != 0,
@@ -44,14 +58,28 @@ impl EntryMode {
         )
     }
 
+    /// Sets the group permissions (read, write, execute).
+    #[inline]
+    pub const fn set_group(&mut self, read: bool, write: bool, execute: bool) {
+        self.0 &= !0o070;
+        self.0 |= (read as u32) << 3 | (write as u32) << 2 | (execute as u32) << 1;
+    }
+
     /// Returns the other permissions (read, write, execute).
     #[inline]
-    pub fn other(&self) -> (bool, bool, bool) {
+    pub const fn other(&self) -> (bool, bool, bool) {
         (
             self.0 & 0o004 != 0,
             self.0 & 0o002 != 0,
             self.0 & 0o001 != 0,
         )
+    }
+
+    /// Sets the other permissions (read, write, execute).
+    #[inline]
+    pub const fn set_other(&mut self, read: bool, write: bool, execute: bool) {
+        self.0 &= !0o007;
+        self.0 |= (read as u32) | (write as u32) << 1 | (execute as u32) << 2;
     }
 }
 
@@ -84,6 +112,13 @@ impl From<u32> for EntryMode {
     #[inline]
     fn from(mode: u32) -> Self {
         Self(mode)
+    }
+}
+
+impl From<EntryMode> for u32 {
+    #[inline]
+    fn from(mode: EntryMode) -> Self {
+        mode.0
     }
 }
 

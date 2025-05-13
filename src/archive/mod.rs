@@ -20,6 +20,7 @@ pub mod entries;
 pub const FILE_SIGNATURE: [u8; 7] = *b"DDUPBAK";
 pub const FILE_VERSION: u8 = 1;
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompressionFormat {
     None,
@@ -29,7 +30,7 @@ pub enum CompressionFormat {
 }
 
 impl CompressionFormat {
-    pub fn encode(&self) -> u8 {
+    pub const fn encode(&self) -> u8 {
         match self {
             CompressionFormat::None => 0,
             CompressionFormat::Gzip => 1,
@@ -38,7 +39,7 @@ impl CompressionFormat {
         }
     }
 
-    pub fn decode(value: u8) -> Self {
+    pub const fn decode(value: u8) -> Self {
         match value {
             0 => CompressionFormat::None,
             1 => CompressionFormat::Gzip,
@@ -46,6 +47,13 @@ impl CompressionFormat {
             3 => CompressionFormat::Brotli,
             _ => panic!("Invalid compression format"),
         }
+    }
+}
+
+impl Default for CompressionFormat {
+    #[inline]
+    fn default() -> Self {
+        CompressionFormat::None
     }
 }
 
@@ -57,7 +65,7 @@ fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
 
         (_metadata.uid(), _metadata.gid())
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
         (0, 0)
     }
@@ -146,6 +154,13 @@ impl Archive {
             entries,
             entries_offset,
         })
+    }
+
+    /// Retrieves the format version of the archive.
+    /// This is the version of the archive format.
+    #[inline]
+    pub const fn version(&self) -> u8 {
+        self.version
     }
 
     /// Sets the compression callback for the archive.
@@ -532,7 +547,7 @@ impl Archive {
             }
         }
 
-        if let Some(f) = progress.clone() {
+        if let Some(f) = progress {
             f(&path)
         }
 

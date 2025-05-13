@@ -125,8 +125,7 @@ void free_entry_reader(struct CEntryReader *reader);
 
 struct CRepository *new_repository(const char *directory,
                                    unsigned int chunk_size,
-                                   unsigned int max_chunk_count,
-                                   const char *const *ignored_files);
+                                   unsigned int max_chunk_count);
 
 struct CRepository *open_repository(const char *directory, const char *chunks_directory);
 
@@ -135,14 +134,6 @@ void free_repository(struct CRepository *repo);
 int repository_save(struct CRepository *repo);
 
 struct CRepository *repository_set_save_on_drop(struct CRepository *repo, bool save_on_drop);
-
-struct CRepository *repository_add_ignored_file(struct CRepository *repo, const char *file);
-
-struct CRepository *repository_remove_ignored_file(struct CRepository *repo, const char *file);
-
-bool repository_is_ignored(struct CRepository *repo, const char *file);
-
-char **repository_get_ignored_files(struct CRepository *repo);
 
 int repository_clean(struct CRepository *repo, CDeletionProgressCallback progress_callback);
 

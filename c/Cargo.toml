@@ -9,6 +9,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 ddup-bak = { path = ".." }
+ignore = "0.4.23"
 
 [build-dependencies]
 cbindgen = "0.24.0"

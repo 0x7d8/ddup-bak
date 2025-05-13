@@ -22,6 +22,7 @@ pub type ChunkHash = [u8; 32];
 
 pub struct ChunkIndex {
     pub directory: PathBuf,
+    pub storage: Arc<dyn storage::ChunkStorage>,
 
     pub lock: Arc<lock::RwLock>,
 
@@ -32,15 +33,16 @@ pub struct ChunkIndex {
 
     chunk_size: usize,
     max_chunk_count: usize,
-
-    pub storage: Arc<dyn storage::ChunkStorage>,
 }
 
 impl Clone for ChunkIndex {
     fn clone(&self) -> Self {
         ChunkIndex {
             directory: self.directory.clone(),
+            storage: Arc::clone(&self.storage),
+
             lock: Arc::clone(&self.lock),
+
             next_id: Arc::clone(&self.next_id),
             deleted_chunks: Arc::clone(&self.deleted_chunks),
             chunks: Arc::clone(&self.chunks),
@@ -48,8 +50,6 @@ impl Clone for ChunkIndex {
 
             chunk_size: self.chunk_size,
             max_chunk_count: self.max_chunk_count,
-
-            storage: Arc::clone(&self.storage),
         }
     }
 }
@@ -63,9 +63,12 @@ impl ChunkIndex {
     ) -> Self {
         let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap()).unwrap();
 
-        ChunkIndex {
+        Self {
             directory,
+            storage,
+
             lock: Arc::new(lock),
+
             next_id: Arc::new(AtomicU64::new(1)),
             deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
             chunks: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
@@ -78,9 +81,9 @@ impl ChunkIndex {
                 hasher::RandomizingHasherBuilder,
                 1024,
             )),
+
             chunk_size,
             max_chunk_count,
-            storage,
         }
     }
 
@@ -134,7 +137,10 @@ impl ChunkIndex {
 
         Ok(Self {
             directory,
+            storage,
+
             lock: Arc::new(lock),
+
             next_id: Arc::new(AtomicU64::new(next_id)),
             deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
             chunks: Arc::new(result_chunks),
@@ -142,7 +148,6 @@ impl ChunkIndex {
 
             chunk_size,
             max_chunk_count,
-            storage,
         })
     }
 

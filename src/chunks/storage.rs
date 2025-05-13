@@ -1,7 +1,7 @@
 use super::ChunkHash;
 use std::{io::Write, path::PathBuf};
 
-pub trait ChunkStorage: Sync + Send + 'static {
+pub trait ChunkStorage: Sync + Send {
     #[inline]
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
         let mut path = PathBuf::new();

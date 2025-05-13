@@ -23,13 +23,7 @@ pub fn init(matches: &ArgMatches) -> i32 {
         "...".bright_black()
     );
 
-    Repository::new(
-        Path::new(directory),
-        chunk_size,
-        max_chunk_count,
-        Vec::new(),
-        None,
-    );
+    Repository::new(Path::new(directory), chunk_size, max_chunk_count, None);
 
     println!(
         "{} {} {} {}",

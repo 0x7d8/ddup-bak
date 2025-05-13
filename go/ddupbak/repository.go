@@ -149,23 +149,14 @@ func goCompressionFormatCallback(path *C.char) C.CCompressionFormat {
 }
 
 // NewRepository creates a new repository with the specified parameters
-func NewRepository(directory string, chunkSize uint, maxChunkCount uint, ignoredFiles []string) (*Repository, error) {
+func NewRepository(directory string, chunkSize uint, maxChunkCount uint) (*Repository, error) {
 	cDirectory := C.CString(directory)
 	defer C.free(unsafe.Pointer(cDirectory))
-
-	var cIgnoredFiles **C.char
-	var cleanup func()
-
-	if len(ignoredFiles) > 0 {
-		cIgnoredFiles, cleanup = goStringsToCStrings(ignoredFiles)
-		defer cleanup()
-	}
 
 	repo := C.new_repository(
 		cDirectory,
 		C.uint(chunkSize),
 		C.uint(maxChunkCount),
-		cIgnoredFiles,
 	)
 
 	if repo == nil {
@@ -233,72 +224,6 @@ func (r *Repository) SetSaveOnDrop(saveOnDrop bool) error {
 
 	C.repository_set_save_on_drop(r.repo, C._Bool(saveOnDrop))
 	return nil
-}
-
-// AddIgnoredFile adds a file pattern to the ignored list
-func (r *Repository) AddIgnoredFile(pattern string) error {
-	if r.repo == nil {
-		return errors.New("repository is closed")
-	}
-
-	cPattern := C.CString(pattern)
-	defer C.free(unsafe.Pointer(cPattern))
-
-	C.repository_add_ignored_file(r.repo, cPattern)
-	return nil
-}
-
-// RemoveIgnoredFile removes a file pattern from the ignored list
-func (r *Repository) RemoveIgnoredFile(pattern string) error {
-	if r.repo == nil {
-		return errors.New("repository is closed")
-	}
-
-	cPattern := C.CString(pattern)
-	defer C.free(unsafe.Pointer(cPattern))
-
-	C.repository_remove_ignored_file(r.repo, cPattern)
-	return nil
-}
-
-// IsIgnored checks if a file is ignored
-func (r *Repository) IsIgnored(file string) (bool, error) {
-	if r.repo == nil {
-		return false, errors.New("repository is closed")
-	}
-
-	cFile := C.CString(file)
-	defer C.free(unsafe.Pointer(cFile))
-
-	isIgnored := C.repository_is_ignored(r.repo, cFile)
-	return bool(isIgnored), nil
-}
-
-// GetIgnoredFiles returns the list of ignored file patterns
-func (r *Repository) GetIgnoredFiles() []string {
-	if r.repo == nil {
-		return []string{}
-	}
-
-	cFiles := C.repository_get_ignored_files(r.repo)
-	if cFiles == nil {
-		return []string{}
-	}
-
-	var count int
-	for ptr := unsafe.Pointer(cFiles); *(**C.char)(ptr) != nil; ptr = unsafe.Pointer(uintptr(ptr) + unsafe.Sizeof(uintptr(0))) {
-		count++
-	}
-
-	result := make([]string, count)
-	for i := 0; i < count; i++ {
-		ptr := (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cFiles)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
-		result[i] = C.GoString(*ptr)
-	}
-
-	C.free_string_array(cFiles)
-
-	return result
 }
 
 // Clean removes unused chunks from the repository

@@ -32,7 +32,6 @@ impl Hasher for RandomizingHasher {
 
 #[derive(Clone)]
 pub struct RandomizingHasherBuilder;
-
 impl BuildHasher for RandomizingHasherBuilder {
     type Hasher = RandomizingHasher;
 

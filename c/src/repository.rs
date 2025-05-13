@@ -79,29 +79,13 @@ pub unsafe extern "C" fn new_repository(
     directory: *const c_char,
     chunk_size: c_uint,
     max_chunk_count: c_uint,
-    ignored_files: *const *const c_char,
 ) -> *mut CRepository {
     let directory = unsafe { CStr::from_ptr(directory).to_string_lossy().into_owned() };
-    let ignored_files = unsafe {
-        let mut files = Vec::new();
-        let mut i = 0;
-        while !ignored_files.add(i).is_null() {
-            files.push(
-                CStr::from_ptr(*ignored_files.add(i))
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            i += 1;
-        }
-
-        files
-    };
 
     let repository = Repository::new(
         Path::new(&directory),
         chunk_size as usize,
         max_chunk_count as usize,
-        ignored_files,
         None,
     );
 
@@ -175,71 +159,6 @@ pub unsafe extern "C" fn repository_set_save_on_drop(
 
 #[no_mangle]
 #[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn repository_add_ignored_file(
-    repo: *mut CRepository,
-    file: *const c_char,
-) -> *mut CRepository {
-    let repo = unsafe { &mut *repo };
-    let file = unsafe { CStr::from_ptr(file).to_string_lossy().into_owned() };
-
-    repo.add_ignored_file(&file);
-
-    repo
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn repository_remove_ignored_file(
-    repo: *mut CRepository,
-    file: *const c_char,
-) -> *mut CRepository {
-    let repo = unsafe { &mut *repo };
-    let file = unsafe { CStr::from_ptr(file).to_string_lossy().into_owned() };
-
-    repo.remove_ignored_file(&file);
-
-    repo
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn repository_is_ignored(
-    repo: *mut CRepository,
-    file: *const c_char,
-) -> bool {
-    let repo = unsafe { &mut *repo };
-    let file = unsafe { CStr::from_ptr(file).to_string_lossy().into_owned() };
-
-    repo.is_ignored(&file)
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
-pub unsafe extern "C" fn repository_get_ignored_files(repo: *mut CRepository) -> *mut *mut c_char {
-    if repo.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let repo = unsafe { &mut *repo };
-    let ignored_files = repo.get_ignored_files();
-
-    let mut files = Vec::with_capacity(ignored_files.len() + 1);
-
-    for file in ignored_files {
-        let c_file = CString::new(file.as_str()).unwrap();
-        files.push(c_file.into_raw());
-    }
-
-    files.push(std::ptr::null_mut());
-
-    let ptr = files.as_mut_ptr();
-    std::mem::forget(files);
-
-    ptr
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn repository_clean(
     repo: *mut CRepository,
     progress_callback: CDeletionProgressCallback,
@@ -286,7 +205,12 @@ pub unsafe extern "C" fn repository_create_archive(
         Some(unsafe { CStr::from_ptr(directory).to_string_lossy().into_owned() })
     };
 
-    let directory_path = directory_str.as_ref().map(Path::new);
+    let directory_path = directory_str.as_ref().map(|d| {
+        ignore::WalkBuilder::new(Path::new(d))
+            .follow_links(false)
+            .git_global(false)
+            .build()
+    });
 
     let progress_chunking = progress_chunking.map(|callback_fn| {
         Arc::new(move |path: &std::path::Path| {

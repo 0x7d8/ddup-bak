@@ -19,7 +19,6 @@ pub struct Repository {
     pub save_on_drop: bool,
 
     pub chunk_index: ChunkIndex,
-    pub ignored_files: Vec<String>,
 }
 
 impl Repository {
@@ -40,23 +39,11 @@ impl Repository {
                 |s| s,
             ),
         )?;
-        let mut ignored_files = Vec::new();
-
-        let ignored_files_path = directory.join(".ddup-bak/ignored_files");
-        if ignored_files_path.exists() {
-            let text = std::fs::read_to_string(&ignored_files_path)?;
-            for line in text.lines() {
-                if !line.is_empty() {
-                    ignored_files.push(line.to_string());
-                }
-            }
-        }
 
         Ok(Self {
             directory: directory.to_path_buf(),
             save_on_drop: true,
             chunk_index,
-            ignored_files,
         })
     }
 
@@ -64,14 +51,12 @@ impl Repository {
         directory: &Path,
         chunk_size: usize,
         max_chunk_count: usize,
-        ignored_files: Vec<String>,
         storage: Option<Arc<dyn storage::ChunkStorage>>,
     ) -> Self {
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-restored")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/chunks")).unwrap();
-        std::fs::write(directory.join(".ddup-bak/ignored_files"), "").unwrap();
 
         let chunk_index = ChunkIndex::new(
             directory.join(".ddup-bak/chunks"),
@@ -89,25 +74,17 @@ impl Repository {
             directory: directory.to_path_buf(),
             save_on_drop: true,
             chunk_index,
-            ignored_files,
         }
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let ignored_files_path = self.directory.join(".ddup-bak/ignored_files");
-        let mut file = File::create(&ignored_files_path)?;
-
-        for entry in &self.ignored_files {
-            writeln!(file, "{}", entry)?;
-        }
-
         self.chunk_index.save()?;
 
         Ok(())
     }
 
     #[inline]
-    fn archive_path(&self, name: &str) -> PathBuf {
+    pub fn archive_path(&self, name: &str) -> PathBuf {
         self.directory
             .join(".ddup-bak/archives")
             .join(format!("{}.ddup", name))
@@ -123,39 +100,6 @@ impl Repository {
         self.save_on_drop = save_on_drop;
 
         self
-    }
-
-    /// Adds a file to the ignored list.
-    /// If the file is already in the list, it does nothing.
-    /// The file is added as a relative path from the repository directory.
-    #[inline]
-    pub fn add_ignored_file(&mut self, file: &str) -> &mut Self {
-        if !self.ignored_files.contains(&file.to_string()) {
-            self.ignored_files.push(file.to_string());
-        }
-
-        self
-    }
-
-    /// Removes a file from the ignored list.
-    /// If the file is not in the list, it does nothing.
-    #[inline]
-    pub fn remove_ignored_file(&mut self, file: &str) {
-        if let Some(pos) = self.ignored_files.iter().position(|x| x == file) {
-            self.ignored_files.remove(pos);
-        }
-    }
-
-    /// Checks if a file is ignored.
-    /// Returns true if the file is ignored, false otherwise.
-    pub fn is_ignored(&self, file: &str) -> bool {
-        self.ignored_files.contains(&file.to_string())
-    }
-
-    /// Returns a reference to the list of ignored files.
-    #[inline]
-    pub fn get_ignored_files(&self) -> &[String] {
-        &self.ignored_files
     }
 
     /// Lists all archives in the repository.
@@ -205,9 +149,10 @@ impl Repository {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recursive_create_archive(
         chunk_index: &ChunkIndex,
-        entry: std::fs::DirEntry,
+        entry: ignore::DirEntry,
         temp_path: &Path,
         progress_chunking: ProgressCallback,
         compression_callback: CompressionFormatCallback,
@@ -216,24 +161,28 @@ impl Repository {
         sizes: Arc<RwLock<HashMap<PathBuf, u64>>>,
     ) -> std::io::Result<()> {
         let path = entry.path();
-        let destination = temp_path.join(path.file_name().unwrap());
+        let destination = temp_path.join(path);
         let metadata = path.symlink_metadata()?;
 
         if error.read().unwrap().is_some() {
             return Ok(());
         }
 
-        if let Some(f) = progress_chunking.clone() {
-            f(&path)
+        if let Some(f) = &progress_chunking {
+            f(path)
         }
 
         if metadata.is_file() {
             let compression = compression_callback
                 .as_ref()
-                .map(|f| f(&path, &metadata))
+                .map(|f| f(path, &metadata))
                 .unwrap_or(CompressionFormat::Deflate);
 
-            let chunks = chunk_index.chunk_file(&path, compression, Some(scope))?;
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let chunks = chunk_index.chunk_file(&path.to_path_buf(), compression, Some(scope))?;
             let file = File::create(&destination)?;
 
             let mut writer = BufWriter::new(&file);
@@ -266,34 +215,8 @@ impl Repository {
                 let (uid, gid) = (metadata.uid(), metadata.gid());
                 std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
             }
-
-            for sub_entry in std::fs::read_dir(&path)?.flatten() {
-                scope.spawn({
-                    let error = Arc::clone(&error);
-                    let sizes = Arc::clone(&sizes);
-                    let destination = destination.clone();
-                    let chunk_index = chunk_index.clone();
-                    let progress_chunking = progress_chunking.clone();
-                    let compression_callback = compression_callback.clone();
-
-                    move |scope| {
-                        if let Err(err) = Self::recursive_create_archive(
-                            &chunk_index,
-                            sub_entry,
-                            &destination,
-                            progress_chunking,
-                            compression_callback,
-                            scope,
-                            Arc::clone(&error),
-                            Arc::clone(&sizes),
-                        ) {
-                            *error.write().unwrap() = Some(err);
-                        }
-                    }
-                });
-            }
         } else if metadata.is_symlink() {
-            if let Ok(target) = std::fs::read_link(&path) {
+            if let Ok(target) = std::fs::read_link(path) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
@@ -319,9 +242,9 @@ impl Repository {
     }
 
     pub fn create_archive(
-        &mut self,
+        &self,
         name: &str,
-        directory: Option<&Path>,
+        directory: Option<ignore::Walk>,
         progress_chunking: ProgressCallback,
         progress_archiving: ProgressCallback,
         compression_callback: CompressionFormatCallback,
@@ -350,15 +273,17 @@ impl Repository {
         let error = Arc::new(RwLock::new(None));
         let sizes = Arc::new(RwLock::new(HashMap::new()));
 
+        let walker = directory.unwrap_or_else(|| {
+            ignore::WalkBuilder::new(&self.directory)
+                .follow_links(false)
+                .git_global(false)
+                .build()
+        });
+
         worker_pool.in_place_scope(|scope| {
-            for entry in std::fs::read_dir(directory.unwrap_or(&self.directory))
-                .unwrap()
-                .flatten()
-            {
+            for entry in walker.flatten() {
                 let path = entry.path();
-                if self.is_ignored(path.to_str().unwrap())
-                    || path.file_name() == Some(".ddup-bak".as_ref())
-                {
+                if path.file_name() == Some(".ddup-bak".as_ref()) {
                     continue;
                 }
 
@@ -397,6 +322,7 @@ impl Repository {
 
         let mut archive = Archive::new(File::create(&archive_path)?);
 
+        archive.set_compression_callback(Some(Arc::new(|_, _| CompressionFormat::None)));
         archive.set_real_size_callback(Some(Arc::new(move |entry| {
             let sizes = sizes.read().unwrap();
 
@@ -469,7 +395,7 @@ impl Repository {
             return Ok(());
         }
 
-        if let Some(f) = progress.clone() {
+        if let Some(f) = &progress {
             f(&path)
         }
 
@@ -713,7 +639,7 @@ impl Repository {
                 }
 
                 if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true) {
-                    if let Some(f) = progress.clone() {
+                    if let Some(f) = &progress {
                         f(chunk_id, deleted)
                     }
                 }
@@ -755,13 +681,5 @@ impl Repository {
         w.unlock()?;
 
         Ok(())
-    }
-}
-
-impl Drop for Repository {
-    fn drop(&mut self) {
-        if self.save_on_drop {
-            self.save().ok();
-        }
     }
 }

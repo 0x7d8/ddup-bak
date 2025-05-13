@@ -627,7 +627,7 @@ impl Repository {
     }
 
     fn recursive_delete_archive(
-        &mut self,
+        &self,
         entry: Entry,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {
@@ -656,7 +656,7 @@ impl Repository {
     }
 
     pub fn delete_archive(
-        &mut self,
+        &self,
         name: &str,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {

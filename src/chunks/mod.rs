@@ -230,7 +230,7 @@ impl ChunkIndex {
     }
 
     #[inline]
-    pub fn dereference_chunk_id(&mut self, chunk_id: u64, clean: bool) -> Option<bool> {
+    pub fn dereference_chunk_id(&self, chunk_id: u64, clean: bool) -> Option<bool> {
         let mut entry = self.chunks.get_mut(&chunk_id)?;
         let (chunk, count) = entry.value_mut();
         let chunk = *chunk;

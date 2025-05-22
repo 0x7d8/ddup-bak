@@ -224,18 +224,18 @@ impl Repository {
                 {
                     use std::os::unix::fs::MetadataExt;
 
-                    std::os::unix::fs::symlink(target, &destination)?;
-
-                    std::fs::set_permissions(&destination, metadata.permissions())?;
-                    let (uid, gid) = (metadata.uid(), metadata.gid());
-                    std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
+                    if std::os::unix::fs::symlink(target, &destination).is_ok() {
+                        std::fs::set_permissions(&destination, metadata.permissions())?;
+                        let (uid, gid) = (metadata.uid(), metadata.gid());
+                        std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
+                    }
                 }
                 #[cfg(windows)]
                 {
                     if target.is_dir() {
-                        std::os::windows::fs::symlink_dir(target, &destination)?;
+                        std::os::windows::fs::symlink_dir(target, &destination).ok();
                     } else {
-                        std::os::windows::fs::symlink_file(target, &destination)?;
+                        std::os::windows::fs::symlink_file(target, &destination).ok();
                     }
                 }
             }

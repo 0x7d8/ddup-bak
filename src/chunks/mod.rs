@@ -414,8 +414,7 @@ impl ChunkIndex {
 
                 match receiver.recv() {
                     Ok(result) => result,
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(_) => Err(std::io::Error::other(
                         "Failed to receive result from parallel chunking task",
                     )),
                 }
@@ -559,10 +558,10 @@ impl ChunkIndex {
 
         for (i, handle) in handles.into_iter().enumerate() {
             if let Err(e) = handle.join() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Worker thread {} panicked: {:?}", i, e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Worker thread {} panicked: {:?}",
+                    i, e
+                )));
             }
         }
 
@@ -572,14 +571,11 @@ impl ChunkIndex {
 
         let mut results_lock = results.lock().unwrap();
         if results_lock.len() != expected_chunks {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Missing chunks: got {} out of {}",
-                    results_lock.len(),
-                    expected_chunks
-                ),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Missing chunks: got {} out of {}",
+                results_lock.len(),
+                expected_chunks
+            )));
         }
 
         results_lock.sort_by_key(|(idx, _, _)| *idx);

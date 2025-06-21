@@ -355,11 +355,11 @@ impl Entry {
     /// This is the name of the file or directory, not the full path.
     /// For example, if the entry is under `path/to/file.txt`, this will return `file.txt`.
     #[inline]
-    pub fn name(&self) -> &str {
+    pub const fn name(&self) -> &str {
         match self {
-            Entry::File(entry) => &entry.name,
-            Entry::Directory(entry) => &entry.name,
-            Entry::Symlink(entry) => &entry.name,
+            Entry::File(entry) => entry.name.as_str(),
+            Entry::Directory(entry) => entry.name.as_str(),
+            Entry::Symlink(entry) => entry.name.as_str(),
         }
     }
 
@@ -394,6 +394,21 @@ impl Entry {
             Entry::Directory(entry) => entry.mtime,
             Entry::Symlink(entry) => entry.mtime,
         }
+    }
+
+    #[inline]
+    pub const fn is_file(&self) -> bool {
+        matches!(self, Entry::File(_))
+    }
+
+    #[inline]
+    pub const fn is_directory(&self) -> bool {
+        matches!(self, Entry::Directory(_))
+    }
+
+    #[inline]
+    pub const fn is_symlink(&self) -> bool {
+        matches!(self, Entry::Symlink(_))
     }
 }
 

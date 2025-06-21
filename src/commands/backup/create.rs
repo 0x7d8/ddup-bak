@@ -62,7 +62,6 @@ pub fn create(matches: &ArgMatches) -> i32 {
                     progress.set_text(file.to_string_lossy());
                 })
             }),
-            None,
             Some(Arc::new(move |_, _| compression)),
             *threads,
         )

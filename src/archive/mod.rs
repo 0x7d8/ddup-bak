@@ -82,7 +82,7 @@ pub struct Archive {
     compression_callback: CompressionFormatCallback,
     real_size_callback: RealSizeCallback,
 
-    entries: Vec<entries::Entry>,
+    pub entries: Vec<entries::Entry>,
     entries_offset: u64,
 }
 
@@ -118,7 +118,14 @@ impl Archive {
     /// Opens an existing archive file for reading and writing.
     /// This will not overwrite the file, but append to it.
     pub fn open(path: &str) -> std::io::Result<Self> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+
+        Self::open_file(file)
+    }
+
+    /// Opens an existing archive file for reading and writing.
+    /// This will not overwrite the file, but append to it.
+    pub fn open_file(mut file: File) -> std::io::Result<Self> {
         let len = file.metadata()?.len();
 
         let mut buffer = [0; 8];
@@ -218,6 +225,123 @@ impl Archive {
         self.entries
     }
 
+    /// Writes a new file entry to the archive.
+    /// This will NOT append the entry to the archive, it will write the content of the file to the archive and
+    /// return the entry.
+    ///
+    /// # Important
+    /// This function does not trim the end header or readd the end header, you will need to do that manually
+    /// after calling this function.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_file_entry(
+        &mut self,
+        mut reader: impl Read,
+        size_real: Option<u64>,
+        name: impl Into<String>,
+        mode: EntryMode,
+        mtime: SystemTime,
+        owner: (u32, u32),
+        compression: CompressionFormat,
+    ) -> std::io::Result<Box<entries::FileEntry>> {
+        let offset = self.file.stream_position()?;
+
+        let mut buffer = [0; 4096];
+        let mut bytes_read = 0;
+        let mut total_bytes = 0;
+        match compression {
+            CompressionFormat::None => {
+                loop {
+                    self.file.write_all(&buffer[..bytes_read])?;
+                    total_bytes += bytes_read;
+
+                    bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                }
+
+                self.file.flush()?;
+            }
+            CompressionFormat::Gzip => {
+                let mut encoder = GzEncoder::new(&mut self.file, flate2::Compression::default());
+                loop {
+                    encoder.write_all(&buffer[..bytes_read])?;
+                    total_bytes += bytes_read;
+
+                    bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                }
+
+                encoder.flush()?;
+                encoder.finish()?;
+            }
+            CompressionFormat::Deflate => {
+                let mut encoder =
+                    DeflateEncoder::new(&mut self.file, flate2::Compression::default());
+                loop {
+                    encoder.write_all(&buffer[..bytes_read])?;
+                    total_bytes += bytes_read;
+
+                    bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                }
+
+                encoder.flush()?;
+                encoder.finish()?;
+            }
+
+            #[cfg(feature = "brotli")]
+            CompressionFormat::Brotli => {
+                let mut encoder = brotli::CompressorWriter::new(&mut self.file, 4096, 11, 22);
+                loop {
+                    encoder.write_all(&buffer[..bytes_read])?;
+                    total_bytes += bytes_read;
+
+                    bytes_read = reader.read(&mut buffer)?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+                }
+            }
+            #[cfg(not(feature = "brotli"))]
+            CompressionFormat::Brotli => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Brotli support is not enabled. Please enable the 'brotli' feature.",
+                ))?;
+            }
+        }
+
+        let size_compressed = match compression {
+            CompressionFormat::None => None,
+            _ => Some(self.file.stream_position()? - offset),
+        };
+        let size_real = size_real.unwrap_or(total_bytes as u64);
+
+        let entry = Box::new(entries::FileEntry {
+            name: name.into(),
+            mode,
+            file: self.file.clone(),
+            owner,
+            mtime,
+            decoder: None,
+            size_compressed,
+            size_real,
+            size: total_bytes as u64,
+            offset,
+            consumed: 0,
+            compression,
+        });
+
+        self.entries_offset = self.file.stream_position()?;
+
+        Ok(entry)
+    }
+
     /// Adds a single file entry to the archive. (including subdirectories)
     /// This will append the entry to the end of the archive, if this entry already exists, it will not be replaced.
     ///
@@ -266,10 +390,36 @@ impl Archive {
         Ok(None)
     }
 
+    fn recursive_find_archive_entry_mut<'a>(
+        entry: &'a mut entries::Entry,
+        entry_parts: &[&OsStr],
+    ) -> std::io::Result<Option<&'a mut entries::Entry>> {
+        if entry_parts.is_empty() {
+            return Ok(None);
+        }
+
+        if Some(entry.name()) == entry_parts.last().map(|s| s.to_string_lossy()).as_deref() {
+            return Ok(Some(entry));
+        }
+
+        if let entries::Entry::Directory(dir_entry) = entry {
+            for sub_entry in &mut dir_entry.entries {
+                if let Some(found) =
+                    Self::recursive_find_archive_entry_mut(sub_entry, &entry_parts[1..])?
+                {
+                    return Ok(Some(found));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Finds an entry in the archive by name.
     /// Returns `None` if the entry is not found.
     /// The entry name is the path inside the archive.
     /// Example: "world/user/level.dat" would be a valid entry name.
+    #[inline]
     pub fn find_archive_entry(
         &self,
         entry_name: &Path,
@@ -287,7 +437,29 @@ impl Archive {
         Ok(None)
     }
 
-    fn trim_end_header(&mut self) -> std::io::Result<()> {
+    /// Finds an entry in the archive by name.
+    /// Returns `None` if the entry is not found.
+    /// The entry name is the path inside the archive.
+    /// Example: "world/user/level.dat" would be a valid entry name.
+    #[inline]
+    pub fn find_archive_entry_mut(
+        &mut self,
+        entry_name: &Path,
+    ) -> std::io::Result<Option<&mut entries::Entry>> {
+        let entry_parts = entry_name
+            .components()
+            .map(|c| c.as_os_str())
+            .collect::<Vec<&OsStr>>();
+        for entry in &mut self.entries {
+            if let Some(found) = Self::recursive_find_archive_entry_mut(entry, &entry_parts)? {
+                return Ok(Some(found));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn trim_end_header(&mut self) -> std::io::Result<()> {
         if self.entries_offset == 0 {
             return Ok(());
         }
@@ -299,7 +471,7 @@ impl Archive {
         Ok(())
     }
 
-    fn write_end_header(&mut self) -> std::io::Result<()> {
+    pub fn write_end_header(&mut self) -> std::io::Result<()> {
         let mut encoder = DeflateEncoder::new(&mut self.file, flate2::Compression::default());
         for entry in &self.entries {
             Self::encode_entry_metadata(&mut encoder, entry)?;
@@ -365,7 +537,6 @@ impl Archive {
                     writer.write_all(&varint::encode_u64(size_compressed))?;
                 }
                 writer.write_all(&varint::encode_u64(file_entry.size_real))?;
-
                 writer.write_all(&varint::encode_u64(file_entry.offset))?;
             }
             entries::Entry::Directory(dir_entry) => {

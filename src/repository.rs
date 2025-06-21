@@ -5,11 +5,10 @@ use crate::{
     chunks::{ChunkIndex, lock::LockMode, reader::EntryReader, storage},
 };
 use std::{
-    collections::HashMap,
     fs::{File, FileTimes},
-    io::{BufWriter, Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 pub type DeletionProgressCallback = Option<Arc<dyn Fn(u64, bool) + Send + Sync + 'static>>;
@@ -54,7 +53,6 @@ impl Repository {
         storage: Option<Arc<dyn storage::ChunkStorage>>,
     ) -> Self {
         std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
-        std::fs::create_dir_all(directory.join(".ddup-bak/archives-tmp")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/archives-restored")).unwrap();
         std::fs::create_dir_all(directory.join(".ddup-bak/chunks")).unwrap();
 
@@ -149,28 +147,46 @@ impl Repository {
         }
     }
 
+    #[inline]
+    pub fn archive_path_parent<'a>(
+        archive: &'a mut Archive,
+        entry: &Path,
+    ) -> Option<&'a mut Box<crate::archive::entries::DirectoryEntry>> {
+        archive
+            .find_archive_entry_mut(entry.parent()?)
+            .ok()
+            .flatten()
+            .map(|e| match e {
+                Entry::Directory(dir) => dir,
+                _ => panic!("Parent entry is not a directory"),
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn recursive_create_archive(
+        archive: Arc<Mutex<Option<Archive>>>,
         chunk_index: &ChunkIndex,
         entry: ignore::DirEntry,
         root_path: &Path,
-        temp_path: &Path,
         progress_chunking: ProgressCallback,
         compression_callback: CompressionFormatCallback,
         scope: &rayon::Scope,
         error: Arc<RwLock<Option<std::io::Error>>>,
-        sizes: Arc<RwLock<HashMap<PathBuf, u64>>>,
     ) -> std::io::Result<()> {
-        let path = entry.path();
-        let destination = temp_path.join(path.strip_prefix(root_path).unwrap());
-        let metadata = path.symlink_metadata()?;
+        let path = entry.path().strip_prefix(root_path).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Path is not a subpath of the root directory",
+            )
+        })?;
+        let metadata = entry.path().symlink_metadata()?;
 
         if error.read().unwrap().is_some() {
             return Ok(());
         }
 
         if let Some(f) = &progress_chunking {
-            f(path)
+            f(entry.path())
         }
 
         if metadata.is_file() {
@@ -179,64 +195,101 @@ impl Repository {
                 .map(|f| f(path, &metadata))
                 .unwrap_or(CompressionFormat::Deflate);
 
-            if let Some(parent) = destination.parent() {
-                if !parent.exists() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+            let chunks =
+                chunk_index.chunk_file(&entry.path().to_path_buf(), compression, Some(scope))?;
 
-            let chunks = chunk_index.chunk_file(&path.to_path_buf(), compression, Some(scope))?;
-            let file = File::create(&destination)?;
-
-            let mut writer = BufWriter::new(&file);
+            let mut chunk_content = Vec::new();
             for id in chunks {
-                writer.write_all(&crate::varint::encode_u64(id))?;
+                chunk_content.extend_from_slice(&crate::varint::encode_u64(id));
             }
 
-            writer.flush()?;
-            file.sync_all()?;
+            let mut archive = archive.lock().unwrap();
+            let file_entry = archive.as_mut().unwrap().write_file_entry(
+                Cursor::new(chunk_content),
+                Some(metadata.len()),
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                metadata.permissions().into(),
+                metadata.modified().unwrap_or(std::time::SystemTime::now()),
+                {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.uid(), metadata.gid())
+                    }
+                    #[cfg(windows)]
+                    {
+                        (0, 0)
+                    }
+                },
+                compression,
+            )?;
 
-            file.set_permissions(metadata.permissions())?;
-            file.set_times(FileTimes::new().set_modified(metadata.modified()?))?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-
-                let (uid, gid) = (metadata.uid(), metadata.gid());
-                std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
+            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+                parent.entries.push(Entry::File(file_entry));
+            } else {
+                archive
+                    .as_mut()
+                    .unwrap()
+                    .entries
+                    .push(Entry::File(file_entry));
             }
-
-            sizes.write().unwrap().insert(destination, metadata.len());
         } else if metadata.is_dir() {
-            std::fs::create_dir_all(&destination)?;
+            if path.file_name().is_none() {
+                return Ok(());
+            }
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
+            let mut archive = archive.lock().unwrap();
 
-                let (uid, gid) = (metadata.uid(), metadata.gid());
-                std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
+            let dir_entry = Entry::Directory(Box::new(crate::archive::entries::DirectoryEntry {
+                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                mode: metadata.permissions().into(),
+                mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
+                owner: {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.uid(), metadata.gid())
+                    }
+                    #[cfg(windows)]
+                    {
+                        (0, 0)
+                    }
+                },
+                entries: Vec::new(),
+            }));
+
+            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+                parent.entries.push(dir_entry);
+            } else {
+                archive.as_mut().unwrap().entries.push(dir_entry);
             }
         } else if metadata.is_symlink() {
             if let Ok(target) = std::fs::read_link(path) {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
+                let mut archive = archive.lock().unwrap();
 
-                    if std::os::unix::fs::symlink(target, &destination).is_ok() {
-                        std::fs::set_permissions(&destination, metadata.permissions())?;
-                        let (uid, gid) = (metadata.uid(), metadata.gid());
-                        std::os::unix::fs::lchown(&destination, Some(uid), Some(gid))?;
-                    }
-                }
-                #[cfg(windows)]
-                {
-                    if target.is_dir() {
-                        std::os::windows::fs::symlink_dir(target, &destination).ok();
-                    } else {
-                        std::os::windows::fs::symlink_file(target, &destination).ok();
-                    }
+                let link_entry = Entry::Symlink(Box::new(crate::archive::entries::SymlinkEntry {
+                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                    mode: metadata.permissions().into(),
+                    mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
+                    owner: {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            (metadata.uid(), metadata.gid())
+                        }
+                        #[cfg(windows)]
+                        {
+                            (0, 0)
+                        }
+                    },
+                    target: target.to_string_lossy().into_owned(),
+                    target_dir: target.is_dir(),
+                }));
+
+                if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+                    parent.entries.push(link_entry);
+                } else {
+                    archive.as_mut().unwrap().entries.push(link_entry);
                 }
             }
         }
@@ -251,7 +304,6 @@ impl Repository {
         directory: Option<ignore::Walk>,
         directory_root: Option<&Path>,
         progress_chunking: ProgressCallback,
-        progress_archiving: ProgressCallback,
         compression_callback: CompressionFormatCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
@@ -265,9 +317,6 @@ impl Repository {
         let mut w = self.chunk_index.lock.write_lock(LockMode::NonDestructive)?;
 
         let archive_path = self.archive_path(name);
-        let archive_tmp_path = self.directory.join(".ddup-bak/archives-tmp").join(name);
-
-        std::fs::create_dir_all(&archive_tmp_path)?;
 
         let worker_pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
@@ -276,7 +325,6 @@ impl Repository {
                 .unwrap(),
         );
         let error = Arc::new(RwLock::new(None));
-        let sizes = Arc::new(RwLock::new(HashMap::new()));
 
         let walker = directory.unwrap_or_else(|| {
             ignore::WalkBuilder::new(&self.directory)
@@ -284,6 +332,8 @@ impl Repository {
                 .git_global(false)
                 .build()
         });
+
+        let archive = Arc::new(Mutex::new(Some(Archive::new(File::create(&archive_path)?))));
 
         worker_pool.in_place_scope(|scope| {
             for entry in walker.flatten() {
@@ -298,24 +348,22 @@ impl Repository {
 
                 scope.spawn({
                     let error = Arc::clone(&error);
-                    let sizes = Arc::clone(&sizes);
+                    let archive = Arc::clone(&archive);
                     let chunk_index = self.chunk_index.clone();
                     let directory_root = directory_root.unwrap_or(&self.directory);
-                    let archive_tmp_path = archive_tmp_path.to_path_buf();
                     let progress_chunking = progress_chunking.clone();
                     let compression_callback = compression_callback.clone();
 
                     move |scope| {
                         if let Err(err) = Self::recursive_create_archive(
+                            archive,
                             &chunk_index,
                             entry,
                             directory_root,
-                            &archive_tmp_path,
                             progress_chunking,
                             compression_callback,
                             scope,
                             Arc::clone(&error),
-                            Arc::clone(&sizes),
                         ) {
                             let mut error = error.write().unwrap();
                             if error.is_none() {
@@ -331,25 +379,8 @@ impl Repository {
             return Err(err);
         }
 
-        let mut archive = Archive::new(File::create(&archive_path)?);
-
-        archive.set_compression_callback(Some(Arc::new(|_, _| CompressionFormat::None)));
-        archive.set_real_size_callback(Some(Arc::new(move |entry| {
-            let sizes = sizes.read().unwrap();
-
-            if let Some(size) = sizes.get(&entry.to_path_buf()) {
-                *size
-            } else {
-                0
-            }
-        })));
-
-        let entries = std::fs::read_dir(&archive_tmp_path)?
-            .flatten()
-            .collect::<Vec<_>>();
-        archive.add_entries(entries, progress_archiving)?;
-
-        std::fs::remove_dir_all(&archive_tmp_path)?;
+        let mut archive = archive.lock().unwrap().take().unwrap();
+        archive.write_end_header()?;
 
         w.unlock()?;
 
@@ -692,5 +723,15 @@ impl Repository {
         w.unlock()?;
 
         Ok(())
+    }
+}
+
+impl Drop for Repository {
+    fn drop(&mut self) {
+        if self.save_on_drop {
+            if let Err(err) = self.save() {
+                eprintln!("Failed to save repository: {}", err);
+            }
+        }
     }
 }

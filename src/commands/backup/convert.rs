@@ -2,11 +2,12 @@ use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::archive::entries::Entry;
-use std::io::Write;
+use std::{fs::File, io::Write};
 
 enum Format {
     Tar,
     TarGz,
+    Ddup,
 }
 
 pub fn convert(matches: &ArgMatches) -> i32 {
@@ -18,6 +19,7 @@ pub fn convert(matches: &ArgMatches) -> i32 {
     let format = match format.as_str() {
         "tar" => Format::Tar,
         "tar.gz" => Format::TarGz,
+        "ddup" => Format::Ddup,
         _ => panic!("invalid format"),
     };
 
@@ -74,9 +76,9 @@ pub fn convert(matches: &ArgMatches) -> i32 {
             )
         });
 
-        let file = std::fs::File::create(output).unwrap();
+        let file = File::create(output).unwrap();
 
-        convert_entries(
+        convert_entries_file(
             &mut repository,
             archive.into_entries(),
             file,
@@ -121,6 +123,7 @@ fn convert_entries<S: Write + 'static>(
                     output,
                     flate2::Compression::default(),
                 )),
+                _ => unreachable!(),
             };
 
             let mut tar = tar::Builder::new(output);
@@ -131,6 +134,46 @@ fn convert_entries<S: Write + 'static>(
             }
 
             tar.finish().unwrap();
+        }
+        _ => unimplemented!(),
+    }
+}
+
+fn convert_entries_file(
+    repository: &mut ddup_bak::repository::Repository,
+    entries: Vec<Entry>,
+    output: File,
+    progress: Option<&Progress>,
+    format: Format,
+) {
+    match format {
+        Format::Tar | Format::TarGz => {
+            let output: Box<dyn Write + 'static> = match format {
+                Format::Tar => Box::new(output),
+                Format::TarGz => Box::new(flate2::write::GzEncoder::new(
+                    output,
+                    flate2::Compression::default(),
+                )),
+                _ => unreachable!(),
+            };
+
+            let mut tar = tar::Builder::new(output);
+            tar.mode(tar::HeaderMode::Complete);
+
+            for entry in entries {
+                tar_recursive_convert_entries(entry, repository, &mut tar, progress, "");
+            }
+
+            tar.finish().unwrap();
+        }
+        Format::Ddup => {
+            let mut archive = ddup_bak::archive::Archive::new(output);
+
+            for entry in entries {
+                ddup_recursive_convert_entries(entry, repository, &mut archive, progress, None);
+            }
+
+            archive.write_end_header().unwrap();
         }
     }
 }
@@ -236,6 +279,80 @@ fn tar_recursive_convert_entries(
             archive
                 .append_link(&mut entry_header, &path, &link.target)
                 .unwrap();
+
+            if let Some(progress) = progress {
+                progress.incr(1usize);
+            }
+        }
+    }
+}
+
+fn ddup_recursive_convert_entries(
+    entry: Entry,
+    repository: &mut ddup_bak::repository::Repository,
+    archive: &mut ddup_bak::archive::Archive,
+    progress: Option<&Progress>,
+    parent_entry: Option<&mut ddup_bak::archive::entries::DirectoryEntry>,
+) {
+    match entry {
+        Entry::Directory(directory) => {
+            let mut dir_entry = ddup_bak::archive::entries::DirectoryEntry {
+                name: directory.name,
+                owner: directory.owner,
+                mode: directory.mode,
+                mtime: directory.mtime,
+                entries: Vec::new(),
+            };
+
+            if let Some(progress) = progress {
+                progress.incr(1usize);
+            }
+
+            for entry in directory.entries {
+                ddup_recursive_convert_entries(
+                    entry,
+                    repository,
+                    archive,
+                    progress,
+                    Some(&mut dir_entry),
+                );
+            }
+
+            if let Some(parent) = parent_entry {
+                parent.entries.push(Entry::Directory(Box::new(dir_entry)));
+            } else {
+                archive.entries.push(Entry::Directory(Box::new(dir_entry)));
+            }
+        }
+        Entry::File(file) => {
+            let file_entry = archive
+                .write_file_entry(
+                    repository.entry_reader(Entry::File(file.clone())).unwrap(),
+                    None,
+                    file.name,
+                    file.mode,
+                    file.mtime,
+                    file.owner,
+                    ddup_bak::archive::CompressionFormat::Deflate,
+                )
+                .unwrap();
+
+            if let Some(parent) = parent_entry {
+                parent.entries.push(Entry::File(file_entry));
+            } else {
+                archive.entries.push(Entry::File(file_entry));
+            }
+
+            if let Some(progress) = progress {
+                progress.incr(1usize);
+            }
+        }
+        Entry::Symlink(link) => {
+            if let Some(parent) = parent_entry {
+                parent.entries.push(Entry::Symlink(link));
+            } else {
+                archive.entries.push(Entry::Symlink(link));
+            }
 
             if let Some(progress) = progress {
                 progress.incr(1usize);

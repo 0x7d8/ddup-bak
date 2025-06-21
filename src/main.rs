@@ -142,7 +142,7 @@ fn cli() -> Command {
                                 .long("format")
                                 .num_args(1)
                                 .required(true)
-                                .value_parser(["tar", "tar.gz", "zip"])
+                                .value_parser(["tar", "tar.gz", "ddup"])
                                 .default_value("tar")
                                 .required(false),
                         )

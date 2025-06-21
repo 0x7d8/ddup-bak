@@ -280,7 +280,7 @@ pub unsafe extern "C" fn archive_find_entry(
     let path_str = unsafe { CStr::from_ptr(path).to_string_lossy().into_owned() };
 
     match archive.find_archive_entry(Path::new(&path_str)) {
-        Ok(Some(entry)) => crate::entries::entry_to_c(entry),
-        _ => std::ptr::null_mut(),
+        Some(entry) => crate::entries::entry_to_c(entry),
+        None => std::ptr::null_mut(),
     }
 }

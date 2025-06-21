@@ -370,19 +370,21 @@ impl Archive {
         entry_parts: &[&OsStr],
     ) -> std::io::Result<Option<&'a entries::Entry>> {
         if entry_parts.is_empty() {
-            return Ok(None);
-        }
-
-        if Some(entry.name()) == entry_parts.last().map(|s| s.to_string_lossy()).as_deref() {
             return Ok(Some(entry));
         }
 
-        if let entries::Entry::Directory(dir_entry) = entry {
-            for sub_entry in &dir_entry.entries {
-                if let Some(found) =
-                    Self::recursive_find_archive_entry(sub_entry, &entry_parts[1..])?
-                {
-                    return Ok(Some(found));
+        if entry.name() == entry_parts[0] {
+            if entry_parts.len() == 1 {
+                return Ok(Some(entry));
+            }
+
+            if let entries::Entry::Directory(dir_entry) = entry {
+                for sub_entry in &dir_entry.entries {
+                    if let Some(found) =
+                        Self::recursive_find_archive_entry(sub_entry, &entry_parts[1..])?
+                    {
+                        return Ok(Some(found));
+                    }
                 }
             }
         }
@@ -395,19 +397,21 @@ impl Archive {
         entry_parts: &[&OsStr],
     ) -> std::io::Result<Option<&'a mut entries::Entry>> {
         if entry_parts.is_empty() {
-            return Ok(None);
-        }
-
-        if Some(entry.name()) == entry_parts.last().map(|s| s.to_string_lossy()).as_deref() {
             return Ok(Some(entry));
         }
 
-        if let entries::Entry::Directory(dir_entry) = entry {
-            for sub_entry in &mut dir_entry.entries {
-                if let Some(found) =
-                    Self::recursive_find_archive_entry_mut(sub_entry, &entry_parts[1..])?
-                {
-                    return Ok(Some(found));
+        if entry.name() == entry_parts[0] {
+            if entry_parts.len() == 1 {
+                return Ok(Some(entry));
+            }
+
+            if let entries::Entry::Directory(dir_entry) = entry {
+                for sub_entry in &mut dir_entry.entries {
+                    if let Some(found) =
+                        Self::recursive_find_archive_entry_mut(sub_entry, &entry_parts[1..])?
+                    {
+                        return Ok(Some(found));
+                    }
                 }
             }
         }

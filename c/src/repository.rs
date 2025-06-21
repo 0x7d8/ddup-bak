@@ -188,7 +188,6 @@ pub unsafe extern "C" fn repository_create_archive(
     name: *const c_char,
     directory: *const c_char,
     progress_chunking: CProgressCallback,
-    progress_archiving: CProgressCallback,
     compression_callback: CCompressionFormatCallback,
     threads: c_uint,
 ) -> *mut CArchive {
@@ -221,15 +220,6 @@ pub unsafe extern "C" fn repository_create_archive(
         }) as Arc<dyn Fn(&std::path::Path) + Send + Sync>
     });
 
-    let progress_archiving = progress_archiving.map(|callback_fn| {
-        Arc::new(move |path: &std::path::Path| {
-            if let Some(path_str) = path.to_str() {
-                let c_path = CString::new(path_str).unwrap();
-                callback_fn(c_path.as_ptr());
-            }
-        }) as Arc<dyn Fn(&std::path::Path) + Send + Sync>
-    });
-
     let compression_callback = compression_callback.map(|callback_fn| {
         Arc::new(move |path: &Path, _: &Metadata| {
             let c_compression_str = CString::new(path.to_string_lossy().into_owned()).unwrap();
@@ -242,7 +232,6 @@ pub unsafe extern "C" fn repository_create_archive(
         directory_path,
         directory_str.as_ref().map(Path::new),
         progress_chunking,
-        progress_archiving,
         compression_callback,
         threads as usize,
     ) {

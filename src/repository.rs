@@ -154,8 +154,6 @@ impl Repository {
     ) -> Option<&'a mut Box<crate::archive::entries::DirectoryEntry>> {
         archive
             .find_archive_entry_mut(entry.parent()?)
-            .ok()
-            .flatten()
             .map(|e| match e {
                 Entry::Directory(dir) => dir,
                 _ => panic!("Parent entry is not a directory"),
@@ -167,6 +165,7 @@ impl Repository {
         archive: Arc<Mutex<Option<Archive>>>,
         chunk_index: &ChunkIndex,
         entry: ignore::DirEntry,
+        metadata: std::fs::Metadata,
         root_path: &Path,
         progress_chunking: ProgressCallback,
         compression_callback: CompressionFormatCallback,
@@ -179,7 +178,6 @@ impl Repository {
                 "Path is not a subpath of the root directory",
             )
         })?;
-        let metadata = entry.path().symlink_metadata()?;
 
         if error.read().unwrap().is_some() {
             return Ok(());
@@ -233,38 +231,8 @@ impl Repository {
                     .entries
                     .push(Entry::File(file_entry));
             }
-        } else if metadata.is_dir() {
-            if path.file_name().is_none() {
-                return Ok(());
-            }
-
-            let mut archive = archive.lock().unwrap();
-
-            let dir_entry = Entry::Directory(Box::new(crate::archive::entries::DirectoryEntry {
-                name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                mode: metadata.permissions().into(),
-                mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
-                owner: {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        (metadata.uid(), metadata.gid())
-                    }
-                    #[cfg(windows)]
-                    {
-                        (0, 0)
-                    }
-                },
-                entries: Vec::new(),
-            }));
-
-            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
-                parent.entries.push(dir_entry);
-            } else {
-                archive.as_mut().unwrap().entries.push(dir_entry);
-            }
         } else if metadata.is_symlink() {
-            if let Ok(target) = std::fs::read_link(path) {
+            if let Ok(target) = std::fs::read_link(entry.path()) {
                 let mut archive = archive.lock().unwrap();
 
                 let link_entry = Entry::Symlink(Box::new(crate::archive::entries::SymlinkEntry {
@@ -338,12 +306,59 @@ impl Repository {
         worker_pool.in_place_scope(|scope| {
             for entry in walker.flatten() {
                 let path = entry.path();
+                let metadata = match path.symlink_metadata() {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        let mut error = error.write().unwrap();
+                        if error.is_none() {
+                            *error = Some(err);
+                        }
+                        break;
+                    }
+                };
                 if path.file_name() == Some(".ddup-bak".as_ref()) {
                     continue;
                 }
 
                 if error.read().unwrap().is_some() {
                     break;
+                }
+
+                if metadata.is_dir() {
+                    if path.file_name().is_none() {
+                        continue;
+                    }
+
+                    let mut archive = archive.lock().unwrap();
+
+                    let dir_entry =
+                        Entry::Directory(Box::new(crate::archive::entries::DirectoryEntry {
+                            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                            mode: metadata.permissions().into(),
+                            mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
+                            owner: {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::MetadataExt;
+                                    (metadata.uid(), metadata.gid())
+                                }
+                                #[cfg(windows)]
+                                {
+                                    (0, 0)
+                                }
+                            },
+                            entries: Vec::new(),
+                        }));
+
+                    if let Some(parent) = Self::archive_path_parent(
+                        archive.as_mut().unwrap(),
+                        path.strip_prefix(directory_root.unwrap_or(&self.directory))
+                            .unwrap(),
+                    ) {
+                        parent.entries.push(dir_entry);
+                    } else {
+                        archive.as_mut().unwrap().entries.push(dir_entry);
+                    }
                 }
 
                 scope.spawn({
@@ -359,6 +374,7 @@ impl Repository {
                             archive,
                             &chunk_index,
                             entry,
+                            metadata,
                             directory_root,
                             progress_chunking,
                             compression_callback,

@@ -339,7 +339,7 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
     let archive = repository.get_archive(name).unwrap();
 
     let path = Path::new(path.map_or(".", |s| s.as_str()));
-    if let Some(entry) = archive.find_archive_entry(path).unwrap() {
+    if let Some(entry) = archive.find_archive_entry(path) {
         let entries = match entry {
             Entry::Directory(dir) => {
                 let mut entries = Vec::with_capacity(dir.entries.len());

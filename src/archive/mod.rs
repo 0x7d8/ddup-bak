@@ -368,55 +368,73 @@ impl Archive {
     fn recursive_find_archive_entry<'a>(
         entry: &'a entries::Entry,
         entry_parts: &[&OsStr],
-    ) -> std::io::Result<Option<&'a entries::Entry>> {
-        if entry_parts.is_empty() {
-            return Ok(Some(entry));
+        current_depth: usize,
+    ) -> Option<&'a entries::Entry> {
+        if entry_parts.len() > current_depth + 1 {
+            return None;
         }
 
-        if entry.name() == entry_parts[0] {
-            if entry_parts.len() == 1 {
-                return Ok(Some(entry));
-            }
+        let current_part = entry_parts.first()?;
+        let entry_name: &OsStr = entry.name().as_ref();
+        if entry_name != *current_part {
+            return None;
+        }
 
-            if let entries::Entry::Directory(dir_entry) = entry {
-                for sub_entry in &dir_entry.entries {
-                    if let Some(found) =
-                        Self::recursive_find_archive_entry(sub_entry, &entry_parts[1..])?
-                    {
-                        return Ok(Some(found));
-                    }
+        if entry_parts.len() == 1 {
+            return Some(entry);
+        }
+
+        if let entries::Entry::Directory(dir_entry) = entry {
+            let remaining_parts = &entry_parts[1..];
+
+            for sub_entry in &dir_entry.entries {
+                if let Some(found) = Self::recursive_find_archive_entry(
+                    sub_entry,
+                    remaining_parts,
+                    current_depth - 1,
+                ) {
+                    return Some(found);
                 }
             }
         }
 
-        Ok(None)
+        None
     }
 
     fn recursive_find_archive_entry_mut<'a>(
         entry: &'a mut entries::Entry,
         entry_parts: &[&OsStr],
-    ) -> std::io::Result<Option<&'a mut entries::Entry>> {
-        if entry_parts.is_empty() {
-            return Ok(Some(entry));
+        current_depth: usize,
+    ) -> Option<&'a mut entries::Entry> {
+        if entry_parts.len() > current_depth + 1 {
+            return None;
         }
 
-        if entry.name() == entry_parts[0] {
-            if entry_parts.len() == 1 {
-                return Ok(Some(entry));
-            }
+        let current_part = entry_parts.first()?;
+        let entry_name: &OsStr = entry.name().as_ref();
+        if entry_name != *current_part {
+            return None;
+        }
 
-            if let entries::Entry::Directory(dir_entry) = entry {
-                for sub_entry in &mut dir_entry.entries {
-                    if let Some(found) =
-                        Self::recursive_find_archive_entry_mut(sub_entry, &entry_parts[1..])?
-                    {
-                        return Ok(Some(found));
-                    }
+        if entry_parts.len() == 1 {
+            return Some(entry);
+        }
+
+        if let entries::Entry::Directory(dir_entry) = entry {
+            let remaining_parts = &entry_parts[1..];
+
+            for sub_entry in &mut dir_entry.entries {
+                if let Some(found) = Self::recursive_find_archive_entry_mut(
+                    sub_entry,
+                    remaining_parts,
+                    current_depth - 1,
+                ) {
+                    return Some(found);
                 }
             }
         }
 
-        Ok(None)
+        None
     }
 
     /// Finds an entry in the archive by name.
@@ -424,21 +442,20 @@ impl Archive {
     /// The entry name is the path inside the archive.
     /// Example: "world/user/level.dat" would be a valid entry name.
     #[inline]
-    pub fn find_archive_entry(
-        &self,
-        entry_name: &Path,
-    ) -> std::io::Result<Option<&entries::Entry>> {
+    pub fn find_archive_entry(&self, entry_name: &Path) -> Option<&entries::Entry> {
         let entry_parts = entry_name
             .components()
             .map(|c| c.as_os_str())
             .collect::<Vec<&OsStr>>();
         for entry in self.entries() {
-            if let Some(found) = Self::recursive_find_archive_entry(entry, &entry_parts)? {
-                return Ok(Some(found));
+            if let Some(found) =
+                Self::recursive_find_archive_entry(entry, &entry_parts, entry_parts.len())
+            {
+                return Some(found);
             }
         }
 
-        Ok(None)
+        None
     }
 
     /// Finds an entry in the archive by name.
@@ -446,21 +463,20 @@ impl Archive {
     /// The entry name is the path inside the archive.
     /// Example: "world/user/level.dat" would be a valid entry name.
     #[inline]
-    pub fn find_archive_entry_mut(
-        &mut self,
-        entry_name: &Path,
-    ) -> std::io::Result<Option<&mut entries::Entry>> {
+    pub fn find_archive_entry_mut(&mut self, entry_name: &Path) -> Option<&mut entries::Entry> {
         let entry_parts = entry_name
             .components()
             .map(|c| c.as_os_str())
             .collect::<Vec<&OsStr>>();
         for entry in &mut self.entries {
-            if let Some(found) = Self::recursive_find_archive_entry_mut(entry, &entry_parts)? {
-                return Ok(Some(found));
+            if let Some(found) =
+                Self::recursive_find_archive_entry_mut(entry, &entry_parts, entry_parts.len())
+            {
+                return Some(found);
             }
         }
 
-        Ok(None)
+        None
     }
 
     pub fn trim_end_header(&mut self) -> std::io::Result<()> {

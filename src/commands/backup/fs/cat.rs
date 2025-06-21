@@ -26,7 +26,7 @@ pub fn cat(name: &str, matches: &ArgMatches) -> i32 {
 
     let archive = repository.get_archive(name).unwrap();
 
-    if let Some(entry) = archive.find_archive_entry(Path::new(path)).unwrap() {
+    if let Some(entry) = archive.find_archive_entry(Path::new(path)) {
         match entry {
             Entry::File(file) => {
                 repository

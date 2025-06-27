@@ -38,7 +38,7 @@ the entry type format is an enum describing what kind of entry an entry is.
 
 ### type_compression_mode
 
-encoded version of entry type + compression format + unix file permissions
+encoded version of entry type + compression format + unix file mode
 
 | Bit     | Desription                      |
 | ------- | ------------------------------- |
@@ -70,7 +70,7 @@ all entries have a few base properties that will always be available
 
 `...varint(u32)          ` - Byte Length of Name String (UTF8)<br>
 `...u8                   ` - Array of Name (file name only, no path) utf8 scalar values (as many as in the byte length)<br>
-`   type_compression_mode` - Entry Type, Compression Format and File Permissions<br>
+`   type_compression_mode` - Entry Type, Compression Format and File Mode (Permissions)<br>
 `...varint(u32)          ` - Unix User Id (File owner)<br>
 `...varint(u32)          ` - Unix Group Id (File owner)<br>
 `...varint(u64)          ` - Seconds since 1970-01-01 00:00:00 UTC of when the file was last modified (Unix Epoch)<br>
@@ -78,8 +78,8 @@ all entries have a few base properties that will always be available
 #### file_entry (0x0)
 
 `...varint(u64)` - Byte Length of Uncompressed file content<br>
-`...varint(u64)` - Byte Length of Compressed file content (**ONLY AVAILABLE IF `compression_format` IS NOT 0**)<br>
-`...varint(u64)` - Byte Lenght of "Real" file size, this is mainly used by the dedup part of this repo<br>
+`...varint(u64)` - Byte Length of Compressed file content (**ONLY EXISTS IF `compression_format` IS NOT 0**)<br>
+`...varint(u64)` - Byte Length of "Real" file size, this is mainly used by the dedup part of this repo<br>
 `...varint(u64)` - Byte Offset (signature included) at which to read the file content in the archive
 
 #### directory_entry (0x1)

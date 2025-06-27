@@ -110,7 +110,7 @@ impl RwLock {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error in refresh thread: {}", e);
+                        eprintln!("Error in refresh thread: {e}");
                     }
                 }
             }
@@ -575,7 +575,7 @@ impl Drop for ReadGuard {
     fn drop(&mut self) {
         if self.active {
             if let Err(e) = self.unlock() {
-                eprintln!("Error releasing read lock in drop: {}", e);
+                eprintln!("Error releasing read lock in drop: {e}");
             }
         }
     }
@@ -618,7 +618,7 @@ impl Drop for WriteGuard {
     fn drop(&mut self) {
         if self.active {
             if let Err(e) = self.unlock() {
-                eprintln!("Error releasing write lock in drop: {}", e);
+                eprintln!("Error releasing write lock in drop: {e}");
             }
         }
     }

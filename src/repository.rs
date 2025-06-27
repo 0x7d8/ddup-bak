@@ -85,7 +85,7 @@ impl Repository {
     pub fn archive_path(&self, name: &str) -> PathBuf {
         self.directory
             .join(".ddup-bak/archives")
-            .join(format!("{}.ddup", name))
+            .join(format!("{name}.ddup"))
     }
 
     /// Sets the save_on_drop flag.
@@ -278,7 +278,7 @@ impl Repository {
         if self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                format!("Archive {} already exists", name),
+                format!("Archive {name} already exists"),
             ));
         }
 
@@ -558,7 +558,7 @@ impl Repository {
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Archive {} not found", name),
+                format!("Archive {name} not found"),
             ));
         }
 
@@ -627,7 +627,7 @@ impl Repository {
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Archive {} not found", name),
+                format!("Archive {name} not found"),
             ));
         }
 
@@ -721,7 +721,7 @@ impl Repository {
         if !self.list_archives()?.contains(&name.to_string()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Archive {} not found", name),
+                format!("Archive {name} not found"),
             ));
         }
 
@@ -746,7 +746,7 @@ impl Drop for Repository {
     fn drop(&mut self) {
         if self.save_on_drop {
             if let Err(err) = self.save() {
-                eprintln!("Failed to save repository: {}", err);
+                eprintln!("Failed to save repository: {err}");
             }
         }
     }

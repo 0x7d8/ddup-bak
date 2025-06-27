@@ -6,12 +6,12 @@ pub trait ChunkStorage: Sync + Send {
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
         let mut path = PathBuf::new();
         for byte in chunk.iter().take(2) {
-            path.push(format!("{:02x}", byte));
+            path.push(format!("{byte:02x}"));
         }
 
         let mut file_name = String::with_capacity(32 * 2 - 2 * 2 + 6);
         for byte in chunk.iter().skip(2) {
-            file_name.push_str(&format!("{:02x}", byte));
+            file_name.push_str(&format!("{byte:02x}"));
         }
         file_name.push_str(".chunk");
 

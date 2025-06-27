@@ -44,7 +44,7 @@ pub fn delete(matches: &ArgMatches) -> i32 {
                 Arc::new(move |chunk, deleted| {
                     progress.set_text(format!(
                         "{} {}",
-                        format!("chunk #{}", chunk).cyan(),
+                        format!("chunk #{chunk}").cyan(),
                         if deleted {
                             "(deleted)".green()
                         } else {

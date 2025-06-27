@@ -257,7 +257,7 @@ impl ChunkIndex {
         let entry = self.chunks.get(&chunk_id).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Chunk ID {} not found", chunk_id),
+                format!("Chunk ID {chunk_id} not found"),
             )
         })?;
 
@@ -522,8 +522,7 @@ impl ChunkIndex {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 format!(
-                                    "Read 0 bytes at position {} (expected up to {})",
-                                    start, chunk_size
+                                    "Read 0 bytes at position {start} (expected up to {chunk_size})"
                                 ),
                             ));
                         }
@@ -559,8 +558,7 @@ impl ChunkIndex {
         for (i, handle) in handles.into_iter().enumerate() {
             if let Err(e) = handle.join() {
                 return Err(std::io::Error::other(format!(
-                    "Worker thread {} panicked: {:?}",
-                    i, e
+                    "Worker thread {i} panicked: {e:?}"
                 )));
             }
         }

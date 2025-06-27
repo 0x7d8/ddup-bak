@@ -8,7 +8,7 @@ use std::{collections::HashMap, io::Write, path::Path, time::SystemTime};
 #[inline]
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
-        format!("{}", bytes)
+        format!("{bytes}")
     } else if bytes < 1024 * 1024 {
         format!("{:.1}K", bytes as f64 / 1024.0)
     } else if bytes < 1024 * 1024 * 1024 {

@@ -210,7 +210,7 @@ fn tar_recursive_convert_entries(
             let dir_path = if path.ends_with('/') {
                 path.clone()
             } else {
-                format!("{}/", path)
+                format!("{path}/")
             };
 
             archive

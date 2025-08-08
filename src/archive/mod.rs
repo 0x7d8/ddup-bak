@@ -716,25 +716,25 @@ impl Archive {
                 self.entries
                     .push(entries::Entry::Directory(Box::new(dir_entry)));
             }
-        } else if metadata.is_symlink() {
-            if let Ok(Ok(target)) = std::fs::read_link(&path).map(|p| p.canonicalize()) {
-                let target = target.to_string_lossy().to_string();
+        } else if metadata.is_symlink()
+            && let Ok(Ok(target)) = std::fs::read_link(&path).map(|p| p.canonicalize())
+        {
+            let target = target.to_string_lossy().to_string();
 
-                let link_entry = entries::SymlinkEntry {
-                    name: file_name,
-                    mode: metadata.permissions().into(),
-                    owner: metadata_owner(&metadata),
-                    mtime: metadata.modified()?,
-                    target,
-                    target_dir: std::fs::metadata(&path)?.is_dir(),
-                };
+            let link_entry = entries::SymlinkEntry {
+                name: file_name,
+                mode: metadata.permissions().into(),
+                owner: metadata_owner(&metadata),
+                mtime: metadata.modified()?,
+                target,
+                target_dir: std::fs::metadata(&path)?.is_dir(),
+            };
 
-                if let Some(entries) = entries {
-                    entries.push(entries::Entry::Symlink(Box::new(link_entry)));
-                } else {
-                    self.entries
-                        .push(entries::Entry::Symlink(Box::new(link_entry)));
-                }
+            if let Some(entries) = entries {
+                entries.push(entries::Entry::Symlink(Box::new(link_entry)));
+            } else {
+                self.entries
+                    .push(entries::Entry::Symlink(Box::new(link_entry)));
             }
         }
 

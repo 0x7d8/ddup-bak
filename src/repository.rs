@@ -109,10 +109,10 @@ impl Repository {
         let archive_dir = self.directory.join(".ddup-bak/archives");
 
         for entry in std::fs::read_dir(archive_dir)?.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if let Some(stripped) = name.strip_suffix(".ddup") {
-                    archives.push(stripped.to_string());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && let Some(stripped) = name.strip_suffix(".ddup")
+            {
+                archives.push(stripped.to_string());
             }
         }
 
@@ -231,34 +231,34 @@ impl Repository {
                     .entries
                     .push(Entry::File(file_entry));
             }
-        } else if metadata.is_symlink() {
-            if let Ok(target) = std::fs::read_link(entry.path()) {
-                let mut archive = archive.lock().unwrap();
+        } else if metadata.is_symlink()
+            && let Ok(target) = std::fs::read_link(entry.path())
+        {
+            let mut archive = archive.lock().unwrap();
 
-                let link_entry = Entry::Symlink(Box::new(crate::archive::entries::SymlinkEntry {
-                    name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                    mode: metadata.permissions().into(),
-                    mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
-                    owner: {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt;
-                            (metadata.uid(), metadata.gid())
-                        }
-                        #[cfg(windows)]
-                        {
-                            (0, 0)
-                        }
-                    },
-                    target: target.to_string_lossy().into_owned(),
-                    target_dir: target.is_dir(),
-                }));
+            let link_entry = Entry::Symlink(Box::new(crate::archive::entries::SymlinkEntry {
+                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                mode: metadata.permissions().into(),
+                mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
+                owner: {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.uid(), metadata.gid())
+                    }
+                    #[cfg(windows)]
+                    {
+                        (0, 0)
+                    }
+                },
+                target: target.to_string_lossy().into_owned(),
+                target_dir: target.is_dir(),
+            }));
 
-                if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
-                    parent.entries.push(link_entry);
-                } else {
-                    archive.as_mut().unwrap().entries.push(link_entry);
-                }
+            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+                parent.entries.push(link_entry);
+            } else {
+                archive.as_mut().unwrap().entries.push(link_entry);
             }
         }
 
@@ -696,10 +696,10 @@ impl Repository {
                     break;
                 }
 
-                if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true) {
-                    if let Some(f) = &progress {
-                        f(chunk_id, deleted)
-                    }
+                if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true)
+                    && let Some(f) = &progress
+                {
+                    f(chunk_id, deleted)
                 }
             },
             Entry::Directory(dir_entry) => {
@@ -744,10 +744,10 @@ impl Repository {
 
 impl Drop for Repository {
     fn drop(&mut self) {
-        if self.save_on_drop {
-            if let Err(err) = self.save() {
-                eprintln!("Failed to save repository: {err}");
-            }
+        if self.save_on_drop
+            && let Err(err) = self.save()
+        {
+            eprintln!("Failed to save repository: {err}");
         }
     }
 }

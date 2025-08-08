@@ -573,10 +573,10 @@ impl ReadGuard {
 
 impl Drop for ReadGuard {
     fn drop(&mut self) {
-        if self.active {
-            if let Err(e) = self.unlock() {
-                eprintln!("Error releasing read lock in drop: {e}");
-            }
+        if self.active
+            && let Err(e) = self.unlock()
+        {
+            eprintln!("Error releasing read lock in drop: {e}");
         }
     }
 }
@@ -616,10 +616,10 @@ impl WriteGuard {
 
 impl Drop for WriteGuard {
     fn drop(&mut self) {
-        if self.active {
-            if let Err(e) = self.unlock() {
-                eprintln!("Error releasing write lock in drop: {e}");
-            }
+        if self.active
+            && let Err(e) = self.unlock()
+        {
+            eprintln!("Error releasing write lock in drop: {e}");
         }
     }
 }
@@ -628,10 +628,10 @@ impl Drop for RwLock {
     fn drop(&mut self) {
         self.running.store(0, Ordering::SeqCst);
 
-        if let Ok(mut refresh_guard) = self.refresh.lock() {
-            if let Some(handle) = refresh_guard.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut refresh_guard) = self.refresh.lock()
+            && let Some(handle) = refresh_guard.take()
+        {
+            let _ = handle.join();
         }
     }
 }

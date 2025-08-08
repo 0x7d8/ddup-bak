@@ -179,7 +179,7 @@ pub struct FileEntry {
 
     pub file: Arc<File>,
     pub offset: u64,
-    pub decoder: Option<Box<dyn Read + Send>>,
+    pub decoder: Option<Box<dyn Read + Sync + Send>>,
     pub consumed: u64,
 }
 

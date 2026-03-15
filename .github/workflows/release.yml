@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/lib
-          if [ "${{ matrix.os }}" = "windows-2019" ]; then
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/$BIN_NAME.exe" "dist/"
             cp "c/target/${{ matrix.target }}/release/ddupbak.dll" "dist/lib/"
             cp "c/target/${{ matrix.target }}/release/ddupbak.lib" "dist/lib/"

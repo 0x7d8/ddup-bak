@@ -9,7 +9,9 @@ use std::{
 };
 
 pub mod backup;
+pub mod clean;
 pub mod init;
+pub mod rebuild;
 
 pub fn open_repository(save: bool) -> Repository {
     if let Ok(mut repository) = Repository::open(Path::new("."), None, None) {
@@ -17,12 +19,18 @@ pub fn open_repository(save: bool) -> Repository {
 
         repository
     } else {
-        println!("{}", "repository is not initialized!".red());
+        println!("{}", "repository is not initialized or is corrupted!".red());
         println!(
             "{} {} {}",
             "Run".red(),
             "ddup-bak init .".cyan(),
             "to initialize a new repository.".red()
+        );
+        println!(
+            "{} {} {}",
+            "Run".red(),
+            "ddup-bak rebuild .".cyan(),
+            "to attempt to rebuild the repository.".red()
         );
 
         std::process::exit(1);

@@ -2,7 +2,7 @@ use crate::{
     archive::{
         Archive, CompressionFormat, CompressionFormatCallback, ProgressCallback, entries::Entry,
     },
-    chunks::{ChunkIndex, lock::LockMode, reader::EntryReader, storage},
+    chunks::{ChunkIndex, RebuildProgressCallback, lock::LockMode, reader::EntryReader, storage},
 };
 use std::{
     fs::{File, FileTimes},
@@ -44,6 +44,71 @@ impl Repository {
             save_on_drop: true,
             chunk_index,
         })
+    }
+
+    /// Rebuilds a corrupted repository by scanning archives and chunk storage.
+    ///
+    /// Use this when `open()` fails because the chunk index is corrupt or
+    /// missing (e.g. after a disk-full event).
+    pub fn rebuild(
+        directory: &Path,
+        chunk_size: usize,
+        max_chunk_count: usize,
+        chunks_directory: Option<&Path>,
+        storage: Option<Arc<dyn storage::ChunkStorage>>,
+        progress: RebuildProgressCallback,
+    ) -> std::io::Result<Self> {
+        let chunks_dir =
+            chunks_directory.map_or(directory.join(".ddup-bak/chunks"), |p| p.to_path_buf());
+        let archives_dir = directory.join(".ddup-bak/archives");
+
+        let storage: Arc<dyn storage::ChunkStorage> = storage.map_or(
+            Arc::new(storage::ChunkStorageLocal(chunks_dir.clone())),
+            |s| s,
+        );
+
+        let chunk_index = ChunkIndex::rebuild(
+            chunks_dir,
+            &archives_dir,
+            chunk_size,
+            max_chunk_count,
+            storage,
+            progress,
+        )?;
+
+        chunk_index.save()?;
+
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            save_on_drop: true,
+            chunk_index,
+        })
+    }
+
+    /// Opens a repository, falling back to rebuild if the index is corrupt.
+    ///
+    /// Tries `open()` first. If that fails with an I/O error (corrupt or
+    /// missing index), automatically runs `rebuild()`. This is the
+    /// recommended entry point for applications that want resilience.
+    pub fn open_or_rebuild(
+        directory: &Path,
+        chunk_size: usize,
+        max_chunk_count: usize,
+        chunks_directory: Option<&Path>,
+        storage: Option<Arc<dyn storage::ChunkStorage>>,
+        progress: RebuildProgressCallback,
+    ) -> std::io::Result<Self> {
+        match Self::open(directory, chunks_directory, storage.clone()) {
+            Ok(repo) => Ok(repo),
+            Err(_) => Self::rebuild(
+                directory,
+                chunk_size,
+                max_chunk_count,
+                chunks_directory,
+                storage,
+                progress,
+            ),
+        }
     }
 
     pub fn new(
@@ -392,6 +457,7 @@ impl Repository {
         });
 
         if let Some(err) = error.write().unwrap().take() {
+            let _ = std::fs::remove_file(&archive_path);
             return Err(err);
         }
 
@@ -414,9 +480,9 @@ impl Repository {
 
                 loop {
                     let chunk_id = crate::varint::decode_u64(&mut file_entry);
-                    if chunk_id == 0 {
+                    let Ok(chunk_id) = chunk_id else {
                         break;
-                    }
+                    };
 
                     let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
 
@@ -463,7 +529,7 @@ impl Repository {
                 let mut buffer = [0; 4096];
 
                 loop {
-                    let chunk_id = crate::varint::decode_u64(&mut file_entry);
+                    let chunk_id = crate::varint::decode_u64(&mut file_entry)?;
                     if chunk_id == 0 {
                         break;
                     }
@@ -691,7 +757,7 @@ impl Repository {
     ) -> std::io::Result<()> {
         match entry {
             Entry::File(mut file_entry) => loop {
-                let chunk_id = crate::varint::decode_u64(&mut file_entry);
+                let chunk_id = crate::varint::decode_u64(&mut file_entry)?;
                 if chunk_id == 0 {
                     break;
                 }

@@ -21,8 +21,9 @@ pub fn list(_matches: &ArgMatches) -> i32 {
         return 1;
     }
 
+    println!();
+
     for backup in list {
-        println!();
         println!("{}", backup.cyan().bold().underline());
     }
 

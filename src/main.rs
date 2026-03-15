@@ -44,6 +44,43 @@ fn cli() -> Command {
                 .arg_required_else_help(false),
         )
         .subcommand(
+            Command::new("rebuild")
+                .about("Rebuilds a corrupted repository by scanning archives and chunk storage")
+                .arg(
+                    Arg::new("directory")
+                        .help("The directory to rebuild the repository in")
+                        .num_args(1)
+                        .default_value(".")
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("chunk_size")
+                        .help("The chunk size to use for the repository (bytes)")
+                        .short('c')
+                        .long("chunk-size")
+                        .num_args(1)
+                        .default_value("1048576")
+                        .value_parser(clap::value_parser!(usize))
+                        .required(false),
+                )
+                .arg(
+                    Arg::new("max_chunk_count")
+                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value, 0 means no limit")
+                        .short('m')
+                        .long("max-chunk-count")
+                        .num_args(1)
+                        .default_value("0")
+                        .value_parser(clap::value_parser!(usize))
+                        .required(false),
+                )
+                .arg_required_else_help(false),
+        )
+        .subcommand(
+            Command::new("clean")
+                .about("Cleans up unreferenced chunks from the repository")
+                .arg_required_else_help(false),
+        )
+        .subcommand(
             Command::new("backup")
                 .about("Manages backups")
                 .subcommand(
@@ -195,6 +232,10 @@ fn main() {
 
     match matches.subcommand() {
         Some(("init", sub_matches)) => std::process::exit(commands::init::init(sub_matches)),
+        Some(("rebuild", sub_matches)) => {
+            std::process::exit(commands::rebuild::rebuild(sub_matches))
+        }
+        Some(("clean", sub_matches)) => std::process::exit(commands::clean::clean(sub_matches)),
         Some(("backup", sub_matches)) => match sub_matches.subcommand() {
             Some(("create", sub_matches)) => {
                 std::process::exit(commands::backup::create::create(sub_matches))

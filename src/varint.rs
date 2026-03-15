@@ -15,15 +15,13 @@ pub fn encode_u32(value: u32) -> Vec<u8> {
 }
 
 #[inline]
-pub fn decode_u32<S: Read>(stream: &mut S) -> u32 {
+pub fn decode_u32<S: Read>(stream: &mut S) -> std::io::Result<u32> {
     let mut result = 0;
     let mut shift: u8 = 0;
 
     let mut byte = [0; 1];
     loop {
-        if stream.read_exact(&mut byte).is_err() {
-            break;
-        }
+        stream.read_exact(&mut byte)?;
 
         result |= ((byte[0] & 0x7F) as u32) << shift;
         if byte[0] & 0x80 == 0 {
@@ -33,7 +31,7 @@ pub fn decode_u32<S: Read>(stream: &mut S) -> u32 {
         shift += 7;
     }
 
-    result
+    Ok(result)
 }
 
 #[inline]
@@ -51,15 +49,13 @@ pub fn encode_u64(value: u64) -> Vec<u8> {
 }
 
 #[inline]
-pub fn decode_u64<S: Read>(stream: &mut S) -> u64 {
+pub fn decode_u64<S: Read>(stream: &mut S) -> std::io::Result<u64> {
     let mut result = 0;
     let mut shift: u8 = 0;
 
     let mut byte = [0; 1];
     loop {
-        if stream.read_exact(&mut byte).is_err() {
-            break;
-        }
+        stream.read_exact(&mut byte)?;
 
         result |= ((byte[0] & 0x7F) as u64) << shift;
         if byte[0] & 0x80 == 0 {
@@ -69,5 +65,5 @@ pub fn decode_u64<S: Read>(stream: &mut S) -> u64 {
         shift += 7;
     }
 
-    result
+    Ok(result)
 }

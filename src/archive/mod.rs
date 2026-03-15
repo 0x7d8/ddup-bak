@@ -746,7 +746,7 @@ impl Archive {
     }
 
     fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> std::io::Result<entries::Entry> {
-        let name_length = varint::decode_u32(decoder) as usize;
+        let name_length = varint::decode_u32(decoder)? as usize;
 
         let mut name_bytes = vec![0; name_length];
         decoder.read_exact(&mut name_bytes)?;
@@ -760,22 +760,22 @@ impl Archive {
         let compression = CompressionFormat::decode(((type_compression_mode >> 26) & 0b1111) as u8);
         let mode = EntryMode::from(type_compression_mode & 0x3FFFFFFF);
 
-        let uid = varint::decode_u32(decoder);
-        let gid = varint::decode_u32(decoder);
+        let uid = varint::decode_u32(decoder)?;
+        let gid = varint::decode_u32(decoder)?;
 
-        let mtime = varint::decode_u64(decoder);
+        let mtime = varint::decode_u64(decoder)?;
         let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::new(mtime, 0);
 
-        let size = varint::decode_u64(decoder);
+        let size = varint::decode_u64(decoder)?;
 
         match entry_type {
             0 => {
                 let size_compressed = match compression {
                     CompressionFormat::None => None,
-                    _ => Some(varint::decode_u64(decoder)),
+                    _ => Some(varint::decode_u64(decoder)?),
                 };
-                let size_real = varint::decode_u64(decoder);
-                let offset = varint::decode_u64(decoder);
+                let size_real = varint::decode_u64(decoder)?;
+                let offset = varint::decode_u64(decoder)?;
 
                 Ok(entries::Entry::File(Box::new(entries::FileEntry {
                     name,
@@ -828,7 +828,10 @@ impl Archive {
                     target_dir,
                 })))
             }
-            _ => panic!("Unsupported entry type"),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid entry type",
+            )),
         }
     }
 }

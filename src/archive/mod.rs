@@ -71,6 +71,34 @@ fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
     }
 }
 
+/// Limits enforced while decoding an archive from disk.
+///
+/// All limits are intentionally generous for legitimate archives but tight
+/// enough to prevent trivial DoS via crafted inputs (huge declared lengths,
+/// deeply-nested directory trees, absurd entry counts).
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeLimits {
+    /// Maximum byte length of any single entry name (file, directory, symlink).
+    pub max_name_len: usize,
+    /// Maximum byte length of a symlink target path.
+    pub max_target_len: usize,
+    /// Maximum directory nesting depth.
+    pub max_depth: usize,
+    /// Maximum number of top-level entries (and per-directory children).
+    pub max_entry_count: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_name_len: 255,
+            max_target_len: 4096,
+            max_depth: 256,
+            max_entry_count: 10_000_000,
+        }
+    }
+}
+
 pub type ProgressCallback = Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>;
 pub type CompressionFormatCallback =
     Option<Arc<dyn Fn(&Path, &Metadata) -> CompressionFormat + Send + Sync>>;
@@ -118,14 +146,23 @@ impl Archive {
     /// Opens an existing archive file for reading and writing.
     /// This will not overwrite the file, but append to it.
     pub fn open(path: &str) -> std::io::Result<Self> {
-        let file = File::open(path)?;
+        Self::open_with_limits(path, DecodeLimits::default())
+    }
 
-        Self::open_file(file)
+    /// Opens an existing archive file with custom decode limits.
+    pub fn open_with_limits(path: &str, limits: DecodeLimits) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        Self::open_file_with_limits(file, limits)
     }
 
     /// Opens an existing archive file for reading and writing.
     /// This will not overwrite the file, but append to it.
-    pub fn open_file(mut file: File) -> std::io::Result<Self> {
+    pub fn open_file(file: File) -> std::io::Result<Self> {
+        Self::open_file_with_limits(file, DecodeLimits::default())
+    }
+
+    /// Opens an existing archive file with custom decode limits.
+    pub fn open_file_with_limits(mut file: File, limits: DecodeLimits) -> std::io::Result<Self> {
         let len = file.metadata()?.len();
 
         let mut buffer = [0; 8];
@@ -143,13 +180,23 @@ impl Archive {
         file.read_exact_at(len - 8, &mut buffer)?;
         let entries_offset = u64::from_le_bytes(buffer);
 
+        if entries_count as usize > limits.max_entry_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "archive entry count {} exceeds limit {}",
+                    entries_count, limits.max_entry_count
+                ),
+            ));
+        }
+
         let mut entries = Vec::with_capacity(entries_count as usize);
         file.seek(SeekFrom::Start(entries_offset))?;
 
         let mut decoder = DeflateDecoder::new(file.try_clone()?);
         let file = Arc::new(file);
         for _ in 0..entries_count {
-            let entry = Self::decode_entry(&mut decoder, file.clone())?;
+            let entry = Self::decode_entry(&mut decoder, file.clone(), &limits, 0)?;
             entries.push(entry);
         }
 
@@ -745,12 +792,28 @@ impl Archive {
         Ok(())
     }
 
-    fn decode_entry<S: Read>(decoder: &mut S, file: Arc<File>) -> std::io::Result<entries::Entry> {
+    fn decode_entry<S: Read>(
+        decoder: &mut S,
+        file: Arc<File>,
+        limits: &DecodeLimits,
+        depth: usize,
+    ) -> std::io::Result<entries::Entry> {
         let name_length = varint::decode_u32(decoder)? as usize;
+
+        if name_length > limits.max_name_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "entry name length {} exceeds limit {}",
+                    name_length, limits.max_name_len
+                ),
+            ));
+        }
 
         let mut name_bytes = vec![0; name_length];
         decoder.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes).unwrap();
+        let name = String::from_utf8(name_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let mut type_mode_bytes = [0; 4];
         decoder.read_exact(&mut type_mode_bytes)?;
@@ -793,9 +856,28 @@ impl Archive {
                 })))
             }
             1 => {
-                let mut entries: Vec<entries::Entry> = Vec::with_capacity(size as usize);
-                for _ in 0..size {
-                    let entry = Self::decode_entry(decoder, file.clone())?;
+                let child_count = size as usize;
+
+                if child_count > limits.max_entry_count {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "directory child count {} exceeds limit {}",
+                            child_count, limits.max_entry_count
+                        ),
+                    ));
+                }
+
+                if depth >= limits.max_depth {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("directory nesting exceeded limit {}", limits.max_depth),
+                    ));
+                }
+
+                let mut entries: Vec<entries::Entry> = Vec::with_capacity(child_count);
+                for _ in 0..child_count {
+                    let entry = Self::decode_entry(decoder, file.clone(), limits, depth + 1)?;
                     entries.push(entry);
                 }
 
@@ -810,10 +892,23 @@ impl Archive {
                 )))
             }
             2 => {
-                let mut target_bytes = vec![0; size as usize];
+                let target_len = size as usize;
+
+                if target_len > limits.max_target_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "symlink target length {} exceeds limit {}",
+                            target_len, limits.max_target_len
+                        ),
+                    ));
+                }
+
+                let mut target_bytes = vec![0; target_len];
                 decoder.read_exact(&mut target_bytes)?;
 
-                let target = String::from_utf8(target_bytes).unwrap();
+                let target = String::from_utf8(target_bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
                 let mut target_dir_bytes = [0; 1];
                 decoder.read_exact(&mut target_dir_bytes)?;

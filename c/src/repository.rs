@@ -82,12 +82,15 @@ pub unsafe extern "C" fn new_repository(
 ) -> *mut CRepository {
     let directory = unsafe { CStr::from_ptr(directory).to_string_lossy().into_owned() };
 
-    let repository = Repository::new(
+    let repository = match Repository::new(
         Path::new(&directory),
         chunk_size as usize,
         max_chunk_count as usize,
         None,
-    );
+    ) {
+        Ok(repo) => repo,
+        Err(_) => return std::ptr::null_mut(),
+    };
 
     CRepository::from_repository(repository)
 }

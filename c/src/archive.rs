@@ -123,7 +123,10 @@ pub unsafe extern "C" fn new_archive(path: *const c_char) -> *mut CArchive {
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let archive = Archive::new(file);
+    let archive = match Archive::new(file) {
+        Ok(archive) => archive,
+        Err(_) => return std::ptr::null_mut(),
+    };
 
     CArchive::from_archive(archive)
 }

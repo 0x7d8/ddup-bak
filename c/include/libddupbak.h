@@ -141,7 +141,6 @@ struct CArchive *repository_create_archive(struct CRepository *repo,
                                            const char *name,
                                            const char *directory,
                                            CProgressCallback progress_chunking,
-                                           CProgressCallback progress_archiving,
                                            CCompressionFormatCallback compression_callback,
                                            unsigned int threads);
 

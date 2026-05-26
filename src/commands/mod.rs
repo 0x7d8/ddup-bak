@@ -1,9 +1,10 @@
 use colored::Colorize;
 use ddup_bak::repository::Repository;
+use parking_lot::RwLock;
 use std::{
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicUsize},
     },
 };
@@ -79,7 +80,7 @@ impl Progress {
 
     #[inline]
     pub fn set_text<T: Into<String>>(&self, text: T) {
-        let mut guard = self.text.write().unwrap();
+        let mut guard = self.text.write();
         *guard = text.into();
     }
 
@@ -136,8 +137,10 @@ impl Progress {
         self.finished
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("{}", "Failed to join progress thread".red());
         }
 
         println!();

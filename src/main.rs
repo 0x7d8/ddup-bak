@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+use colored::Colorize;
 
 mod commands;
 
@@ -227,38 +228,50 @@ fn cli() -> Command {
         )
 }
 
+fn handle_command_result(result: std::io::Result<i32>) {
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{} {}", "error:".red(), err);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let matches = cli().get_matches();
 
     match matches.subcommand() {
-        Some(("init", sub_matches)) => std::process::exit(commands::init::init(sub_matches)),
+        Some(("init", sub_matches)) => handle_command_result(commands::init::init(sub_matches)),
         Some(("rebuild", sub_matches)) => {
-            std::process::exit(commands::rebuild::rebuild(sub_matches))
+            handle_command_result(commands::rebuild::rebuild(sub_matches))
         }
-        Some(("clean", sub_matches)) => std::process::exit(commands::clean::clean(sub_matches)),
+        Some(("clean", sub_matches)) => handle_command_result(commands::clean::clean(sub_matches)),
         Some(("backup", sub_matches)) => match sub_matches.subcommand() {
             Some(("create", sub_matches)) => {
-                std::process::exit(commands::backup::create::create(sub_matches))
+                handle_command_result(commands::backup::create::create(sub_matches))
             }
             Some(("delete", sub_matches)) => {
-                std::process::exit(commands::backup::delete::delete(sub_matches))
+                handle_command_result(commands::backup::delete::delete(sub_matches))
             }
             Some(("restore", sub_matches)) => {
-                std::process::exit(commands::backup::restore::restore(sub_matches))
+                handle_command_result(commands::backup::restore::restore(sub_matches))
             }
             Some(("convert", sub_matches)) => {
-                std::process::exit(commands::backup::convert::convert(sub_matches))
+                handle_command_result(commands::backup::convert::convert(sub_matches))
             }
             Some(("list", sub_matches)) => {
-                std::process::exit(commands::backup::list::list(sub_matches))
+                handle_command_result(commands::backup::list::list(sub_matches))
             }
             Some(("fs", sub_matches)) => match sub_matches.subcommand() {
-                Some(("ls", sub_sub_matches)) => std::process::exit(commands::backup::fs::ls::ls(
-                    sub_matches.get_one::<String>("name").unwrap(),
-                    sub_sub_matches,
-                )),
+                Some(("ls", sub_sub_matches)) => {
+                    handle_command_result(commands::backup::fs::ls::ls(
+                        sub_matches.get_one::<String>("name").unwrap(),
+                        sub_sub_matches,
+                    ))
+                }
                 Some(("cat", sub_sub_matches)) => {
-                    std::process::exit(commands::backup::fs::cat::cat(
+                    handle_command_result(commands::backup::fs::cat::cat(
                         sub_matches.get_one::<String>("name").unwrap(),
                         sub_sub_matches,
                     ))

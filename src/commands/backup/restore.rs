@@ -4,7 +4,7 @@ use colored::Colorize;
 use ddup_bak::archive::entries::Entry;
 use std::sync::Arc;
 
-pub fn restore(matches: &ArgMatches) -> i32 {
+pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(false);
 
     let name = matches.get_one::<String>("name").expect("required");
@@ -12,8 +12,7 @@ pub fn restore(matches: &ArgMatches) -> i32 {
     let threads = matches.get_one::<usize>("threads").expect("required");
 
     if !repository
-        .list_archives()
-        .unwrap()
+        .list_archives()?
         .into_iter()
         .any(|name| name == *name)
     {
@@ -24,12 +23,12 @@ pub fn restore(matches: &ArgMatches) -> i32 {
             "does not exist!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
     println!("{}", "restoring backup...".bright_black());
 
-    let archive = repository.get_archive(name).unwrap();
+    let archive = repository.get_archive(name)?;
 
     fn recursive_count_entries(entry: &Entry) -> usize {
         match entry {
@@ -63,20 +62,18 @@ pub fn restore(matches: &ArgMatches) -> i32 {
         )
     });
 
-    repository
-        .restore_entries(
-            name,
-            archive.into_entries(),
-            Some({
-                let progress = progress.clone();
+    repository.restore_entries(
+        name,
+        archive.into_entries(),
+        Some({
+            let progress = progress.clone();
 
-                Arc::new(move |_| {
-                    progress.incr(1usize);
-                })
-            }),
-            *threads,
-        )
-        .unwrap();
+            Arc::new(move |_| {
+                progress.incr(1usize);
+            })
+        }),
+        *threads,
+    )?;
 
     progress.finish();
 
@@ -95,17 +92,22 @@ pub fn restore(matches: &ArgMatches) -> i32 {
         );
 
         if std::path::Path::new(destination).exists() {
-            for entry in std::fs::read_dir(destination).unwrap().flatten() {
-                let path = entry.path();
+            for entry in std::fs::read_dir(destination)? {
+                let entry = entry?;
 
-                if path.file_name().unwrap() == ".ddup-bak" {
+                let path = entry.path();
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+
+                if file_name == ".ddup-bak" {
                     continue;
                 }
 
                 if path.is_file() {
-                    std::fs::remove_file(path).unwrap();
+                    std::fs::remove_file(path)?;
                 } else if path.is_dir() {
-                    std::fs::remove_dir_all(path).unwrap();
+                    std::fs::remove_dir_all(path)?;
                 }
             }
         }
@@ -113,13 +115,19 @@ pub fn restore(matches: &ArgMatches) -> i32 {
         let source = std::path::Path::new(".ddup-bak/archives-restored/").join(name);
         let destination = std::path::Path::new(destination);
 
-        std::fs::create_dir_all(destination).unwrap();
+        std::fs::create_dir_all(destination)?;
 
-        for entry in std::fs::read_dir(source).unwrap().flatten() {
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+
             let path = entry.path();
-            let destination_path = destination.join(path.file_name().unwrap());
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
 
-            std::fs::rename(path, destination_path).unwrap();
+            let destination_path = destination.join(file_name);
+
+            std::fs::rename(path, destination_path)?;
         }
 
         println!(
@@ -131,5 +139,5 @@ pub fn restore(matches: &ArgMatches) -> i32 {
         );
     }
 
-    0
+    Ok(0)
 }

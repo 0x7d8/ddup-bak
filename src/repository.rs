@@ -4,11 +4,12 @@ use crate::{
     },
     chunks::{ChunkIndex, RebuildProgressCallback, lock::LockMode, reader::EntryReader, storage},
 };
+use parking_lot::{Mutex, RwLock};
 use std::{
     fs::{File, FileTimes},
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::Arc,
 };
 
 pub type DeletionProgressCallback = Option<Arc<dyn Fn(u64, bool) + Send + Sync + 'static>>;
@@ -116,10 +117,10 @@ impl Repository {
         chunk_size: usize,
         max_chunk_count: usize,
         storage: Option<Arc<dyn storage::ChunkStorage>>,
-    ) -> Self {
-        std::fs::create_dir_all(directory.join(".ddup-bak/archives")).unwrap();
-        std::fs::create_dir_all(directory.join(".ddup-bak/archives-restored")).unwrap();
-        std::fs::create_dir_all(directory.join(".ddup-bak/chunks")).unwrap();
+    ) -> std::io::Result<Self> {
+        std::fs::create_dir_all(directory.join(".ddup-bak/archives"))?;
+        std::fs::create_dir_all(directory.join(".ddup-bak/archives-restored"))?;
+        std::fs::create_dir_all(directory.join(".ddup-bak/chunks"))?;
 
         let chunk_index = ChunkIndex::new(
             directory.join(".ddup-bak/chunks"),
@@ -131,13 +132,13 @@ impl Repository {
                 )),
                 |s| s,
             ),
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             directory: directory.to_path_buf(),
             save_on_drop: true,
             chunk_index,
-        }
+        })
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -190,7 +191,7 @@ impl Repository {
     pub fn get_archive(&self, name: &str) -> std::io::Result<Archive> {
         let archive_path = self.archive_path(name);
 
-        Archive::open(archive_path.to_str().unwrap())
+        Archive::open(&archive_path)
     }
 
     pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
@@ -219,9 +220,9 @@ impl Repository {
     ) -> Option<&'a mut Box<crate::archive::entries::DirectoryEntry>> {
         archive
             .find_archive_entry_mut(entry.parent()?)
-            .map(|e| match e {
-                Entry::Directory(dir) => dir,
-                _ => panic!("Parent entry is not a directory"),
+            .and_then(|e| match e {
+                Entry::Directory(dir) => Some(dir),
+                _ => None,
             })
     }
 
@@ -243,8 +244,11 @@ impl Repository {
                 "Path is not a subpath of the root directory",
             )
         })?;
+        let Some(file_name) = path.file_name() else {
+            return Ok(());
+        };
 
-        if error.read().unwrap().is_some() {
+        if error.read().is_some() {
             return Ok(());
         }
 
@@ -266,11 +270,15 @@ impl Repository {
                 chunk_content.extend_from_slice(&crate::varint::encode_u64(id));
             }
 
-            let mut archive = archive.lock().unwrap();
-            let file_entry = archive.as_mut().unwrap().write_file_entry(
+            let mut archive_lock = archive.lock();
+            let Some(archive) = archive_lock.as_mut() else {
+                return Err(std::io::Error::other("Archive has already been finalized"));
+            };
+
+            let file_entry = archive.write_file_entry(
                 Cursor::new(chunk_content),
                 Some(metadata.len()),
-                path.file_name().unwrap().to_string_lossy().into_owned(),
+                file_name.to_string_lossy(),
                 metadata.permissions().into(),
                 metadata.modified().unwrap_or(std::time::SystemTime::now()),
                 {
@@ -287,22 +295,21 @@ impl Repository {
                 compression,
             )?;
 
-            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+            if let Some(parent) = Self::archive_path_parent(archive, path) {
                 parent.entries.push(Entry::File(file_entry));
             } else {
-                archive
-                    .as_mut()
-                    .unwrap()
-                    .entries
-                    .push(Entry::File(file_entry));
+                archive.entries.push(Entry::File(file_entry));
             }
         } else if metadata.is_symlink()
             && let Ok(target) = std::fs::read_link(entry.path())
         {
-            let mut archive = archive.lock().unwrap();
+            let mut archive_lock = archive.lock();
+            let Some(archive) = archive_lock.as_mut() else {
+                return Err(std::io::Error::other("Archive has already been finalized"));
+            };
 
             let link_entry = Entry::Symlink(Box::new(crate::archive::entries::SymlinkEntry {
-                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                name: file_name.to_string_lossy().into(),
                 mode: metadata.permissions().into(),
                 mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
                 owner: {
@@ -320,10 +327,10 @@ impl Repository {
                 target_dir: target.is_dir(),
             }));
 
-            if let Some(parent) = Self::archive_path_parent(archive.as_mut().unwrap(), path) {
+            if let Some(parent) = Self::archive_path_parent(archive, path) {
                 parent.entries.push(link_entry);
             } else {
-                archive.as_mut().unwrap().entries.push(link_entry);
+                archive.entries.push(link_entry);
             }
         }
 
@@ -340,7 +347,7 @@ impl Repository {
         compression_callback: CompressionFormatCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
-        if self.list_archives()?.contains(&name.to_string()) {
+        if self.list_archives()?.iter().any(|n| n == name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!("Archive {name} already exists"),
@@ -355,7 +362,7 @@ impl Repository {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .unwrap(),
+                .map_err(std::io::Error::other)?,
         );
         let error = Arc::new(RwLock::new(None));
 
@@ -366,7 +373,9 @@ impl Repository {
                 .build()
         });
 
-        let archive = Arc::new(Mutex::new(Some(Archive::new(File::create(&archive_path)?))));
+        let archive = Arc::new(Mutex::new(Some(Archive::new(File::create(
+            &archive_path,
+        )?)?)));
 
         worker_pool.in_place_scope(|scope| {
             for entry in walker.flatten() {
@@ -374,7 +383,7 @@ impl Repository {
                 let metadata = match path.symlink_metadata() {
                     Ok(metadata) => metadata,
                     Err(err) => {
-                        let mut error = error.write().unwrap();
+                        let mut error = error.write();
                         if error.is_none() {
                             *error = Some(err);
                         }
@@ -384,21 +393,23 @@ impl Repository {
                 if path.file_name() == Some(".ddup-bak".as_ref()) {
                     continue;
                 }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
 
-                if error.read().unwrap().is_some() {
+                if error.read().is_some() {
                     break;
                 }
 
                 if metadata.is_dir() {
-                    if path.file_name().is_none() {
-                        continue;
-                    }
-
-                    let mut archive = archive.lock().unwrap();
+                    let mut archive_lock = archive.lock();
+                    let Some(archive) = archive_lock.as_mut() else {
+                        break;
+                    };
 
                     let dir_entry =
                         Entry::Directory(Box::new(crate::archive::entries::DirectoryEntry {
-                            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                            name: file_name.to_string_lossy().into(),
                             mode: metadata.permissions().into(),
                             mtime: metadata.modified().unwrap_or(std::time::SystemTime::now()),
                             owner: {
@@ -416,13 +427,13 @@ impl Repository {
                         }));
 
                     if let Some(parent) = Self::archive_path_parent(
-                        archive.as_mut().unwrap(),
+                        archive,
                         path.strip_prefix(directory_root.unwrap_or(&self.directory))
-                            .unwrap(),
+                            .unwrap_or(path),
                     ) {
                         parent.entries.push(dir_entry);
                     } else {
-                        archive.as_mut().unwrap().entries.push(dir_entry);
+                        archive.entries.push(dir_entry);
                     }
                 }
 
@@ -446,7 +457,7 @@ impl Repository {
                             scope,
                             Arc::clone(&error),
                         ) {
-                            let mut error = error.write().unwrap();
+                            let mut error = error.write();
                             if error.is_none() {
                                 *error = Some(err);
                             }
@@ -456,12 +467,14 @@ impl Repository {
             }
         });
 
-        if let Some(err) = error.write().unwrap().take() {
+        if let Some(err) = error.write().take() {
             let _ = std::fs::remove_file(&archive_path);
             return Err(err);
         }
 
-        let mut archive = archive.lock().unwrap().take().unwrap();
+        let Some(mut archive) = archive.lock().take() else {
+            return Err(std::io::Error::other("Archive has already been finalized"));
+        };
         archive.write_end_header()?;
 
         w.unlock()?;
@@ -476,8 +489,6 @@ impl Repository {
     ) -> std::io::Result<()> {
         match entry {
             Entry::File(mut file_entry) => {
-                let mut buffer = [0; 4096];
-
                 loop {
                     let chunk_id = crate::varint::decode_u64(&mut file_entry);
                     let Ok(chunk_id) = chunk_id else {
@@ -486,14 +497,7 @@ impl Repository {
 
                     let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
 
-                    loop {
-                        let bytes_read = chunk.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-
-                        stream.write_all(&buffer[..bytes_read])?;
-                    }
+                    std::io::copy(&mut chunk, stream)?;
                 }
 
                 Ok(())
@@ -515,7 +519,7 @@ impl Repository {
     ) -> std::io::Result<()> {
         let path = directory.join(entry.name());
 
-        if error.read().unwrap().is_some() {
+        if error.read().is_some() {
             return Ok(());
         }
 
@@ -526,7 +530,6 @@ impl Repository {
         match entry {
             Entry::File(mut file_entry) => {
                 let mut file = File::create(&path)?;
-                let mut buffer = [0; 4096];
 
                 loop {
                     let chunk_id = crate::varint::decode_u64(&mut file_entry)?;
@@ -536,14 +539,7 @@ impl Repository {
 
                     let mut chunk = chunk_index.read_chunk_id_content(chunk_id)?;
 
-                    loop {
-                        let bytes_read = chunk.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-
-                        file.write_all(&buffer[..bytes_read])?;
-                    }
+                    std::io::copy(&mut chunk, &mut file)?;
                 }
 
                 file.set_permissions(file_entry.mode.into())?;
@@ -583,7 +579,7 @@ impl Repository {
                                 scope,
                                 Arc::clone(&error),
                             ) {
-                                let mut error = error.write().unwrap();
+                                let mut error = error.write();
                                 if error.is_none() {
                                     *error = Some(err);
                                 }
@@ -621,7 +617,7 @@ impl Repository {
         progress: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
-        if !self.list_archives()?.contains(&name.to_string()) {
+        if !self.list_archives()?.iter().any(|n| n == name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Archive {name} not found"),
@@ -631,7 +627,7 @@ impl Repository {
         let mut r = self.chunk_index.lock.read_lock(LockMode::NonDestructive)?;
 
         let archive_path = self.archive_path(name);
-        let archive = Archive::open(archive_path.to_str().unwrap())?;
+        let archive = Archive::open(&archive_path)?;
         let destination = self
             .directory
             .join(".ddup-bak/archives-restored")
@@ -643,7 +639,7 @@ impl Repository {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .unwrap(),
+                .map_err(std::io::Error::other)?,
         );
         let error = Arc::new(RwLock::new(None));
 
@@ -664,7 +660,7 @@ impl Repository {
                             scope,
                             Arc::clone(&error),
                         ) {
-                            let mut error = error.write().unwrap();
+                            let mut error = error.write();
                             if error.is_none() {
                                 *error = Some(err);
                             }
@@ -674,7 +670,7 @@ impl Repository {
             }
         });
 
-        if let Some(err) = error.write().unwrap().take() {
+        if let Some(err) = error.write().take() {
             return Err(err);
         }
 
@@ -690,7 +686,7 @@ impl Repository {
         progress: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
-        if !self.list_archives()?.contains(&name.to_string()) {
+        if !self.list_archives()?.iter().any(|n| n == name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Archive {name} not found"),
@@ -710,7 +706,7 @@ impl Repository {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
-                .unwrap(),
+                .map_err(std::io::Error::other)?,
         );
         let error = Arc::new(RwLock::new(None));
 
@@ -731,7 +727,7 @@ impl Repository {
                             scope,
                             Arc::clone(&error),
                         ) {
-                            let mut error = error.write().unwrap();
+                            let mut error = error.write();
                             if error.is_none() {
                                 *error = Some(err);
                             }
@@ -741,7 +737,7 @@ impl Repository {
             }
         });
 
-        if let Some(err) = error.write().unwrap().take() {
+        if let Some(err) = error.write().take() {
             return Err(err);
         }
 
@@ -784,7 +780,7 @@ impl Repository {
         name: &str,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {
-        if !self.list_archives()?.contains(&name.to_string()) {
+        if !self.list_archives()?.iter().any(|n| n == name) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("Archive {name} not found"),
@@ -794,7 +790,7 @@ impl Repository {
         let mut w = self.chunk_index.lock.write_lock(LockMode::Destructive)?;
 
         let archive_path = self.archive_path(name);
-        let archive = Archive::open(archive_path.to_str().unwrap())?;
+        let archive = Archive::open(&archive_path)?;
 
         for entry in archive.into_entries() {
             self.recursive_delete_archive(entry, progress.clone())?;

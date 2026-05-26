@@ -3,7 +3,7 @@ use colored::Colorize;
 use ddup_bak::repository::Repository;
 use std::path::Path;
 
-pub fn init(matches: &ArgMatches) -> i32 {
+pub fn init(matches: &ArgMatches) -> std::io::Result<i32> {
     let directory = matches.get_one::<String>("directory").expect("required");
     let chunk_size = *matches.get_one::<usize>("chunk_size").expect("required");
     let max_chunk_count = *matches
@@ -13,7 +13,7 @@ pub fn init(matches: &ArgMatches) -> i32 {
     if std::path::Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "already exists!".red());
 
-        return 1;
+        return Ok(1);
     }
 
     println!(
@@ -23,7 +23,7 @@ pub fn init(matches: &ArgMatches) -> i32 {
         "...".bright_black()
     );
 
-    Repository::new(Path::new(directory), chunk_size, max_chunk_count, None);
+    Repository::new(Path::new(directory), chunk_size, max_chunk_count, None)?;
 
     println!(
         "{} {} {} {}",
@@ -33,5 +33,5 @@ pub fn init(matches: &ArgMatches) -> i32 {
         "DONE".green().bold()
     );
 
-    0
+    Ok(0)
 }

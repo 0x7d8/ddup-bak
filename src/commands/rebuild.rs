@@ -1,11 +1,10 @@
+use crate::commands::Progress;
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::repository::Repository;
 use std::{path::Path, sync::Arc};
 
-use crate::commands::Progress;
-
-pub fn rebuild(matches: &ArgMatches) -> i32 {
+pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
     let directory = matches.get_one::<String>("directory").expect("required");
     let chunk_size = *matches.get_one::<usize>("chunk_size").expect("required");
     let max_chunk_count = *matches
@@ -15,7 +14,7 @@ pub fn rebuild(matches: &ArgMatches) -> i32 {
     if !std::path::Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "does not exist!".red());
 
-        return 1;
+        return Ok(1);
     }
 
     println!(
@@ -31,7 +30,7 @@ pub fn rebuild(matches: &ArgMatches) -> i32 {
             "\r\x1B[K {} {} {}",
             "rebuilding repository...".bright_black().italic(),
             spinner.cyan(),
-            progress.text.read().unwrap().cyan()
+            progress.text.read().cyan()
         )
     });
 
@@ -54,8 +53,7 @@ pub fn rebuild(matches: &ArgMatches) -> i32 {
                 ));
             })
         }),
-    )
-    .unwrap();
+    )?;
 
     println!(
         "{} {} {} {}",
@@ -65,5 +63,5 @@ pub fn rebuild(matches: &ArgMatches) -> i32 {
         "DONE".green().bold()
     );
 
-    0
+    Ok(0)
 }

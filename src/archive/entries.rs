@@ -238,20 +238,18 @@ impl Read for FileEntry {
                 self.consumed += bytes_read as u64;
                 Ok(bytes_read)
             }
-            CompressionFormat::Gzip => {
-                if self.decoder.is_none() {
+            CompressionFormat::Gzip if let Some(size_compressed) = self.size_compressed => {
+                let decoder = self.decoder.get_or_insert_with(|| {
                     let reader = BoundedReader {
                         file: Arc::clone(&self.file),
                         offset: self.offset,
                         position: 0,
-                        size: self.size_compressed.unwrap(),
+                        size: size_compressed,
                     };
 
-                    let decoder = Box::new(GzDecoder::new(reader));
-                    self.decoder = Some(decoder);
-                }
+                    Box::new(GzDecoder::new(reader))
+                });
 
-                let decoder = self.decoder.as_mut().unwrap();
                 let bytes_read = decoder.read(buf)?;
 
                 if bytes_read > remaining as usize {
@@ -263,20 +261,18 @@ impl Read for FileEntry {
                 self.consumed += bytes_read as u64;
                 Ok(bytes_read)
             }
-            CompressionFormat::Deflate => {
-                if self.decoder.is_none() {
+            CompressionFormat::Deflate if let Some(size_compressed) = self.size_compressed => {
+                let decoder = self.decoder.get_or_insert_with(|| {
                     let reader = BoundedReader {
                         file: Arc::clone(&self.file),
                         offset: self.offset,
                         position: 0,
-                        size: self.size_compressed.unwrap(),
+                        size: size_compressed,
                     };
 
-                    let decoder = Box::new(DeflateDecoder::new(reader));
-                    self.decoder = Some(decoder);
-                }
+                    Box::new(DeflateDecoder::new(reader))
+                });
 
-                let decoder = self.decoder.as_mut().unwrap();
                 let bytes_read = decoder.read(buf)?;
 
                 if bytes_read > remaining as usize {
@@ -288,22 +284,19 @@ impl Read for FileEntry {
                 self.consumed += bytes_read as u64;
                 Ok(bytes_read)
             }
-
             #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli => {
-                if self.decoder.is_none() {
+            CompressionFormat::Brotli if let Some(size_compressed) = self.size_compressed => {
+                let decoder = self.decoder.get_or_insert_with(|| {
                     let reader = BoundedReader {
                         file: Arc::clone(&self.file),
                         offset: self.offset,
                         position: 0,
-                        size: self.size_compressed.unwrap(),
+                        size: size_compressed,
                     };
 
-                    let decoder = Box::new(brotli::Decompressor::new(reader, 4096));
-                    self.decoder = Some(decoder);
-                }
+                    Box::new(brotli::Decompressor::new(reader, 4096))
+                });
 
-                let decoder = self.decoder.as_mut().unwrap();
                 let bytes_read = decoder.read(buf)?;
 
                 if bytes_read > remaining as usize {
@@ -319,6 +312,14 @@ impl Read for FileEntry {
             CompressionFormat::Brotli => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Brotli support is not enabled. Please enable the 'brotli' feature.",
+            )),
+
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported compression format or broken entry: {:?}",
+                    self.compression
+                ),
             )),
         }
     }

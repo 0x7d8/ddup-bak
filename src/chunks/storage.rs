@@ -78,7 +78,9 @@ impl ChunkStorage for ChunkStorageLocal {
         mut content: Box<dyn std::io::Read + Send>,
     ) -> std::io::Result<()> {
         let path = self.0.join(self.path_from_chunk(chunk));
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
         if path.exists() {
             return Ok(());

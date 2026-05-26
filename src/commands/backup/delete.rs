@@ -3,13 +3,12 @@ use clap::ArgMatches;
 use colored::Colorize;
 use std::sync::Arc;
 
-pub fn delete(matches: &ArgMatches) -> i32 {
+pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(true);
     let name = matches.get_one::<String>("name").expect("required");
 
     if !repository
-        .list_archives()
-        .unwrap()
+        .list_archives()?
         .into_iter()
         .any(|name| name == *name)
     {
@@ -20,7 +19,7 @@ pub fn delete(matches: &ArgMatches) -> i32 {
             "does not exist!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
     println!("{}", "deleting backup...".bright_black());
@@ -31,30 +30,28 @@ pub fn delete(matches: &ArgMatches) -> i32 {
             "\r\x1B[K {} {} {}",
             "dereferencing chunks...".bright_black().italic(),
             spinner.cyan(),
-            progress.text.read().unwrap().cyan()
+            progress.text.read().cyan()
         )
     });
 
-    repository
-        .delete_archive(
-            name,
-            Some({
-                let progress = progress.clone();
+    repository.delete_archive(
+        name,
+        Some({
+            let progress = progress.clone();
 
-                Arc::new(move |chunk, deleted| {
-                    progress.set_text(format!(
-                        "{} {}",
-                        format!("chunk #{chunk}").cyan(),
-                        if deleted {
-                            "(deleted)".green()
-                        } else {
-                            "(not deleted)".red()
-                        }
-                    ));
-                })
-            }),
-        )
-        .unwrap();
+            Arc::new(move |chunk, deleted| {
+                progress.set_text(format!(
+                    "{} {}",
+                    format!("chunk #{chunk}").cyan(),
+                    if deleted {
+                        "(deleted)".green()
+                    } else {
+                        "(not deleted)".red()
+                    }
+                ));
+            })
+        }),
+    )?;
 
     progress.finish();
 
@@ -64,5 +61,5 @@ pub fn delete(matches: &ArgMatches) -> i32 {
         "DONE".green().bold()
     );
 
-    0
+    Ok(0)
 }

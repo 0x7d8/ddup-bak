@@ -1,10 +1,9 @@
-use std::sync::Arc;
-
 use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
+use std::sync::Arc;
 
-pub fn clean(_matches: &ArgMatches) -> i32 {
+pub fn clean(_matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(true);
 
     println!("{}", "cleaning repository...".bright_black());
@@ -15,27 +14,25 @@ pub fn clean(_matches: &ArgMatches) -> i32 {
             "\r\x1B[K {} {} {}",
             "cleaning repository...".bright_black().italic(),
             spinner.cyan(),
-            progress.text.read().unwrap().cyan()
+            progress.text.read().cyan()
         )
     });
 
-    repository
-        .clean(Some({
-            let progress = progress.clone();
+    repository.clean(Some({
+        let progress = progress.clone();
 
-            Arc::new(move |chunk, deleted| {
-                progress.set_text(format!(
-                    "{} {}",
-                    format!("chunk #{chunk}").cyan(),
-                    if deleted {
-                        "(deleted)".green()
-                    } else {
-                        "(not deleted)".red()
-                    }
-                ));
-            })
-        }))
-        .unwrap();
+        Arc::new(move |chunk, deleted| {
+            progress.set_text(format!(
+                "{} {}",
+                format!("chunk #{chunk}").cyan(),
+                if deleted {
+                    "(deleted)".green()
+                } else {
+                    "(not deleted)".red()
+                }
+            ));
+        })
+    }))?;
 
     progress.finish();
 
@@ -45,5 +42,5 @@ pub fn clean(_matches: &ArgMatches) -> i32 {
         "DONE".green().bold()
     );
 
-    0
+    Ok(0)
 }

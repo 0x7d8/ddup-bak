@@ -5,12 +5,13 @@ use flate2::{
     read::{DeflateDecoder, GzDecoder},
     write::{DeflateEncoder, GzEncoder},
 };
+use parking_lot::{Mutex, RwLock};
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock, atomic::AtomicU64},
+    sync::{Arc, atomic::AtomicU64},
 };
 
 mod hasher;
@@ -74,10 +75,10 @@ impl ChunkIndex {
         chunk_size: usize,
         max_chunk_count: usize,
         storage: Arc<dyn storage::ChunkStorage>,
-    ) -> Self {
-        let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap()).unwrap();
+    ) -> std::io::Result<Self> {
+        let lock = lock::RwLock::new(directory.join("index.lock"))?;
 
-        Self {
+        Ok(Self {
             directory,
             storage,
 
@@ -98,7 +99,7 @@ impl ChunkIndex {
 
             chunk_size,
             max_chunk_count,
-        }
+        })
     }
 
     pub fn open(
@@ -111,11 +112,19 @@ impl ChunkIndex {
         let mut buffer = [0; 32];
         decoder.read_exact(&mut buffer)?;
 
-        let deleted_chunks = u64::from_le_bytes(buffer[0..8].try_into().unwrap()) as usize;
-        let chunk_size = u32::from_le_bytes(buffer[8..12].try_into().unwrap()) as usize;
-        let max_chunk_count = u32::from_le_bytes(buffer[12..16].try_into().unwrap()) as usize;
-        let chunk_count = u64::from_le_bytes(buffer[16..24].try_into().unwrap()) as usize;
-        let next_id = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+        fn map_err(_err: std::array::TryFromSliceError) -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Corrupted index file: invalid header",
+            )
+        }
+
+        let deleted_chunks = u64::from_le_bytes(buffer[0..8].try_into().map_err(map_err)?) as usize;
+        let chunk_size = u32::from_le_bytes(buffer[8..12].try_into().map_err(map_err)?) as usize;
+        let max_chunk_count =
+            u32::from_le_bytes(buffer[12..16].try_into().map_err(map_err)?) as usize;
+        let chunk_count = u64::from_le_bytes(buffer[16..24].try_into().map_err(map_err)?) as usize;
+        let next_id = u64::from_le_bytes(buffer[24..32].try_into().map_err(map_err)?);
 
         let mut result_deleted_chunks = VecDeque::with_capacity(deleted_chunks);
         let result_chunks = DashMap::with_capacity_and_hasher_and_shard_amount(
@@ -147,7 +156,7 @@ impl ChunkIndex {
             result_chunk_hashes.insert(buffer, id);
         }
 
-        let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap())?;
+        let lock = lock::RwLock::new(directory.join("index.lock"))?;
 
         Ok(Self {
             directory,
@@ -216,7 +225,7 @@ impl ChunkIndex {
                     continue;
                 }
 
-                let archive = match crate::archive::Archive::open(path.to_str().unwrap()) {
+                let archive = match crate::archive::Archive::open(path) {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
@@ -236,7 +245,7 @@ impl ChunkIndex {
             }
         }
 
-        let lock = lock::RwLock::new(directory.join("index.lock").to_str().unwrap())?;
+        let lock = lock::RwLock::new(directory.join("index.lock"))?;
 
         Ok(Self {
             directory,
@@ -263,7 +272,7 @@ impl ChunkIndex {
             return None;
         }
 
-        let deleted_count = u64::from_le_bytes(buffer[0..8].try_into().unwrap()) as usize;
+        let deleted_count = u64::from_le_bytes(buffer[0..8].try_into().ok()?) as usize;
 
         for _ in 0..deleted_count {
             let mut one_byte = [0u8; 1];
@@ -336,7 +345,7 @@ impl ChunkIndex {
             let file = File::create(&tmp_path)?;
             let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
 
-            let deleted_chunks = self.deleted_chunks.lock().unwrap();
+            let deleted_chunks = self.deleted_chunks.lock();
 
             encoder.write_all(&(deleted_chunks.len() as u64).to_le_bytes())?;
             encoder.write_all(&(self.chunk_size as u32).to_le_bytes())?;
@@ -420,7 +429,7 @@ impl ChunkIndex {
             deleted_ids.push(id);
         }
 
-        let mut deleted_chunks = self.deleted_chunks.lock().unwrap();
+        let mut deleted_chunks = self.deleted_chunks.lock();
         for id in deleted_ids {
             deleted_chunks.push_back(id);
         }
@@ -447,7 +456,7 @@ impl ChunkIndex {
             self.chunk_hashes.remove(&chunk);
 
             self.storage.delete_chunk_content(&chunk).ok()?;
-            self.deleted_chunks.lock().unwrap().push_back(chunk_id);
+            self.deleted_chunks.lock().push_back(chunk_id);
 
             return Some(true);
         }
@@ -472,7 +481,7 @@ impl ChunkIndex {
 
         let mut compression_bytes = [0; 1];
         reader.read_exact(&mut compression_bytes)?;
-        let compression = CompressionFormat::decode(compression_bytes[0]);
+        let compression = CompressionFormat::try_decode(compression_bytes[0])?;
 
         match compression {
             CompressionFormat::None => Ok(reader),
@@ -496,7 +505,7 @@ impl ChunkIndex {
 
     #[inline]
     fn next_id(&self) -> u64 {
-        if let Some(id) = self.deleted_chunks.lock().unwrap().pop_front() {
+        if let Some(id) = self.deleted_chunks.lock().pop_front() {
             return id;
         }
 
@@ -686,18 +695,17 @@ impl ChunkIndex {
 
             let handle = std::thread::spawn(move || {
                 loop {
-                    let (idx, start, end) =
-                        if let Some(chunk) = chunk_queue.lock().unwrap().pop_front() {
-                            chunk
-                        } else {
-                            break;
-                        };
+                    let (idx, start, end) = if let Some(chunk) = chunk_queue.lock().pop_front() {
+                        chunk
+                    } else {
+                        break;
+                    };
 
-                    if error.read().unwrap().is_some() {
+                    if error.read().is_some() {
                         continue;
                     }
 
-                    let result = (|| {
+                    let run = || {
                         let mut file = File::open(&path)?;
                         file.seek(SeekFrom::Start(start as u64))?;
 
@@ -725,14 +733,14 @@ impl ChunkIndex {
                         let chunk_id = self_clone.add_chunk(&hash_array, &buffer, compression)?;
 
                         Ok((idx, chunk_id, hash_array))
-                    })();
+                    };
 
-                    match result {
+                    match run() {
                         Ok(data) => {
-                            results.lock().unwrap().push(data);
+                            results.lock().push(data);
                         }
                         Err(e) => {
-                            *error.write().unwrap() = Some(e);
+                            *error.write() = Some(e);
                         }
                     }
                 }
@@ -749,11 +757,11 @@ impl ChunkIndex {
             }
         }
 
-        if let Some(err) = error.write().unwrap().take() {
+        if let Some(err) = error.write().take() {
             return Err(err);
         }
 
-        let mut results_lock = results.lock().unwrap();
+        let mut results_lock = results.lock();
         if results_lock.len() != expected_chunks {
             return Err(std::io::Error::other(format!(
                 "Missing chunks: got {} out of {}",

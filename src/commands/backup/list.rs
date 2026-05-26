@@ -2,12 +2,12 @@ use crate::commands::open_repository;
 use clap::ArgMatches;
 use colored::Colorize;
 
-pub fn list(_matches: &ArgMatches) -> i32 {
+pub fn list(_matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(false);
 
     println!("{}", "listing backups...".bright_black());
 
-    let list = repository.list_archives().unwrap();
+    let list = repository.list_archives()?;
 
     println!(
         "{} {}",
@@ -18,7 +18,7 @@ pub fn list(_matches: &ArgMatches) -> i32 {
     if list.is_empty() {
         println!();
         println!("{}", "no backups found".red());
-        return 1;
+        return Ok(1);
     }
 
     println!();
@@ -27,5 +27,5 @@ pub fn list(_matches: &ArgMatches) -> i32 {
         println!("{}", backup.cyan().bold().underline());
     }
 
-    0
+    Ok(0)
 }

@@ -3,7 +3,7 @@ use clap::ArgMatches;
 use colored::Colorize;
 use std::{path::Path, sync::Arc};
 
-pub fn create(matches: &ArgMatches) -> i32 {
+pub fn create(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(true);
     let name = matches.get_one::<String>("name").expect("required");
     let directory = matches.get_one::<String>("directory");
@@ -18,8 +18,7 @@ pub fn create(matches: &ArgMatches) -> i32 {
     };
 
     if repository
-        .list_archives()
-        .unwrap()
+        .list_archives()?
         .into_iter()
         .any(|backup| backup == *name)
     {
@@ -30,7 +29,7 @@ pub fn create(matches: &ArgMatches) -> i32 {
             "already exists!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
     println!("{}", "creating backup...".bright_black());
@@ -41,31 +40,29 @@ pub fn create(matches: &ArgMatches) -> i32 {
             "\r\x1B[K {} {} {}",
             "chunking...".bright_black().italic(),
             spinner.cyan(),
-            progress.text.read().unwrap().cyan()
+            progress.text.read().cyan()
         )
     });
 
-    repository
-        .create_archive(
-            name,
-            directory.map(|d| {
-                ignore::WalkBuilder::new(Path::new(d))
-                    .follow_links(false)
-                    .git_global(false)
-                    .build()
-            }),
-            directory.map(Path::new),
-            Some({
-                let progress = progress.clone();
+    repository.create_archive(
+        name,
+        directory.map(|d| {
+            ignore::WalkBuilder::new(Path::new(d))
+                .follow_links(false)
+                .git_global(false)
+                .build()
+        }),
+        directory.map(Path::new),
+        Some({
+            let progress = progress.clone();
 
-                Arc::new(move |file| {
-                    progress.set_text(file.to_string_lossy());
-                })
-            }),
-            Some(Arc::new(move |_, _| compression)),
-            *threads,
-        )
-        .unwrap();
+            Arc::new(move |file| {
+                progress.set_text(file.to_string_lossy());
+            })
+        }),
+        Some(Arc::new(move |_, _| compression)),
+        *threads,
+    )?;
 
     progress.finish();
 
@@ -75,5 +72,5 @@ pub fn create(matches: &ArgMatches) -> i32 {
         "DONE".green().bold()
     );
 
-    0
+    Ok(0)
 }

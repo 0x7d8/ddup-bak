@@ -201,8 +201,8 @@ fn render_entry(
     };
 
     let (uid, gid) = entry.owner();
-    let username = users.get(&uid).unwrap();
-    let groupname = groups.get(&gid).unwrap();
+    let username = users.get(&uid).expect("user should exist");
+    let groupname = groups.get(&gid).expect("group should exist");
 
     let perms = render_unix_permissions(entry.mode());
     let time_str = format_time(entry.mtime());
@@ -282,7 +282,7 @@ fn render_entry(
     }
 }
 
-fn render_entries(mut entries: Vec<&Entry>) {
+fn render_entries(mut entries: Vec<&Entry>) -> std::io::Result<()> {
     let mut users = HashMap::new();
     let mut groups = HashMap::new();
 
@@ -312,17 +312,18 @@ fn render_entries(mut entries: Vec<&Entry>) {
             &groups,
         );
 
-        lock.write_all(rendered_entry.as_bytes()).unwrap();
+        lock.write_all(rendered_entry.as_bytes())?;
     }
+
+    Ok(())
 }
 
-pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
+pub fn ls(name: &str, matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository(false);
     let path = matches.get_one::<String>("path");
 
     if !repository
-        .list_archives()
-        .unwrap()
+        .list_archives()?
         .into_iter()
         .any(|name| name == *name)
     {
@@ -333,10 +334,10 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
             "does not exist!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
-    let archive = repository.get_archive(name).unwrap();
+    let archive = repository.get_archive(name)?;
 
     let path = Path::new(path.map_or(".", |s| s.as_str()));
     if let Some(entry) = archive.find_archive_entry(path) {
@@ -368,7 +369,7 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
             )
         );
 
-        render_entries(entries);
+        render_entries(entries)?;
     } else if path.components().all(|c| c.as_os_str() == ".") {
         println!(
             "total {} entries, {}",
@@ -386,7 +387,7 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
             )
         );
 
-        render_entries(archive.entries().iter().collect::<Vec<_>>());
+        render_entries(archive.entries().iter().collect::<Vec<_>>())?;
     } else {
         println!(
             "{} {}",
@@ -394,8 +395,8 @@ pub fn ls(name: &str, matches: &ArgMatches) -> i32 {
             "does not exist!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
-    0
+    Ok(0)
 }

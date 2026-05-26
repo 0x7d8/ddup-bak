@@ -39,13 +39,16 @@ impl CompressionFormat {
         }
     }
 
-    pub const fn decode(value: u8) -> Self {
+    pub fn try_decode(value: u8) -> std::io::Result<Self> {
         match value {
-            0 => CompressionFormat::None,
-            1 => CompressionFormat::Gzip,
-            2 => CompressionFormat::Deflate,
-            3 => CompressionFormat::Brotli,
-            _ => panic!("Invalid compression format"),
+            0 => Ok(CompressionFormat::None),
+            1 => Ok(CompressionFormat::Gzip),
+            2 => Ok(CompressionFormat::Deflate),
+            3 => Ok(CompressionFormat::Brotli),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid compression format",
+            )),
         }
     }
 }
@@ -127,30 +130,30 @@ impl Archive {
     /// Creates a new archive file.
     /// The file signature is written to the beginning of the file.
     /// The file is truncated to 0 bytes.
-    pub fn new(mut file: File) -> Self {
-        file.set_len(0).unwrap();
-        file.write_all(&FILE_SIGNATURE).unwrap();
-        file.write_all(&[FILE_VERSION]).unwrap();
-        file.sync_all().unwrap();
+    pub fn new(mut file: File) -> std::io::Result<Self> {
+        file.set_len(0)?;
+        file.write_all(&FILE_SIGNATURE)?;
+        file.write_all(&[FILE_VERSION])?;
+        file.sync_all()?;
 
-        Self {
+        Ok(Self {
             file: Arc::new(file),
             version: FILE_VERSION,
             compression_callback: None,
             real_size_callback: None,
             entries: Vec::new(),
             entries_offset: 8,
-        }
+        })
     }
 
     /// Opens an existing archive file for reading and writing.
     /// This will not overwrite the file, but append to it.
-    pub fn open(path: &str) -> std::io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::open_with_limits(path, DecodeLimits::default())
     }
 
     /// Opens an existing archive file with custom decode limits.
-    pub fn open_with_limits(path: &str, limits: DecodeLimits) -> std::io::Result<Self> {
+    pub fn open_with_limits(path: impl AsRef<Path>, limits: DecodeLimits) -> std::io::Result<Self> {
         let file = File::open(path)?;
         Self::open_file_with_limits(file, limits)
     }
@@ -593,7 +596,7 @@ impl Archive {
         let mtime = entry
             .mtime()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
+            .unwrap_or_default();
         writer.write_all(&varint::encode_u64(mtime.as_secs()))?;
 
         match entry {
@@ -630,14 +633,17 @@ impl Archive {
         progress: ProgressCallback,
     ) -> std::io::Result<()> {
         let path = fs_entry.path();
+        let Some(file_name) = path.file_name() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid file name",
+            ));
+        };
 
-        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
         let metadata = path.symlink_metadata()?;
 
         if metadata.is_file() {
             let mut file = File::open(&path)?;
-            let mut buffer = [0; 4096];
-            let mut bytes_read = file.read(&mut buffer)?;
 
             let compression = match self.compression_callback {
                 Some(ref f) => f(&path, &metadata),
@@ -652,28 +658,14 @@ impl Archive {
 
             match compression {
                 CompressionFormat::None => {
-                    loop {
-                        self.file.write_all(&buffer[..bytes_read])?;
-
-                        bytes_read = file.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                    }
+                    std::io::copy(&mut file, &mut self.file)?;
 
                     self.file.flush()?;
                 }
                 CompressionFormat::Gzip => {
                     let mut encoder =
                         GzEncoder::new(&mut self.file, flate2::Compression::default());
-                    loop {
-                        encoder.write_all(&buffer[..bytes_read])?;
-
-                        bytes_read = file.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                    }
+                    std::io::copy(&mut file, &mut encoder)?;
 
                     encoder.flush()?;
                     encoder.finish()?;
@@ -681,14 +673,7 @@ impl Archive {
                 CompressionFormat::Deflate => {
                     let mut encoder =
                         DeflateEncoder::new(&mut self.file, flate2::Compression::default());
-                    loop {
-                        encoder.write_all(&buffer[..bytes_read])?;
-
-                        bytes_read = file.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                    }
+                    std::io::copy(&mut file, &mut encoder)?;
 
                     encoder.flush()?;
                     encoder.finish()?;
@@ -697,14 +682,7 @@ impl Archive {
                 #[cfg(feature = "brotli")]
                 CompressionFormat::Brotli => {
                     let mut encoder = brotli::CompressorWriter::new(&mut self.file, 4096, 11, 22);
-                    loop {
-                        encoder.write_all(&buffer[..bytes_read])?;
-
-                        bytes_read = file.read(&mut buffer)?;
-                        if bytes_read == 0 {
-                            break;
-                        }
-                    }
+                    std::io::copy(&mut file, &mut encoder)?;
                 }
                 #[cfg(not(feature = "brotli"))]
                 CompressionFormat::Brotli => {
@@ -716,7 +694,7 @@ impl Archive {
             }
 
             let entry = entries::FileEntry {
-                name: file_name,
+                name: file_name.to_string_lossy().into(),
                 mode: metadata.permissions().into(),
                 file: self.file.clone(),
                 owner: metadata_owner(&metadata),
@@ -750,7 +728,7 @@ impl Archive {
             }
 
             let dir_entry = entries::DirectoryEntry {
-                name: file_name,
+                name: file_name.to_string_lossy().into(),
                 mode: metadata.permissions().into(),
                 owner: metadata_owner(&metadata),
                 mtime: metadata.modified()?,
@@ -769,7 +747,7 @@ impl Archive {
             let target = target.to_string_lossy().to_string();
 
             let link_entry = entries::SymlinkEntry {
-                name: file_name,
+                name: file_name.to_string_lossy().into(),
                 mode: metadata.permissions().into(),
                 owner: metadata_owner(&metadata),
                 mtime: metadata.modified()?,
@@ -820,7 +798,8 @@ impl Archive {
         let type_compression_mode = u32::from_le_bytes(type_mode_bytes);
 
         let entry_type = (type_compression_mode >> 30) & 0b11;
-        let compression = CompressionFormat::decode(((type_compression_mode >> 26) & 0b1111) as u8);
+        let compression =
+            CompressionFormat::try_decode(((type_compression_mode >> 26) & 0b1111) as u8)?;
         let mode = EntryMode::from(type_compression_mode & 0x3FFFFFFF);
 
         let uid = varint::decode_u32(decoder)?;

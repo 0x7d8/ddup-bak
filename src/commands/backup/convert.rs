@@ -10,7 +10,7 @@ enum Format {
     Ddup,
 }
 
-pub fn convert(matches: &ArgMatches) -> i32 {
+pub fn convert(matches: &ArgMatches) -> std::io::Result<i32> {
     let mut repository = open_repository(false);
 
     let name = matches.get_one::<String>("name").expect("required");
@@ -24,8 +24,7 @@ pub fn convert(matches: &ArgMatches) -> i32 {
     };
 
     if !repository
-        .list_archives()
-        .unwrap()
+        .list_archives()?
         .into_iter()
         .any(|archive_name| archive_name == *name)
     {
@@ -36,10 +35,10 @@ pub fn convert(matches: &ArgMatches) -> i32 {
             "does not exist!".red()
         );
 
-        return 1;
+        return Ok(1);
     }
 
-    let archive = repository.get_archive(name).unwrap();
+    let archive = repository.get_archive(name)?;
 
     if let Some(output) = output {
         println!("{}", "converting backup...".bright_black());
@@ -76,7 +75,7 @@ pub fn convert(matches: &ArgMatches) -> i32 {
             )
         });
 
-        let file = File::create(output).unwrap();
+        let file = File::create(output)?;
 
         convert_entries_file(
             &mut repository,
@@ -84,7 +83,7 @@ pub fn convert(matches: &ArgMatches) -> i32 {
             file,
             Some(&progress),
             format,
-        );
+        )?;
 
         progress.finish();
 
@@ -102,10 +101,10 @@ pub fn convert(matches: &ArgMatches) -> i32 {
             output,
             None,
             format,
-        );
+        )?;
     }
 
-    0
+    Ok(0)
 }
 
 fn convert_entries<S: Write + 'static>(
@@ -114,7 +113,7 @@ fn convert_entries<S: Write + 'static>(
     output: S,
     progress: Option<&Progress>,
     format: Format,
-) {
+) -> std::io::Result<()> {
     match format {
         Format::Tar | Format::TarGz => {
             let output: Box<dyn Write + 'static> = match format {
@@ -130,13 +129,15 @@ fn convert_entries<S: Write + 'static>(
             tar.mode(tar::HeaderMode::Complete);
 
             for entry in entries {
-                tar_recursive_convert_entries(entry, repository, &mut tar, progress, "");
+                tar_recursive_convert_entries(entry, repository, &mut tar, progress, "")?;
             }
 
-            tar.finish().unwrap();
+            tar.finish()?;
         }
         _ => unimplemented!(),
     }
+
+    Ok(())
 }
 
 fn convert_entries_file(
@@ -145,7 +146,7 @@ fn convert_entries_file(
     output: File,
     progress: Option<&Progress>,
     format: Format,
-) {
+) -> std::io::Result<()> {
     match format {
         Format::Tar | Format::TarGz => {
             let output: Box<dyn Write + 'static> = match format {
@@ -161,21 +162,23 @@ fn convert_entries_file(
             tar.mode(tar::HeaderMode::Complete);
 
             for entry in entries {
-                tar_recursive_convert_entries(entry, repository, &mut tar, progress, "");
+                tar_recursive_convert_entries(entry, repository, &mut tar, progress, "")?;
             }
 
-            tar.finish().unwrap();
+            tar.finish()?;
         }
         Format::Ddup => {
-            let mut archive = ddup_bak::archive::Archive::new(output);
+            let mut archive = ddup_bak::archive::Archive::new(output)?;
 
             for entry in entries {
-                ddup_recursive_convert_entries(entry, repository, &mut archive, progress, None);
+                ddup_recursive_convert_entries(entry, repository, &mut archive, progress, None)?;
             }
 
-            archive.write_end_header().unwrap();
+            archive.write_end_header()?;
         }
     }
+
+    Ok(())
 }
 
 fn tar_recursive_convert_entries(
@@ -184,7 +187,7 @@ fn tar_recursive_convert_entries(
     archive: &mut tar::Builder<Box<dyn Write>>,
     progress: Option<&Progress>,
     parent_path: &str,
-) {
+) -> std::io::Result<()> {
     match entry {
         Entry::Directory(entries) => {
             let path = if parent_path.is_empty() {
@@ -202,7 +205,7 @@ fn tar_recursive_convert_entries(
                 entries
                     .mtime
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
             );
             entry_header.set_entry_type(tar::EntryType::Directory);
@@ -213,16 +216,14 @@ fn tar_recursive_convert_entries(
                 format!("{path}/")
             };
 
-            archive
-                .append_data(&mut entry_header, &dir_path, std::io::empty())
-                .unwrap();
+            archive.append_data(&mut entry_header, &dir_path, std::io::empty())?;
 
             if let Some(progress) = progress {
                 progress.incr(1usize);
             }
 
             for entry in entries.entries {
-                tar_recursive_convert_entries(entry, repository, archive, progress, &path);
+                tar_recursive_convert_entries(entry, repository, archive, progress, &path)?;
             }
         }
         Entry::File(file) => {
@@ -240,17 +241,15 @@ fn tar_recursive_convert_entries(
             entry_header.set_mtime(
                 file.mtime
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
             );
             entry_header.set_entry_type(tar::EntryType::Regular);
             entry_header.set_size(file.size_real);
 
-            let reader = repository.entry_reader(Entry::File(file.clone())).unwrap();
+            let reader = repository.entry_reader(Entry::File(file.clone()))?;
 
-            archive
-                .append_data(&mut entry_header, &path, reader)
-                .unwrap();
+            archive.append_data(&mut entry_header, &path, reader)?;
 
             if let Some(progress) = progress {
                 progress.incr(1usize);
@@ -271,20 +270,20 @@ fn tar_recursive_convert_entries(
             entry_header.set_mtime(
                 link.mtime
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs(),
             );
             entry_header.set_entry_type(tar::EntryType::Symlink);
 
-            archive
-                .append_link(&mut entry_header, &path, &link.target)
-                .unwrap();
+            archive.append_link(&mut entry_header, &path, &link.target)?;
 
             if let Some(progress) = progress {
                 progress.incr(1usize);
             }
         }
     }
+
+    Ok(())
 }
 
 fn ddup_recursive_convert_entries(
@@ -293,7 +292,7 @@ fn ddup_recursive_convert_entries(
     archive: &mut ddup_bak::archive::Archive,
     progress: Option<&Progress>,
     parent_entry: Option<&mut ddup_bak::archive::entries::DirectoryEntry>,
-) {
+) -> std::io::Result<()> {
     match entry {
         Entry::Directory(directory) => {
             let mut dir_entry = ddup_bak::archive::entries::DirectoryEntry {
@@ -315,7 +314,7 @@ fn ddup_recursive_convert_entries(
                     archive,
                     progress,
                     Some(&mut dir_entry),
-                );
+                )?;
             }
 
             if let Some(parent) = parent_entry {
@@ -325,17 +324,15 @@ fn ddup_recursive_convert_entries(
             }
         }
         Entry::File(file) => {
-            let file_entry = archive
-                .write_file_entry(
-                    repository.entry_reader(Entry::File(file.clone())).unwrap(),
-                    None,
-                    file.name,
-                    file.mode,
-                    file.mtime,
-                    file.owner,
-                    ddup_bak::archive::CompressionFormat::Deflate,
-                )
-                .unwrap();
+            let file_entry = archive.write_file_entry(
+                repository.entry_reader(Entry::File(file.clone()))?,
+                None,
+                file.name,
+                file.mode,
+                file.mtime,
+                file.owner,
+                ddup_bak::archive::CompressionFormat::Deflate,
+            )?;
 
             if let Some(parent) = parent_entry {
                 parent.entries.push(Entry::File(file_entry));
@@ -359,4 +356,6 @@ fn ddup_recursive_convert_entries(
             }
         }
     }
+
+    Ok(())
 }

@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "ddup-bak"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "atomicwrites",
  "blake2",
@@ -387,6 +387,7 @@ dependencies = [
  "clap 4.5.37",
  "colored",
  "dashmap",
+ "fastcdc",
  "flate2",
  "ignore",
  "libc",
@@ -422,6 +423,12 @@ dependencies = [
  "libc",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "fastcdc"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
 
 [[package]]
 name = "fastrand"

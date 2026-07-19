@@ -24,7 +24,7 @@ fn cli() -> Command {
                 )
                 .arg(
                     Arg::new("chunk_size")
-                        .help("The chunk size to use for the repository (bytes)")
+                        .help("The average chunk size to target for the repository (bytes). Boundaries are content-defined, so actual chunk sizes vary around this")
                         .short('c')
                         .long("chunk-size")
                         .num_args(1)
@@ -34,7 +34,7 @@ fn cli() -> Command {
                 )
                 .arg(
                     Arg::new("max_chunk_count")
-                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value, 0 means no limit")
+                        .help("A soft cap on the chunk count for individual files. If the expected count exceeds it, the average chunk size is doubled until it fits. Content-defined boundaries mean this cannot be an exact limit. 0 means no limit")
                         .short('m')
                         .long("max-chunk-count")
                         .num_args(1)
@@ -56,7 +56,7 @@ fn cli() -> Command {
                 )
                 .arg(
                     Arg::new("chunk_size")
-                        .help("The chunk size to use for the repository (bytes)")
+                        .help("The average chunk size to target for the repository (bytes). Boundaries are content-defined, so actual chunk sizes vary around this")
                         .short('c')
                         .long("chunk-size")
                         .num_args(1)
@@ -66,7 +66,7 @@ fn cli() -> Command {
                 )
                 .arg(
                     Arg::new("max_chunk_count")
-                        .help("The max chunk count to allow for individual files, if exceeded, chunk size will be halfed until count is below this value, 0 means no limit")
+                        .help("A soft cap on the chunk count for individual files. If the expected count exceeds it, the average chunk size is doubled until it fits. Content-defined boundaries mean this cannot be an exact limit. 0 means no limit")
                         .short('m')
                         .long("max-chunk-count")
                         .num_args(1)

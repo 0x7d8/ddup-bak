@@ -5,11 +5,12 @@ use flate2::{
     read::{DeflateDecoder, GzDecoder},
     write::{DeflateEncoder, GzEncoder},
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{BufReader, Cursor, Read, Write},
     path::PathBuf,
     sync::{Arc, atomic::AtomicU64},
 };
@@ -58,15 +59,11 @@ impl Clone for ChunkIndex {
     }
 }
 
-fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut total = 0;
-    while total < buf.len() {
-        match reader.read(&mut buf[total..])? {
-            0 => break,
-            n => total += n,
-        }
+fn map_cdc_error(err: fastcdc::v2020::Error) -> std::io::Error {
+    match err {
+        fastcdc::v2020::Error::IoError(err) => err,
+        other => std::io::Error::other(other.to_string()),
     }
-    Ok(total)
 }
 
 impl ChunkIndex {
@@ -317,18 +314,15 @@ impl ChunkIndex {
     ) {
         for entry in entries {
             match entry {
-                crate::archive::entries::Entry::File(mut file_entry) => loop {
-                    let old_chunk_id = varint::decode_u64(&mut file_entry);
-                    let Ok(old_chunk_id) = old_chunk_id else {
-                        break;
-                    };
-
-                    if let Some(&new_id) = old_to_new_id.get(&old_chunk_id)
-                        && let Some(mut e) = chunks.get_mut(&new_id)
-                    {
-                        e.value_mut().1 += 1;
+                crate::archive::entries::Entry::File(mut file_entry) => {
+                    while let Ok(Some(old_chunk_id)) = varint::decode_u64_opt(&mut file_entry) {
+                        if let Some(&new_id) = old_to_new_id.get(&old_chunk_id)
+                            && let Some(mut e) = chunks.get_mut(&new_id)
+                        {
+                            e.value_mut().1 += 1;
+                        }
                     }
-                },
+                }
                 crate::archive::entries::Entry::Directory(dir_entry) => {
                     Self::walk_archive_entries_for_refs(dir_entry.entries, old_to_new_id, chunks);
                 }
@@ -569,76 +563,50 @@ impl ChunkIndex {
         Ok(id)
     }
 
+    fn cdc_parameters(&self, len: usize) -> (usize, usize, usize) {
+        let mut avg = self.chunk_size.max(1);
+
+        if self.max_chunk_count > 0 {
+            while len.div_ceil(avg) > self.max_chunk_count && avg < fastcdc::v2020::AVERAGE_MAX {
+                avg = avg.saturating_mul(2);
+            }
+        }
+
+        let avg = avg.clamp(fastcdc::v2020::AVERAGE_MIN, fastcdc::v2020::AVERAGE_MAX);
+        let min = (avg / 4).clamp(fastcdc::v2020::MINIMUM_MIN, fastcdc::v2020::MINIMUM_MAX);
+        let max = (avg * 4).clamp(fastcdc::v2020::MAXIMUM_MIN, fastcdc::v2020::MAXIMUM_MAX);
+
+        (min, avg, max)
+    }
+
     pub fn chunk_file(
         &self,
         path: &PathBuf,
         compression: CompressionFormat,
-        scope: Option<&rayon::Scope<'_>>,
     ) -> std::io::Result<Vec<u64>> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
 
-        let mut chunk_size = self.chunk_size;
-        let mut chunk_count = len.div_ceil(chunk_size);
-        let mut chunk_threshold = 50;
-        if self.max_chunk_count > 0 {
-            while chunk_count > self.max_chunk_count {
-                chunk_count /= 2;
-                chunk_size *= 2;
-            }
+        let (min_size, avg_size, max_size) = self.cdc_parameters(len);
+        let estimated = len.div_ceil(avg_size);
 
-            chunk_threshold = self.max_chunk_count / 2;
-        }
+        let batch_size = rayon::current_num_threads().max(1) * 2;
 
-        chunk_count = len.div_ceil(chunk_size);
+        let mut chunk_ids = Vec::with_capacity(estimated);
+        let mut chunks = Vec::with_capacity(estimated);
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
 
-        if chunk_count > chunk_threshold
-            && let Some(scope) = scope
+        for chunk in
+            fastcdc::v2020::StreamCDC::new(BufReader::new(file), min_size, avg_size, max_size)
         {
-            let path = path.clone();
-            let self_clone = self.clone();
+            batch.push(chunk.map_err(map_cdc_error)?.data);
 
-            let (sender, receiver) = std::sync::mpsc::channel();
-
-            scope.spawn(move |_| {
-                match self_clone.chunk_file_parallel(&path, compression, chunk_size, chunk_count) {
-                    Ok(chunk_ids) => {
-                        let _ = sender.send(Ok(chunk_ids));
-                    }
-                    Err(e) => {
-                        let _ = sender.send(Err(e));
-                    }
-                }
-            });
-
-            return match receiver.recv() {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::other(
-                    "Failed to receive result from parallel chunking task",
-                )),
-            };
-        }
-
-        let mut file = File::open(path)?;
-        let mut chunks = Vec::with_capacity(chunk_count);
-        let mut chunk_ids = Vec::with_capacity(chunk_count);
-        let mut buffer = vec![0; chunk_size];
-        let mut hasher = Blake2b::<U32>::new();
-
-        loop {
-            let bytes_read = read_full(&mut file, &mut buffer)?;
-            if bytes_read == 0 {
-                break;
+            if batch.len() >= batch_size {
+                self.store_batch(&mut batch, compression, &mut chunk_ids, &mut chunks)?;
             }
-
-            hasher.update(&buffer[..bytes_read]);
-            let hash = hasher.finalize_reset();
-            let mut hash_array = [0; 32];
-            hash_array.copy_from_slice(&hash);
-
-            chunk_ids.push(self.add_chunk(&hash_array, &buffer[..bytes_read], compression)?);
-            chunks.push(hash_array);
         }
+
+        self.store_batch(&mut batch, compression, &mut chunk_ids, &mut chunks)?;
 
         for (i, chunk_id) in chunk_ids.iter().enumerate() {
             let mut entry = self
@@ -652,144 +620,37 @@ impl ChunkIndex {
         Ok(chunk_ids)
     }
 
-    fn chunk_file_parallel(
+    fn store_batch(
         &self,
-        path: &PathBuf,
+        batch: &mut Vec<Vec<u8>>,
         compression: CompressionFormat,
-        chunk_size: usize,
-        chunk_count: usize,
-    ) -> std::io::Result<Vec<u64>> {
-        let file_size = std::fs::metadata(path)?.len() as usize;
-
-        let mut chunk_boundaries = VecDeque::with_capacity(chunk_count);
-        for i in 0..chunk_count {
-            let start = i * chunk_size;
-            let end = if i == chunk_count - 1 {
-                file_size
-            } else {
-                (i + 1) * chunk_size
-            };
-
-            if start < file_size {
-                chunk_boundaries.push_back((i, start, end.min(file_size)));
-            }
+        chunk_ids: &mut Vec<u64>,
+        chunks: &mut Vec<ChunkHash>,
+    ) -> std::io::Result<()> {
+        if batch.is_empty() {
+            return Ok(());
         }
 
-        let expected_chunks = chunk_boundaries.len();
+        let stored = batch
+            .par_iter()
+            .map(|data| {
+                let mut hasher = Blake2b::<U32>::new();
+                hasher.update(data);
 
-        let threads = rayon::current_num_threads();
-        let pool_size = threads.min(expected_chunks);
-        let path = path.clone();
+                let mut hash = [0; 32];
+                hash.copy_from_slice(&hasher.finalize());
 
-        let chunk_queue = Arc::new(Mutex::new(chunk_boundaries));
-        let results = Arc::new(Mutex::new(Vec::with_capacity(expected_chunks)));
-        let error = Arc::new(RwLock::new(None));
+                Ok((self.add_chunk(&hash, data, compression)?, hash))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
 
-        let mut handles = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let chunk_queue = Arc::clone(&chunk_queue);
-            let results = Arc::clone(&results);
-            let error = Arc::clone(&error);
-            let path = path.clone();
-            let self_clone = self.clone();
-
-            let handle = std::thread::spawn(move || {
-                loop {
-                    let (idx, start, end) = if let Some(chunk) = chunk_queue.lock().pop_front() {
-                        chunk
-                    } else {
-                        break;
-                    };
-
-                    if error.read().is_some() {
-                        continue;
-                    }
-
-                    let run = || {
-                        let mut file = File::open(&path)?;
-                        file.seek(SeekFrom::Start(start as u64))?;
-
-                        let size = end - start;
-                        let mut buffer = vec![0; size];
-
-                        let bytes_read = read_full(&mut file, &mut buffer)?;
-
-                        if bytes_read == 0 && start < file_size {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!("Read 0 bytes at position {start} (expected up to {size})"),
-                            ));
-                        }
-
-                        buffer.truncate(bytes_read);
-
-                        let mut hasher = Blake2b::<U32>::new();
-                        hasher.update(&buffer);
-                        let hash = hasher.finalize();
-
-                        let mut hash_array = [0; 32];
-                        hash_array.copy_from_slice(&hash);
-
-                        let chunk_id = self_clone.add_chunk(&hash_array, &buffer, compression)?;
-
-                        Ok((idx, chunk_id, hash_array))
-                    };
-
-                    match run() {
-                        Ok(data) => {
-                            results.lock().push(data);
-                        }
-                        Err(e) => {
-                            *error.write() = Some(e);
-                        }
-                    }
-                }
-            });
-
-            handles.push(handle);
+        for (chunk_id, hash) in stored {
+            chunk_ids.push(chunk_id);
+            chunks.push(hash);
         }
 
-        for (i, handle) in handles.into_iter().enumerate() {
-            if let Err(e) = handle.join() {
-                return Err(std::io::Error::other(format!(
-                    "Worker thread {i} panicked: {e:?}"
-                )));
-            }
-        }
+        batch.clear();
 
-        if let Some(err) = error.write().take() {
-            return Err(err);
-        }
-
-        let mut results_lock = results.lock();
-        if results_lock.len() != expected_chunks {
-            return Err(std::io::Error::other(format!(
-                "Missing chunks: got {} out of {}",
-                results_lock.len(),
-                expected_chunks
-            )));
-        }
-
-        results_lock.sort_by_key(|(idx, _, _)| *idx);
-
-        let mut chunk_ids = Vec::with_capacity(results_lock.len());
-        let mut chunks = Vec::with_capacity(results_lock.len());
-
-        for (_, chunk_id, hash) in results_lock.iter() {
-            chunk_ids.push(*chunk_id);
-            chunks.push(*hash);
-        }
-        drop(results_lock);
-
-        for (i, chunk_id) in chunk_ids.iter().enumerate() {
-            let mut entry = self
-                .chunks
-                .entry(*chunk_id)
-                .or_insert_with(|| (chunks[i], 0));
-
-            entry.1 += 1;
-        }
-
-        Ok(chunk_ids)
+        Ok(())
     }
 }

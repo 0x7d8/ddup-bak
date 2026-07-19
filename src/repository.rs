@@ -235,7 +235,6 @@ impl Repository {
         root_path: &Path,
         progress_chunking: ProgressCallback,
         compression_callback: CompressionFormatCallback,
-        scope: &rayon::Scope,
         error: Arc<RwLock<Option<std::io::Error>>>,
     ) -> std::io::Result<()> {
         let path = entry.path().strip_prefix(root_path).map_err(|_| {
@@ -262,8 +261,7 @@ impl Repository {
                 .map(|f| f(path, &metadata))
                 .unwrap_or(CompressionFormat::Deflate);
 
-            let chunks =
-                chunk_index.chunk_file(&entry.path().to_path_buf(), compression, Some(scope))?;
+            let chunks = chunk_index.chunk_file(&entry.path().to_path_buf(), compression)?;
 
             let mut chunk_content = Vec::new();
             for id in chunks {
@@ -445,7 +443,7 @@ impl Repository {
                     let progress_chunking = progress_chunking.clone();
                     let compression_callback = compression_callback.clone();
 
-                    move |scope| {
+                    move |_| {
                         if let Err(err) = Self::recursive_create_archive(
                             archive,
                             &chunk_index,
@@ -454,7 +452,6 @@ impl Repository {
                             directory_root,
                             progress_chunking,
                             compression_callback,
-                            scope,
                             Arc::clone(&error),
                         ) {
                             let mut error = error.write();
@@ -489,12 +486,7 @@ impl Repository {
     ) -> std::io::Result<()> {
         match entry {
             Entry::File(mut file_entry) => {
-                loop {
-                    let chunk_id = crate::varint::decode_u64(&mut file_entry);
-                    let Ok(chunk_id) = chunk_id else {
-                        break;
-                    };
-
+                while let Some(chunk_id) = crate::varint::decode_u64_opt(&mut file_entry)? {
                     let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
 
                     std::io::copy(&mut chunk, stream)?;
@@ -531,12 +523,7 @@ impl Repository {
             Entry::File(mut file_entry) => {
                 let mut file = File::create(&path)?;
 
-                loop {
-                    let chunk_id = crate::varint::decode_u64(&mut file_entry)?;
-                    if chunk_id == 0 {
-                        break;
-                    }
-
+                while let Some(chunk_id) = crate::varint::decode_u64_opt(&mut file_entry)? {
                     let mut chunk = chunk_index.read_chunk_id_content(chunk_id)?;
 
                     std::io::copy(&mut chunk, &mut file)?;
@@ -746,27 +733,16 @@ impl Repository {
         Ok(destination)
     }
 
-    fn recursive_delete_archive(
-        &self,
-        entry: Entry,
-        progress: DeletionProgressCallback,
-    ) -> std::io::Result<()> {
+    fn recursive_collect_chunk_ids(entry: Entry, chunk_ids: &mut Vec<u64>) -> std::io::Result<()> {
         match entry {
-            Entry::File(mut file_entry) => loop {
-                let chunk_id = crate::varint::decode_u64(&mut file_entry)?;
-                if chunk_id == 0 {
-                    break;
+            Entry::File(mut file_entry) => {
+                while let Some(chunk_id) = crate::varint::decode_u64_opt(&mut file_entry)? {
+                    chunk_ids.push(chunk_id);
                 }
-
-                if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true)
-                    && let Some(f) = &progress
-                {
-                    f(chunk_id, deleted)
-                }
-            },
+            }
             Entry::Directory(dir_entry) => {
                 for sub_entry in dir_entry.entries {
-                    self.recursive_delete_archive(sub_entry, progress.clone())?;
+                    Self::recursive_collect_chunk_ids(sub_entry, chunk_ids)?;
                 }
             }
             _ => {}
@@ -792,11 +768,24 @@ impl Repository {
         let archive_path = self.archive_path(name);
         let archive = Archive::open(&archive_path)?;
 
+        // Collect every chunk reference before touching the index. Dereferencing
+        // while walking would leave the archive half-deleted but still listed if a
+        // read failed part way through, and a retry would then decrement the same
+        // chunks a second time - destroying data shared with other archives.
+        let mut chunk_ids = Vec::new();
         for entry in archive.into_entries() {
-            self.recursive_delete_archive(entry, progress.clone())?;
+            Self::recursive_collect_chunk_ids(entry, &mut chunk_ids)?;
         }
 
         std::fs::remove_file(archive_path)?;
+
+        for chunk_id in chunk_ids {
+            if let Some(deleted) = self.chunk_index.dereference_chunk_id(chunk_id, true)
+                && let Some(f) = &progress
+            {
+                f(chunk_id, deleted)
+            }
+        }
 
         w.unlock()?;
 

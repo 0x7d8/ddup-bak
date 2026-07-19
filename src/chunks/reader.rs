@@ -34,12 +34,9 @@ impl EntryReader {
         self.buffer.clear();
         self.buffer_pos = 0;
 
-        let chunk_id = match crate::varint::decode_u64(&mut self.entry) {
-            Ok(id) => id,
-            Err(_) => {
-                self.finished = true;
-                return Ok(());
-            }
+        let Some(chunk_id) = crate::varint::decode_u64_opt(&mut self.entry)? else {
+            self.finished = true;
+            return Ok(());
         };
 
         let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;

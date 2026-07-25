@@ -375,6 +375,8 @@ impl Repository {
             &archive_path,
         )?)?)));
 
+        let directory_root = directory_root.unwrap_or(&self.directory);
+
         worker_pool.in_place_scope(|scope| {
             for entry in walker.flatten() {
                 let path = entry.path();
@@ -391,7 +393,22 @@ impl Repository {
                 if path.file_name() == Some(".ddup-bak".as_ref()) {
                     continue;
                 }
-                let Some(file_name) = path.file_name() else {
+
+                let relative_path = match path.strip_prefix(directory_root) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        let mut error = error.write();
+                        if error.is_none() {
+                            *error = Some(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Path is not a subpath of the root directory",
+                            ));
+                        }
+                        break;
+                    }
+                };
+
+                let Some(file_name) = relative_path.file_name() else {
                     continue;
                 };
 
@@ -424,11 +441,7 @@ impl Repository {
                             entries: Vec::new(),
                         }));
 
-                    if let Some(parent) = Self::archive_path_parent(
-                        archive,
-                        path.strip_prefix(directory_root.unwrap_or(&self.directory))
-                            .unwrap_or(path),
-                    ) {
+                    if let Some(parent) = Self::archive_path_parent(archive, relative_path) {
                         parent.entries.push(dir_entry);
                     } else {
                         archive.entries.push(dir_entry);
@@ -439,7 +452,6 @@ impl Repository {
                     let error = Arc::clone(&error);
                     let archive = Arc::clone(&archive);
                     let chunk_index = self.chunk_index.clone();
-                    let directory_root = directory_root.unwrap_or(&self.directory);
                     let progress_chunking = progress_chunking.clone();
                     let compression_callback = compression_callback.clone();
 

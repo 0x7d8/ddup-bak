@@ -1,656 +1,579 @@
-use crate::{archive::CompressionFormat, repository::DeletionProgressCallback, varint};
-use blake2::{Blake2b, Digest, digest::consts::U32};
+use crate::{
+    archive::{
+        Archive, CompressionFormat, Compressor, decompressor,
+        entries::{Entry, FileEntry},
+    },
+    varint,
+};
 use dashmap::DashMap;
-use flate2::{
-    read::{DeflateDecoder, GzDecoder},
-    write::{DeflateEncoder, GzEncoder},
-};
-use parking_lot::Mutex;
-use rayon::prelude::*;
+use flate2::read::DeflateDecoder;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fs::File,
-    io::{BufReader, Cursor, Read, Write},
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicU64},
+    io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
+use storage::ChunkStorage;
 
-mod hasher;
-pub mod lock;
 pub mod reader;
 pub mod storage;
 
 pub type ChunkHash = [u8; 32];
 
-pub type RebuildProgressCallback =
-    Option<Arc<dyn Fn(u64, &ChunkHash, u64) + Send + Sync + 'static>>;
+/// Largest chunk `cdc_parameters` can produce, and therefore the most memory a single
+/// verified chunk read will use.
+pub const MAX_CHUNK_SIZE: usize = 4 * fastcdc::v2020::AVERAGE_MAX;
 
-pub struct ChunkIndex {
-    pub directory: PathBuf,
-    pub storage: Arc<dyn storage::ChunkStorage>,
+/// Chunk file: a format byte followed by the data.
+const CHUNK_HEADER_LEN: u64 = 1;
 
-    pub lock: Arc<lock::RwLock>,
+/// Index format 3: raw, header carries the hash algorithm. Format 2 was Deflate-compressed
+/// and always BLAKE3. Format 1 (before `DDUPIDX` magics) was Deflate-compressed, BLAKE2b and
+/// keyed by chunk id; see `ChunkIndex::load_v1`.
+const INDEX_MAGIC_V3: &[u8; 8] = b"DDUPIDX3";
+const INDEX_MAGIC_V2: &[u8; 8] = b"DDUPIDX2";
 
-    next_id: Arc<AtomicU64>,
-    deleted_chunks: Arc<Mutex<VecDeque<u64>>>,
-    chunks: Arc<DashMap<u64, (ChunkHash, u64), hasher::RandomizingHasherBuilder>>,
-    chunk_hashes: Arc<DashMap<ChunkHash, u64, hasher::RandomizingHasherBuilder>>,
-
-    chunk_size: usize,
-    max_chunk_count: usize,
+/// Function identifying chunks by content. Fixed for the lifetime of a chunk store since chunk
+/// files are named by their hash; recorded in the index header. BLAKE2b is the default so
+/// repositories created by any version look the same; BLAKE3 is faster and opt-in.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashAlgorithm {
+    #[default]
+    Blake2b256 = 0,
+    Blake3 = 1,
 }
 
-impl Clone for ChunkIndex {
-    fn clone(&self) -> Self {
-        Self {
-            directory: self.directory.clone(),
-            storage: Arc::clone(&self.storage),
+impl HashAlgorithm {
+    pub const ALL: [Self; 2] = [Self::Blake2b256, Self::Blake3];
 
-            lock: Arc::clone(&self.lock),
+    pub const fn encode(&self) -> u8 {
+        *self as u8
+    }
 
-            next_id: Arc::clone(&self.next_id),
-            deleted_chunks: Arc::clone(&self.deleted_chunks),
-            chunks: Arc::clone(&self.chunks),
-            chunk_hashes: Arc::clone(&self.chunk_hashes),
+    pub fn try_decode(value: u8) -> std::io::Result<Self> {
+        match value {
+            0 => Ok(Self::Blake2b256),
+            1 => Ok(Self::Blake3),
+            _ => Err(invalid("invalid hash algorithm")),
+        }
+    }
 
-            chunk_size: self.chunk_size,
-            max_chunk_count: self.max_chunk_count,
+    pub fn hash(&self, data: &[u8]) -> ChunkHash {
+        match self {
+            Self::Blake2b256 => {
+                use blake2::{Blake2b, Digest, digest::consts::U32};
+                Blake2b::<U32>::digest(data).into()
+            }
+            Self::Blake3 => *blake3::hash(data).as_bytes(),
         }
     }
 }
 
-fn map_cdc_error(err: fastcdc::v2020::Error) -> std::io::Error {
-    match err {
-        fastcdc::v2020::Error::IoError(err) => err,
-        other => std::io::Error::other(other.to_string()),
+impl std::str::FromStr for HashAlgorithm {
+    type Err = std::io::Error;
+
+    fn from_str(name: &str) -> std::io::Result<Self> {
+        match name {
+            "blake2b" => Ok(Self::Blake2b256),
+            "blake3" => Ok(Self::Blake3),
+            _ => Err(invalid(format!("unknown hash algorithm {name:?}"))),
+        }
     }
+}
+
+/// Repository settings stored in the index header.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexHeader {
+    pub version: u8,
+    pub chunk_size: usize,
+    pub max_chunk_count: usize,
+    pub hash_algorithm: HashAlgorithm,
+}
+
+/// Reference counts of every chunk in a repository. A cache: `rebuild` recreates it from the
+/// archives and chunk storage.
+pub struct ChunkIndex {
+    pub chunk_size: usize,
+    pub max_chunk_count: usize,
+    pub hash_algorithm: HashAlgorithm,
+    chunks: DashMap<ChunkHash, u64>,
 }
 
 impl ChunkIndex {
-    pub fn new(
-        directory: PathBuf,
-        chunk_size: usize,
-        max_chunk_count: usize,
-        storage: Arc<dyn storage::ChunkStorage>,
-    ) -> std::io::Result<Self> {
-        let lock = lock::RwLock::new(directory.join("index.lock"))?;
-
-        Ok(Self {
-            directory,
-            storage,
-
-            lock: Arc::new(lock),
-
-            next_id: Arc::new(AtomicU64::new(1)),
-            deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
-            chunks: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
-                10_000,
-                hasher::RandomizingHasherBuilder,
-                1024,
-            )),
-            chunk_hashes: Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
-                10_000,
-                hasher::RandomizingHasherBuilder,
-                1024,
-            )),
-
+    pub fn new(chunk_size: usize, max_chunk_count: usize, hash_algorithm: HashAlgorithm) -> Self {
+        Self {
             chunk_size,
             max_chunk_count,
-        })
+            hash_algorithm,
+            chunks: DashMap::new(),
+        }
     }
 
-    pub fn open(
-        directory: PathBuf,
-        storage: Arc<dyn storage::ChunkStorage>,
-    ) -> std::io::Result<Self> {
-        let file = File::open(directory.join("index"))?;
-        let mut decoder = DeflateDecoder::new(file);
-
-        let mut buffer = [0; 32];
-        decoder.read_exact(&mut buffer)?;
-
-        fn map_err(_err: std::array::TryFromSliceError) -> std::io::Error {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Corrupted index file: invalid header",
-            )
+    /// Loads an index in the current or the BLAKE3-only format. A format 1 index is an error;
+    /// the repository migrates it first (`load_v1`).
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let (header, mut reader, count) = Self::open(path)?;
+        if header.version == 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "index uses format 1; the repository has not been migrated",
+            ));
         }
 
-        let deleted_chunks = u64::from_le_bytes(buffer[0..8].try_into().map_err(map_err)?) as usize;
-        let chunk_size = u32::from_le_bytes(buffer[8..12].try_into().map_err(map_err)?) as usize;
-        let max_chunk_count =
-            u32::from_le_bytes(buffer[12..16].try_into().map_err(map_err)?) as usize;
-        let chunk_count = u64::from_le_bytes(buffer[16..24].try_into().map_err(map_err)?) as usize;
-        let next_id = u64::from_le_bytes(buffer[24..32].try_into().map_err(map_err)?);
-
-        let mut result_deleted_chunks = VecDeque::with_capacity(deleted_chunks);
-        let result_chunks = DashMap::with_capacity_and_hasher_and_shard_amount(
-            chunk_count,
-            hasher::RandomizingHasherBuilder,
-            1024,
+        let index = Self::new(
+            header.chunk_size,
+            header.max_chunk_count,
+            header.hash_algorithm,
         );
-        let result_chunk_hashes = DashMap::with_capacity_and_hasher_and_shard_amount(
-            chunk_count,
-            hasher::RandomizingHasherBuilder,
-            1024,
+        let mut hash = [0; 32];
+        for _ in 0..count {
+            reader.read_exact(&mut hash)?;
+            index.chunks.insert(hash, varint::decode(&mut reader)?);
+        }
+        if reader.read(&mut [0])? != 0 {
+            return Err(invalid("index has trailing data"));
+        }
+
+        Ok(index)
+    }
+
+    /// Loads a format 1 index: reference counts plus the chunk id map that archives of that
+    /// era reference chunks by.
+    pub fn load_v1(path: &Path) -> std::io::Result<(Self, HashMap<u64, ChunkHash>)> {
+        let (header, mut reader, count) = Self::open(path)?;
+        if header.version != 1 {
+            return Err(invalid("index is not format 1"));
+        }
+
+        let index = Self::new(
+            header.chunk_size,
+            header.max_chunk_count,
+            header.hash_algorithm,
         );
-
-        for _ in 0..deleted_chunks {
-            let id = varint::decode_u64(&mut decoder)?;
-            result_deleted_chunks.push_back(id);
-        }
-
+        let mut ids = HashMap::with_capacity(count.min(1 << 20) as usize);
+        let mut hash = [0; 32];
         loop {
-            let mut buffer = [0; 32];
-            if decoder.read_exact(&mut buffer).is_err() {
-                break;
+            match reader.read(&mut hash[..1])? {
+                0 => break,
+                _ => reader.read_exact(&mut hash[1..])?,
             }
-
-            let id = varint::decode_u64(&mut decoder)?;
-            let count = varint::decode_u64(&mut decoder)?;
-
-            result_chunks.insert(id, (buffer, count));
-            result_chunk_hashes.insert(buffer, id);
+            let id = varint::decode(&mut reader)?;
+            let references = varint::decode(&mut reader)?;
+            index.chunks.insert(hash, references);
+            ids.insert(id, hash);
         }
 
-        let lock = lock::RwLock::new(directory.join("index.lock"))?;
-
-        Ok(Self {
-            directory,
-            storage,
-
-            lock: Arc::new(lock),
-
-            next_id: Arc::new(AtomicU64::new(next_id)),
-            deleted_chunks: Arc::new(Mutex::new(result_deleted_chunks)),
-            chunks: Arc::new(result_chunks),
-            chunk_hashes: Arc::new(result_chunk_hashes),
-
-            chunk_size,
-            max_chunk_count,
-        })
+        Ok((index, ids))
     }
 
-    pub fn rebuild(
-        directory: PathBuf,
-        archives_directory: &std::path::Path,
-        chunk_size: usize,
-        max_chunk_count: usize,
-        storage: Arc<dyn storage::ChunkStorage>,
-        progress: RebuildProgressCallback,
-    ) -> std::io::Result<Self> {
-        let chunk_hashes_on_disk: Vec<ChunkHash> = storage.list_chunk_hashes()?;
-
-        let chunks: DashMap<u64, (ChunkHash, u64), hasher::RandomizingHasherBuilder> =
-            DashMap::with_capacity_and_hasher_and_shard_amount(
-                chunk_hashes_on_disk.len(),
-                hasher::RandomizingHasherBuilder,
-                1024,
-            );
-        let chunk_hashes_map: DashMap<ChunkHash, u64, hasher::RandomizingHasherBuilder> =
-            DashMap::with_capacity_and_hasher_and_shard_amount(
-                chunk_hashes_on_disk.len(),
-                hasher::RandomizingHasherBuilder,
-                1024,
-            );
-
-        let old_id_to_hash = Self::try_recover_old_id_map(&directory);
-
-        let mut next_id: u64 = 1;
-        let mut old_to_new_id: HashMap<u64, u64> = HashMap::new();
-
-        for hash in &chunk_hashes_on_disk {
-            let new_id = next_id;
-            next_id += 1;
-
-            chunks.insert(new_id, (*hash, 0));
-            chunk_hashes_map.insert(*hash, new_id);
+    /// `load_v1` for a damaged index, keeping every record that decodes and stopping at the
+    /// first one that does not. The records are a Deflate stream, so a truncated or corrupt
+    /// index still yields everything written before the damage, and an archive whose chunk ids
+    /// are all in that part migrates normally. Records are in hash order rather than id order,
+    /// so what survives is an arbitrary subset of the ids: small archives come back far more
+    /// often than large ones. Only for `rebuild`, since taking a partial map is a decision to
+    /// give up on whatever it does not cover, and that is the caller's to make.
+    pub fn salvage_v1(path: &Path) -> std::io::Result<(Self, HashMap<u64, ChunkHash>)> {
+        let (header, mut reader, count) = Self::open(path)?;
+        if header.version != 1 {
+            return Err(invalid("index is not format 1"));
         }
 
-        if let Some(ref old_map) = old_id_to_hash {
-            for (old_id, hash) in old_map {
-                if let Some(new_id_ref) = chunk_hashes_map.get(hash) {
-                    old_to_new_id.insert(*old_id, *new_id_ref.value());
-                }
-            }
-        }
-
-        if archives_directory.exists() {
-            for dir_entry in std::fs::read_dir(archives_directory)?.flatten() {
-                let path = dir_entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("ddup") {
-                    continue;
-                }
-
-                let archive = match crate::archive::Archive::open(path) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-
-                Self::walk_archive_entries_for_refs(
-                    archive.into_entries(),
-                    &old_to_new_id,
-                    &chunks,
-                );
-            }
-        }
-
-        if let Some(ref cb) = progress {
-            for entry in chunks.iter() {
-                let (id, (hash, count)) = entry.pair();
-                cb(*id, hash, *count);
-            }
-        }
-
-        let lock = lock::RwLock::new(directory.join("index.lock"))?;
-
-        Ok(Self {
-            directory,
-            storage,
-
-            lock: Arc::new(lock),
-
-            next_id: Arc::new(AtomicU64::new(next_id)),
-            deleted_chunks: Arc::new(Mutex::new(VecDeque::new())),
-            chunks: Arc::new(chunks),
-            chunk_hashes: Arc::new(chunk_hashes_map),
-
-            chunk_size,
-            max_chunk_count,
-        })
-    }
-
-    fn try_recover_old_id_map(directory: &std::path::Path) -> Option<HashMap<u64, ChunkHash>> {
-        let file = File::open(directory.join("index")).ok()?;
-        let mut decoder = DeflateDecoder::new(file);
-
-        let mut buffer = [0; 32];
-        if decoder.read_exact(&mut buffer).is_err() {
-            return None;
-        }
-
-        let deleted_count = u64::from_le_bytes(buffer[0..8].try_into().ok()?) as usize;
-
-        for _ in 0..deleted_count {
-            let mut one_byte = [0u8; 1];
-            loop {
-                if decoder.read_exact(&mut one_byte).is_err() {
-                    return Some(HashMap::new());
-                }
-                if one_byte[0] & 0x80 == 0 {
-                    break;
-                }
-            }
-        }
-
-        let mut map = HashMap::new();
-
-        loop {
-            let mut hash_buf = [0; 32];
-            if decoder.read_exact(&mut hash_buf).is_err() {
+        let index = Self::new(
+            header.chunk_size,
+            header.max_chunk_count,
+            header.hash_algorithm,
+        );
+        let mut ids = HashMap::with_capacity(count.min(1 << 20) as usize);
+        let mut hash = [0; 32];
+        while matches!(reader.read(&mut hash[..1]), Ok(1)) {
+            let Ok(()) = reader.read_exact(&mut hash[1..]) else {
                 break;
-            }
-
-            let id = match crate::varint::decode_u64(&mut decoder) {
-                Ok(v) => v,
-                Err(_) => break,
             };
-
-            if crate::varint::decode_u64(&mut decoder).is_err() {
-                map.insert(id, hash_buf);
+            let (Ok(id), Ok(references)) =
+                (varint::decode(&mut reader), varint::decode(&mut reader))
+            else {
                 break;
-            }
-
-            map.insert(id, hash_buf);
+            };
+            index.chunks.insert(hash, references);
+            ids.insert(id, hash);
         }
 
-        Some(map)
+        Ok((index, ids))
     }
 
-    fn walk_archive_entries_for_refs(
-        entries: Vec<crate::archive::entries::Entry>,
-        old_to_new_id: &HashMap<u64, u64>,
-        chunks: &DashMap<u64, (ChunkHash, u64), hasher::RandomizingHasherBuilder>,
-    ) {
+    pub fn load_header(path: &Path) -> std::io::Result<IndexHeader> {
+        Ok(Self::open(path)?.0)
+    }
+
+    /// Identifies the index format, returning its header and a reader positioned at the first
+    /// chunk record, plus the record count (unknown for format 1, which is read to EOF).
+    fn open(path: &Path) -> std::io::Result<(IndexHeader, Box<dyn Read>, u64)> {
+        let mut file = BufReader::new(File::open(path)?);
+        let mut magic = [0; 8];
+        if file.read_exact(&mut magic).is_ok() && magic == *INDEX_MAGIC_V3 {
+            let mut header = [0; 17];
+            file.read_exact(&mut header)?;
+            let header_out = IndexHeader {
+                version: 3,
+                chunk_size: u32::from_le_bytes(header[..4].try_into().unwrap()) as usize,
+                max_chunk_count: u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
+                hash_algorithm: HashAlgorithm::try_decode(header[8])?,
+            };
+            let count = u64::from_le_bytes(header[9..].try_into().unwrap());
+            return Ok((header_out, Box::new(file), count));
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut decoder = DeflateDecoder::new(file);
+        let mut header = [0; 32];
+        decoder.read_exact(&mut header[..8])?;
+        if header[..8] == *INDEX_MAGIC_V2 {
+            decoder.read_exact(&mut header[..16])?;
+            let header_out = IndexHeader {
+                version: 2,
+                chunk_size: u32::from_le_bytes(header[..4].try_into().unwrap()) as usize,
+                max_chunk_count: u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
+                hash_algorithm: HashAlgorithm::Blake3,
+            };
+            let count = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            return Ok((header_out, Box::new(decoder), count));
+        }
+
+        // Format 1: deleted-id count, chunk size, max chunk count, chunk count, next id, then
+        // the deleted ids as varints, then (hash, id, references) records to EOF.
+        decoder.read_exact(&mut header[8..])?;
+        let deleted = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let header_out = IndexHeader {
+            version: 1,
+            chunk_size: u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize,
+            max_chunk_count: u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize,
+            hash_algorithm: HashAlgorithm::Blake2b256,
+        };
+        let count = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        for _ in 0..deleted {
+            varint::decode(&mut decoder)?;
+        }
+        Ok((header_out, Box::new(decoder), count))
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let tmp_path = path.with_extension("tmp");
+        let mut writer = BufWriter::new(crate::fs::create_file(&tmp_path)?);
+
+        writer.write_all(INDEX_MAGIC_V3)?;
+        writer.write_all(&(self.chunk_size as u32).to_le_bytes())?;
+        writer.write_all(&(self.max_chunk_count as u32).to_le_bytes())?;
+        writer.write_all(&[self.hash_algorithm.encode()])?;
+        writer.write_all(&(self.chunks.len() as u64).to_le_bytes())?;
+        for entry in self.chunks.iter() {
+            writer.write_all(entry.key())?;
+            varint::encode(&mut writer, *entry.value())?;
+        }
+        writer.into_inner()?.sync_all()?;
+
+        std::fs::rename(&tmp_path, path)?;
+        crate::fs::sync_dir(path.parent().unwrap_or(Path::new(".")))
+    }
+
+    /// Recomputes reference counts from `archives`, one archive in memory at a time; chunks in
+    /// storage that no archive references are kept with a count of zero so `clean` can delete
+    /// them. `progress` receives every reference as it is counted.
+    pub fn rebuild(
+        chunk_size: usize,
+        max_chunk_count: usize,
+        hash_algorithm: HashAlgorithm,
+        storage: &dyn ChunkStorage,
+        archives: impl IntoIterator<Item = std::io::Result<Archive>>,
+        progress: impl Fn(&ChunkHash, u64),
+    ) -> std::io::Result<Self> {
+        let index = Self::new(chunk_size, max_chunk_count, hash_algorithm);
+        for hash in storage.list_chunk_hashes()? {
+            index.chunks.insert(hash, 0);
+        }
+        for archive in archives {
+            index.count_references(archive?.into_entries(), &progress)?;
+        }
+        Ok(index)
+    }
+
+    fn count_references(
+        &self,
+        entries: Vec<Entry>,
+        progress: &impl Fn(&ChunkHash, u64),
+    ) -> std::io::Result<()> {
         for entry in entries {
             match entry {
-                crate::archive::entries::Entry::File(mut file_entry) => {
-                    while let Ok(Some(old_chunk_id)) = varint::decode_u64_opt(&mut file_entry) {
-                        if let Some(&new_id) = old_to_new_id.get(&old_chunk_id)
-                            && let Some(mut e) = chunks.get_mut(&new_id)
-                        {
-                            e.value_mut().1 += 1;
-                        }
+                Entry::File(mut file) => {
+                    for hash in entry_hashes(&mut file)? {
+                        progress(&hash, self.reference(&hash));
                     }
                 }
-                crate::archive::entries::Entry::Directory(dir_entry) => {
-                    Self::walk_archive_entries_for_refs(dir_entry.entries, old_to_new_id, chunks);
-                }
-                _ => {}
+                Entry::Directory(dir) => self.count_references(dir.entries, progress)?,
+                Entry::Symlink(_) => {}
             }
         }
-    }
-
-    pub fn save(&self) -> std::io::Result<()> {
-        let index_path = self.directory.join("index");
-        let tmp_path = self.directory.join("index.tmp");
-
-        {
-            let file = File::create(&tmp_path)?;
-            let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
-
-            let deleted_chunks = self.deleted_chunks.lock();
-
-            encoder.write_all(&(deleted_chunks.len() as u64).to_le_bytes())?;
-            encoder.write_all(&(self.chunk_size as u32).to_le_bytes())?;
-            encoder.write_all(&(self.max_chunk_count as u32).to_le_bytes())?;
-            encoder.write_all(&(self.chunks.len() as u64).to_le_bytes())?;
-            encoder.write_all(
-                &self
-                    .next_id
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_le_bytes(),
-            )?;
-
-            for id in deleted_chunks.iter() {
-                encoder.write_all(&varint::encode_u64(*id))?;
-            }
-
-            for entry in self.chunks.iter() {
-                let (id, (chunk, count)) = entry.pair();
-
-                encoder.write_all(chunk)?;
-                encoder.write_all(&varint::encode_u64(*id))?;
-                encoder.write_all(&varint::encode_u64(*count))?;
-            }
-
-            let inner = encoder.finish()?;
-            inner.sync_all()?;
-        }
-
-        std::fs::rename(&tmp_path, &index_path)?;
-
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = File::open(&self.directory) {
-                let _ = dir.sync_all();
-            }
-        }
-
         Ok(())
     }
 
-    #[inline]
-    pub fn references(&self, chunk: &ChunkHash) -> u64 {
-        if let Some(id) = self.chunk_hashes.get(chunk) {
-            let id = *id.value();
-
-            if let Some(entry) = self.chunks.get(&id) {
-                let (_, count) = entry.value();
-                return *count;
-            }
-        }
-
-        0
+    pub fn len(&self) -> usize {
+        self.chunks.len()
     }
 
-    pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
-        let chunks_to_delete: Vec<_> = self
-            .chunks
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn contains(&self, hash: &ChunkHash) -> bool {
+        self.chunks.contains_key(hash)
+    }
+
+    pub fn references(&self, hash: &ChunkHash) -> u64 {
+        self.chunks.get(hash).map_or(0, |count| *count)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ChunkHash, u64)> + '_ {
+        self.chunks
             .iter()
-            .filter_map(|entry| {
-                let (id, (chunk, count)) = (entry.key(), entry.value());
-                if *count == 0 {
-                    Some((*id, *chunk))
-                } else {
-                    None
+            .map(|entry| (*entry.key(), *entry.value()))
+    }
+
+    /// Increments the reference count and returns the new count (1 means the chunk is new).
+    pub fn reference(&self, hash: &ChunkHash) -> u64 {
+        let mut count = self.chunks.entry(*hash).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Decrements the reference count and returns the new count.
+    pub fn dereference(&self, hash: &ChunkHash) -> u64 {
+        self.chunks.get_mut(hash).map_or(0, |mut count| {
+            *count = count.saturating_sub(1);
+            *count
+        })
+    }
+
+    pub fn remove(&self, hash: &ChunkHash) {
+        self.chunks.remove(hash);
+    }
+
+    pub fn unreferenced(&self) -> Vec<ChunkHash> {
+        self.chunks
+            .iter()
+            .filter(|entry| *entry.value() == 0)
+            .map(|entry| *entry.key())
+            .collect()
+    }
+}
+
+/// Works out which algorithm named the chunks in `storage` by hashing one of them. Empty
+/// storage gets the default.
+pub fn detect_hash_algorithm(storage: &dyn ChunkStorage) -> std::io::Result<HashAlgorithm> {
+    let Some(hash) = storage.list_chunk_hashes()?.into_iter().next() else {
+        return Ok(HashAlgorithm::default());
+    };
+    let data = read_chunk_unverified(storage, &hash)?;
+    HashAlgorithm::ALL
+        .into_iter()
+        .find(|algorithm| algorithm.hash(&data) == hash)
+        .ok_or_else(|| {
+            invalid(format!(
+                "chunk {} does not match its content under any hash algorithm",
+                hex(&hash)
+            ))
+        })
+}
+
+pub fn hex(hash: &ChunkHash) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(64);
+    for byte in hash {
+        hex.push(DIGITS[(byte >> 4) as usize] as char);
+        hex.push(DIGITS[(byte & 0xF) as usize] as char);
+    }
+    hex
+}
+
+/// FastCDC (min, average, max) sizes for a file of `len` bytes. The average doubles until the
+/// expected chunk count fits `max_chunk_count` (0 disables the cap).
+pub fn cdc_parameters(
+    chunk_size: usize,
+    max_chunk_count: usize,
+    len: u64,
+) -> (usize, usize, usize) {
+    use fastcdc::v2020::{
+        AVERAGE_MAX, AVERAGE_MIN, MAXIMUM_MAX, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN,
+    };
+
+    let mut avg = chunk_size.clamp(AVERAGE_MIN, AVERAGE_MAX);
+    while max_chunk_count > 0
+        && len.div_ceil(avg as u64) > max_chunk_count as u64
+        && avg < AVERAGE_MAX
+    {
+        avg = (avg * 2).min(AVERAGE_MAX);
+    }
+
+    (
+        (avg / 4).clamp(MINIMUM_MIN, MINIMUM_MAX),
+        avg,
+        (avg * 4).clamp(MAXIMUM_MIN, MAXIMUM_MAX),
+    )
+}
+
+/// Chunk hashes referenced by a repository file entry (archive format 2 and later).
+pub fn entry_hashes(entry: &mut FileEntry) -> std::io::Result<Vec<ChunkHash>> {
+    let body = entry_body(entry)?;
+    if body.len() % 32 != 0 {
+        return Err(invalid(format!(
+            "entry {} has a malformed chunk list",
+            entry.name
+        )));
+    }
+
+    Ok(body.as_chunks::<32>().0.to_vec())
+}
+
+/// Chunk hashes of a format 1 repository file entry, which lists chunk ids as varints and
+/// relies on the index of its era to resolve them.
+pub fn entry_hashes_v1(
+    entry: &mut FileEntry,
+    ids: &HashMap<u64, ChunkHash>,
+) -> std::io::Result<Vec<ChunkHash>> {
+    let body = entry_body(entry)?;
+    let mut cursor = Cursor::new(body.as_slice());
+    let mut hashes = Vec::new();
+    while (cursor.position() as usize) < body.len() {
+        let id = varint::decode(&mut cursor)?;
+        hashes.push(*ids.get(&id).ok_or_else(|| {
+            invalid(format!(
+                "entry {} references unknown chunk id {id}",
+                entry.name
+            ))
+        })?);
+    }
+    Ok(hashes)
+}
+
+fn entry_body(entry: &mut FileEntry) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
+    entry.read_to_end(&mut body)?;
+    Ok(body)
+}
+
+thread_local! {
+    static ZSTD_COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> = const { std::cell::RefCell::new(None) };
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn write_chunk(
+    storage: &dyn ChunkStorage,
+    hash: &ChunkHash,
+    data: &[u8],
+    compression: CompressionFormat,
+) -> std::io::Result<()> {
+    storage.write_chunk_content(hash, &encode_chunk(data, compression)?)
+}
+
+/// Chunk file body: a format byte followed by the data. Chunks that do not shrink are stored raw
+/// so reads never decompress for nothing. Zstd reuses a per-thread context and records the
+/// content size in the frame, which lets `read_chunk` allocate exactly once.
+fn encode_chunk(data: &[u8], compression: CompressionFormat) -> std::io::Result<Vec<u8>> {
+    let mut content = Vec::with_capacity(1 + data.len());
+    content.push(compression.encode());
+
+    match compression {
+        CompressionFormat::None => content.extend_from_slice(data),
+        CompressionFormat::Zstd => {
+            content.reserve(zstd::zstd_safe::compress_bound(data.len()));
+            let mut cursor = Cursor::new(content);
+            cursor.set_position(1);
+            ZSTD_COMPRESSOR.with_borrow_mut(|compressor| {
+                match compressor {
+                    Some(compressor) => compressor,
+                    None => {
+                        compressor.insert(zstd::bulk::Compressor::new(crate::archive::ZSTD_LEVEL)?)
+                    }
                 }
-            })
-            .collect();
-
-        let mut deleted_ids = Vec::with_capacity(chunks_to_delete.len());
-
-        for (id, chunk) in chunks_to_delete {
-            if let Some(f) = progress.clone() {
-                f(id, true);
-            }
-
-            self.storage.delete_chunk_content(&chunk)?;
-
-            self.chunk_hashes.remove(&chunk);
-            self.chunks.remove(&id);
-
-            deleted_ids.push(id);
+                .compress_to_buffer(data, &mut cursor)
+            })?;
+            content = cursor.into_inner();
         }
-
-        let mut deleted_chunks = self.deleted_chunks.lock();
-        for id in deleted_ids {
-            deleted_chunks.push_back(id);
-        }
-
-        Ok(())
-    }
-
-    #[inline]
-    pub fn dereference_chunk_id(&self, chunk_id: u64, clean: bool) -> Option<bool> {
-        let mut entry = self.chunks.get_mut(&chunk_id)?;
-        let (chunk, count) = entry.value_mut();
-        let chunk = *chunk;
-
-        if *count == 0 {
-            return Some(false);
-        }
-
-        *count -= 1;
-
-        if *count == 0 && clean {
-            drop(entry);
-
-            self.chunks.remove(&chunk_id);
-            self.chunk_hashes.remove(&chunk);
-
-            self.storage.delete_chunk_content(&chunk).ok()?;
-            self.deleted_chunks.lock().push_back(chunk_id);
-
-            return Some(true);
-        }
-
-        Some(false)
-    }
-
-    #[inline]
-    pub fn read_chunk_id_content(&self, chunk_id: u64) -> std::io::Result<Box<dyn Read + Send>> {
-        let entry = self.chunks.get(&chunk_id).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Chunk ID {chunk_id} not found"),
-            )
-        })?;
-
-        let (chunk, _) = entry.value();
-        let chunk = *chunk;
-        drop(entry);
-
-        let mut reader = self.storage.read_chunk_content(&chunk)?;
-
-        let mut compression_bytes = [0; 1];
-        reader.read_exact(&mut compression_bytes)?;
-        let compression = CompressionFormat::try_decode(compression_bytes[0])?;
-
-        match compression {
-            CompressionFormat::None => Ok(reader),
-            CompressionFormat::Gzip => Ok(Box::new(GzDecoder::new(reader))),
-            CompressionFormat::Deflate => Ok(Box::new(DeflateDecoder::new(reader))),
-
-            #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli => Ok(Box::new(brotli::Decompressor::new(reader, 4096))),
-            #[cfg(not(feature = "brotli"))]
-            CompressionFormat::Brotli => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Brotli support is not enabled. Please enable the 'brotli' feature.",
-            )),
+        other => {
+            let mut encoder = Compressor::new(other, &mut content)?;
+            encoder.write_all(data)?;
+            encoder.finish()?;
         }
     }
 
-    #[inline]
-    pub fn get_chunk_id(&self, chunk: &ChunkHash) -> Option<u64> {
-        self.chunk_hashes.get(chunk).map(|v| *v)
+    if content.len() > data.len() {
+        content.clear();
+        content.push(CompressionFormat::None.encode());
+        content.extend_from_slice(data);
     }
+    Ok(content)
+}
 
-    #[inline]
-    fn next_id(&self) -> u64 {
-        if let Some(id) = self.deleted_chunks.lock().pop_front() {
-            return id;
-        }
-
-        self.next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+/// Reads and decompresses a chunk, failing if it does not hash to `hash`.
+pub fn read_chunk(
+    storage: &dyn ChunkStorage,
+    algorithm: HashAlgorithm,
+    hash: &ChunkHash,
+) -> std::io::Result<Vec<u8>> {
+    let data = read_chunk_unverified(storage, hash)?;
+    if algorithm.hash(&data) != *hash {
+        return Err(invalid(format!("chunk {} is corrupted", hex(hash))));
     }
+    Ok(data)
+}
 
-    fn add_chunk(
-        &self,
-        chunk: &ChunkHash,
-        data: &[u8],
-        compression: CompressionFormat,
-    ) -> std::io::Result<u64> {
-        let entry = self.chunk_hashes.entry(*chunk);
-        let (id, is_new) = match entry {
-            dashmap::mapref::entry::Entry::Occupied(e) => (*e.get(), false),
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                let id = self.next_id();
-                e.insert(id);
-                (id, true)
-            }
-        };
+fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::io::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    storage
+        .read_chunk_content(hash)?
+        .take(MAX_CHUNK_SIZE as u64 + CHUNK_HEADER_LEN + 1)
+        .read_to_end(&mut content)?;
+    let corrupted = || invalid(format!("chunk {} is corrupted", hex(hash)));
 
-        if !is_new {
-            return Ok(id);
-        }
+    let Some(&format) = content.first() else {
+        return Err(corrupted());
+    };
+    let format = CompressionFormat::try_decode(format)?;
+    content.drain(..CHUNK_HEADER_LEN as usize);
 
-        let mut final_data = vec![compression.encode()];
-
-        match compression {
-            CompressionFormat::None => final_data.extend_from_slice(data),
-            CompressionFormat::Gzip => {
-                let mut encoder = GzEncoder::new(&mut final_data, flate2::Compression::default());
-                encoder.write_all(data)?;
-                encoder.finish()?;
-            }
-            CompressionFormat::Deflate => {
-                let mut encoder =
-                    DeflateEncoder::new(&mut final_data, flate2::Compression::default());
-                encoder.write_all(data)?;
-                encoder.finish()?;
-            }
-            #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli => {
-                let mut encoder = brotli::CompressorWriter::new(&mut final_data, 4096, 11, 22);
-                encoder.write_all(data)?;
-                drop(encoder);
-            }
-            #[cfg(not(feature = "brotli"))]
-            CompressionFormat::Brotli => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Brotli support is not enabled. Please enable the 'brotli' feature.",
-                ));
-            }
-        }
-
-        self.storage
-            .write_chunk_content(chunk, Box::new(Cursor::new(final_data)))?;
-
-        Ok(id)
-    }
-
-    fn cdc_parameters(&self, len: usize) -> (usize, usize, usize) {
-        let mut avg = self.chunk_size.max(1);
-
-        if self.max_chunk_count > 0 {
-            while len.div_ceil(avg) > self.max_chunk_count && avg < fastcdc::v2020::AVERAGE_MAX {
-                avg = avg.saturating_mul(2);
-            }
-        }
-
-        let avg = avg.clamp(fastcdc::v2020::AVERAGE_MIN, fastcdc::v2020::AVERAGE_MAX);
-        let min = (avg / 4).clamp(fastcdc::v2020::MINIMUM_MIN, fastcdc::v2020::MINIMUM_MAX);
-        let max = (avg * 4).clamp(fastcdc::v2020::MAXIMUM_MIN, fastcdc::v2020::MAXIMUM_MAX);
-
-        (min, avg, max)
-    }
-
-    pub fn chunk_file(
-        &self,
-        path: &PathBuf,
-        compression: CompressionFormat,
-    ) -> std::io::Result<Vec<u64>> {
-        let file = File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-
-        let (min_size, avg_size, max_size) = self.cdc_parameters(len);
-        let estimated = len.div_ceil(avg_size);
-
-        let batch_size = rayon::current_num_threads().max(1) * 2;
-
-        let mut chunk_ids = Vec::with_capacity(estimated);
-        let mut chunks = Vec::with_capacity(estimated);
-        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
-
-        for chunk in
-            fastcdc::v2020::StreamCDC::new(BufReader::new(file), min_size, avg_size, max_size)
+    let data = match format {
+        CompressionFormat::None => content,
+        CompressionFormat::Zstd
+            if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&content) =>
         {
-            batch.push(chunk.map_err(map_cdc_error)?.data);
-
-            if batch.len() >= batch_size {
-                self.store_batch(&mut batch, compression, &mut chunk_ids, &mut chunks)?;
+            if size > MAX_CHUNK_SIZE as u64 {
+                return Err(corrupted());
             }
+            let mut data = Vec::with_capacity(size as usize);
+            ZSTD_DECOMPRESSOR.with_borrow_mut(|decompressor| {
+                match decompressor {
+                    Some(decompressor) => decompressor,
+                    None => decompressor.insert(zstd::bulk::Decompressor::new()?),
+                }
+                .decompress_to_buffer(&content, &mut data)
+            })?;
+            data
         }
-
-        self.store_batch(&mut batch, compression, &mut chunk_ids, &mut chunks)?;
-
-        for (i, chunk_id) in chunk_ids.iter().enumerate() {
-            let mut entry = self
-                .chunks
-                .entry(*chunk_id)
-                .or_insert_with(|| (chunks[i], 0));
-
-            entry.1 += 1;
+        format => {
+            let mut data = Vec::new();
+            decompressor(format, Cursor::new(content))?
+                .take(MAX_CHUNK_SIZE as u64 + 1)
+                .read_to_end(&mut data)?;
+            data
         }
+    };
 
-        Ok(chunk_ids)
+    if data.len() > MAX_CHUNK_SIZE {
+        return Err(corrupted());
     }
+    Ok(data)
+}
 
-    fn store_batch(
-        &self,
-        batch: &mut Vec<Vec<u8>>,
-        compression: CompressionFormat,
-        chunk_ids: &mut Vec<u64>,
-        chunks: &mut Vec<ChunkHash>,
-    ) -> std::io::Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        let stored = batch
-            .par_iter()
-            .map(|data| {
-                let mut hasher = Blake2b::<U32>::new();
-                hasher.update(data);
-
-                let mut hash = [0; 32];
-                hash.copy_from_slice(&hasher.finalize());
-
-                Ok((self.add_chunk(&hash, data, compression)?, hash))
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
-
-        for (chunk_id, hash) in stored {
-            chunk_ids.push(chunk_id);
-            chunks.push(hash);
-        }
-
-        batch.clear();
-
-        Ok(())
-    }
+fn invalid(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }

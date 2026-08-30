@@ -1,121 +1,94 @@
-use crate::archive::CCompressionFormat;
-use crate::entries::CFileEntry;
-use ddup_bak::archive::entries::{Entry, EntryMode, FileEntry};
-use ddup_bak::chunks::reader::EntryReader;
-use std::ffi::*;
-use std::io::Read;
-use std::ops::{Deref, DerefMut};
-use std::slice;
-use std::sync::Arc;
-use std::time::SystemTime;
+use crate::{entries::CFileEntry, repository::CRepository, set_error};
+use ddup_bak::{
+    archive::entries::{Entry, EntryMode, FileEntry},
+    chunks::reader::EntryReader,
+    repository::Repository,
+};
+use std::{ffi::*, fs::File, io::Read, sync::Arc, time::SystemTime};
 
+/// Opaque streaming reader over a repository file entry. Holds a shared repository lock until
+/// freed.
 #[repr(C)]
 pub struct CEntryReader {
     _private: [u8; 0],
 }
 
-pub struct EntryReaderHandle {
-    inner: Box<EntryReader>,
-}
-
-impl Deref for EntryReaderHandle {
-    type Target = EntryReader;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for EntryReaderHandle {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_create_entry_reader(
-    repo: *mut crate::repository::CRepository,
+    repo: *mut CRepository,
     entry: *const CFileEntry,
 ) -> *mut CEntryReader {
-    if repo.is_null() || entry.is_null() {
+    let (Some(repo), Some(entry)) = (unsafe { (repo as *const Repository).as_ref() }, unsafe {
+        entry.as_ref()
+    }) else {
+        return std::ptr::null_mut();
+    };
+    if entry.file.is_null() || entry.common.name.is_null() {
         return std::ptr::null_mut();
     }
 
-    let repo = &*repo;
-    let entry = &*entry;
-
-    let name = match CStr::from_ptr(entry.common.name).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return std::ptr::null_mut(),
+    let file = unsafe {
+        Arc::increment_strong_count(entry.file as *const File);
+        Arc::from_raw(entry.file as *const File)
     };
-
-    let file_arc = if !entry.file.is_null() {
-        let file_ref = &*(entry.file as *const std::fs::File);
-        Arc::new(
-            file_ref
-                .try_clone()
-                .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
-        )
-    } else {
-        return std::ptr::null_mut();
-    };
+    let compression = entry.compression.into();
 
     let file_entry = FileEntry {
-        name,
+        name: unsafe { CStr::from_ptr(entry.common.name) }
+            .to_string_lossy()
+            .into_owned(),
         mode: EntryMode::from(entry.common.mode),
         owner: (entry.common.uid, entry.common.gid),
         mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(entry.common.mtime),
-        compression: entry.compression.into(),
-        size_compressed: if matches!(entry.compression, CCompressionFormat::None) {
-            None
-        } else {
-            Some(entry.size_compressed)
+        compression,
+        size_compressed: match compression {
+            ddup_bak::archive::CompressionFormat::None => None,
+            _ => Some(entry.size_compressed),
         },
         size_real: entry.size_real,
         size: entry.size,
-        file: file_arc,
+        file,
         offset: entry.offset,
         decoder: None,
         consumed: 0,
     };
 
     match repo.entry_reader(Entry::File(Box::new(file_entry))) {
-        Ok(reader) => {
-            let handle = Box::new(EntryReaderHandle {
-                inner: Box::new(reader),
-            });
-
-            Box::into_raw(handle) as *mut CEntryReader
+        Ok(reader) => Box::into_raw(Box::new(reader)) as *mut CEntryReader,
+        Err(err) => {
+            set_error(&err);
+            std::ptr::null_mut()
         }
-        Err(_) => std::ptr::null_mut(),
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
+/// Reads up to `buffer_size` bytes. Returns the byte count, 0 at end of file, -1 on error.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn entry_reader_read(
     reader: *mut CEntryReader,
     buffer: *mut c_char,
     buffer_size: usize,
 ) -> c_int {
-    if reader.is_null() || buffer.is_null() {
+    let Some(reader) = (unsafe { (reader as *mut EntryReader).as_mut() }) else {
+        return -1;
+    };
+    if buffer.is_null() {
         return -1;
     }
 
-    let reader_handle = &mut *(reader as *mut EntryReaderHandle);
-    let buf_slice = slice::from_raw_parts_mut(buffer as *mut u8, buffer_size);
-
-    match reader_handle.read(buf_slice) {
+    let buffer = unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, buffer_size) };
+    match reader.read(buffer) {
         Ok(bytes_read) => bytes_read as c_int,
-        Err(_) => -1,
+        Err(err) => {
+            set_error(&err);
+            -1
+        }
     }
 }
 
-#[no_mangle]
-#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn free_entry_reader(reader: *mut CEntryReader) {
     if !reader.is_null() {
-        let _ = Box::from_raw(reader as *mut EntryReaderHandle);
+        drop(unsafe { Box::from_raw(reader as *mut EntryReader) });
     }
 }

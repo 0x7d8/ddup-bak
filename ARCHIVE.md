@@ -1,4 +1,4 @@
-# ddup-bak archive format version 1
+# ddup-bak archive format version 2
 
 ## definitions
 
@@ -25,6 +25,7 @@ the compression format is an enum describing what compression the content of an 
 - **`1`**: Gzip Compression
 - **`2`**: Deflate Compression
 - **`3`**: Brotli Compression
+- **`4`**: Zstd Compression
 
 ### entry_type
 
@@ -61,7 +62,7 @@ each archive file has an 8-byte signature at the beginning, this signature is ma
 | 5    | 66 (B)      |
 | 6    | 65 (A)      |
 | 7    | 75 (K)      |
-| 8    | 1 (version) |
+| 8    | 2 (version) |
 
 ### entry
 
@@ -79,7 +80,7 @@ all entries have a few base properties that will always be available
 
 `...varint(u64)` - Byte Length of Uncompressed file content<br>
 `...varint(u64)` - Byte Length of Compressed file content (**ONLY EXISTS IF `compression_format` IS NOT 0**)<br>
-`...varint(u64)` - Byte Length of "Real" file size, this is mainly used by the dedup part of this repo<br>
+`...varint(u64)` - Byte Length of "Real" file size, for repository archives this is the size of the original file<br>
 `...varint(u64)` - Byte Offset (signature included) at which to read the file content in the archive
 
 #### directory_entry (0x1)
@@ -104,3 +105,31 @@ a ddup-bak archive is structured in the following way:
 an implementation is expected to read the last 16 bytes of an archive to determine how many entries to read
 and at what offset to read them, implementations usually read entries upon opening an archive, since it does
 not require reading file data
+
+## repository archives
+
+archives inside a repository (`.ddup-bak/archives/*.ddup`) do not store file data inline. the content of every
+file entry is a list of 32-byte chunk hashes (compression_format 0), and the "real" size is the size of the
+original file. the chunks themselves live in `.ddup-bak/chunks/<xx>/<yy>/<rest>.chunk`, named by the hex hash
+of their uncompressed content, prefixed with one compression_format byte.
+
+the hash is either BLAKE2b-256 (`0`, the default) or BLAKE3-256 (`1`), chosen when the repository is created
+and fixed for its lifetime, since chunk files are named by it.
+
+`.ddup-bak/chunks/index` caches reference counts and can always be rebuilt from the archives:
+
+`    u8[8]      ` - `DDUPIDX3`<br>
+`    u32        ` - LE average chunk size<br>
+`    u32        ` - LE max chunk count per file (0 = unlimited)<br>
+`    u8         ` - hash algorithm<br>
+`    u64        ` - LE entry count<br>
+`...entry      ` - `u8[32]` chunk hash followed by `varint(u64)` reference count
+
+two older index formats are still read: `DDUPIDX2`, a deflate stream with the same fields minus the hash
+algorithm byte and always BLAKE3-256, and format 1, a deflate stream keyed by index-assigned chunk ids.
+
+### changes from version 1
+
+version 1 repository archives referenced chunks by index-assigned ids. opening such a repository rewrites its
+archives and index into version 2 in place before anything else reads them.
+entry names are validated on read and write: they must be non-empty, not `.` or `..`, and contain no `/`, `\` or NUL.

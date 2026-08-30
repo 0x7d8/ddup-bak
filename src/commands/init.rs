@@ -9,6 +9,10 @@ pub fn init(matches: &ArgMatches) -> std::io::Result<i32> {
     let max_chunk_count = *matches
         .get_one::<usize>("max_chunk_count")
         .expect("required");
+    let hash_algorithm = matches
+        .get_one::<String>("hash")
+        .expect("required")
+        .parse::<ddup_bak::chunks::HashAlgorithm>()?;
 
     if std::path::Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "already exists!".red());
@@ -23,7 +27,13 @@ pub fn init(matches: &ArgMatches) -> std::io::Result<i32> {
         "...".bright_black()
     );
 
-    Repository::new(Path::new(directory), chunk_size, max_chunk_count, None)?;
+    Repository::new_with_hash(
+        Path::new(directory),
+        chunk_size,
+        max_chunk_count,
+        hash_algorithm,
+        None,
+    )?;
 
     println!(
         "{} {} {} {}",

@@ -11,7 +11,7 @@ enum Format {
 }
 
 pub fn convert(matches: &ArgMatches) -> std::io::Result<i32> {
-    let mut repository = open_repository(false);
+    let repository = open_repository();
 
     let name = matches.get_one::<String>("name").expect("required");
     let output = matches.get_one::<String>("output");
@@ -78,7 +78,7 @@ pub fn convert(matches: &ArgMatches) -> std::io::Result<i32> {
         let file = File::create(output)?;
 
         convert_entries_file(
-            &mut repository,
+            &repository,
             archive.into_entries(),
             file,
             Some(&progress),
@@ -95,20 +95,14 @@ pub fn convert(matches: &ArgMatches) -> std::io::Result<i32> {
     } else {
         let output = std::io::stdout().lock();
 
-        convert_entries(
-            &mut repository,
-            archive.into_entries(),
-            output,
-            None,
-            format,
-        )?;
+        convert_entries(&repository, archive.into_entries(), output, None, format)?;
     }
 
     Ok(0)
 }
 
 fn convert_entries<S: Write + 'static>(
-    repository: &mut ddup_bak::repository::Repository,
+    repository: &ddup_bak::repository::Repository,
     entries: Vec<Entry>,
     output: S,
     progress: Option<&Progress>,
@@ -141,7 +135,7 @@ fn convert_entries<S: Write + 'static>(
 }
 
 fn convert_entries_file(
-    repository: &mut ddup_bak::repository::Repository,
+    repository: &ddup_bak::repository::Repository,
     entries: Vec<Entry>,
     output: File,
     progress: Option<&Progress>,
@@ -183,7 +177,7 @@ fn convert_entries_file(
 
 fn tar_recursive_convert_entries(
     entry: Entry,
-    repository: &mut ddup_bak::repository::Repository,
+    repository: &ddup_bak::repository::Repository,
     archive: &mut tar::Builder<Box<dyn Write>>,
     progress: Option<&Progress>,
     parent_path: &str,
@@ -288,7 +282,7 @@ fn tar_recursive_convert_entries(
 
 fn ddup_recursive_convert_entries(
     entry: Entry,
-    repository: &mut ddup_bak::repository::Repository,
+    repository: &ddup_bak::repository::Repository,
     archive: &mut ddup_bak::archive::Archive,
     progress: Option<&Progress>,
     parent_entry: Option<&mut ddup_bak::archive::entries::DirectoryEntry>,

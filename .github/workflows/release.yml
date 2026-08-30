@@ -92,17 +92,17 @@ jobs:
           mkdir -p dist/lib
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/release/$BIN_NAME.exe" "dist/"
-            cp "c/target/release/ddupbak.dll" "dist/lib/"
-            cp "c/target/release/ddupbak.lib" "dist/lib/"
+            cp "target/release/ddupbak.dll" "dist/lib/"
+            cp "target/release/ddupbak.lib" "dist/lib/"
             cp "c/include/libddupbak.h" "dist/lib/"
           else
             cp "target/release/$BIN_NAME" "dist/"
             if [ "${{ matrix.os }}" = "macos-latest" ]; then
-              cp "c/target/release/libddupbak.dylib" "dist/lib/"
-              cp "c/target/release/libddupbak.a" "dist/lib/"
+              cp "target/release/libddupbak.dylib" "dist/lib/"
+              cp "target/release/libddupbak.a" "dist/lib/"
             else
-              cp "c/target/release/libddupbak.so" "dist/lib/"
-              cp "c/target/release/libddupbak.a" "dist/lib/"
+              cp "target/release/libddupbak.so" "dist/lib/"
+              cp "target/release/libddupbak.a" "dist/lib/"
             fi
             cp "c/include/libddupbak.h" "dist/lib/"
           fi

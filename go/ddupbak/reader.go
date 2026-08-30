@@ -1,11 +1,10 @@
 package ddupbak
 
 /*
-#include <stdlib.h>
-#include <stdint.h>
 #include <libddupbak.h>
 */
 import "C"
+
 import (
 	"errors"
 	"io"
@@ -13,100 +12,71 @@ import (
 	"unsafe"
 )
 
-// EntryReader provides an io.Reader interface for reading file entry content from a repository
+// EntryReader streams the content of a repository file entry. It holds a shared repository lock
+// until closed, so close it promptly.
 type EntryReader struct {
 	reader *C.struct_CEntryReader
-	buffer []byte // Reusable buffer for read operations
 }
 
-// NewEntryReader creates a new reader for the specified file entry
+// NewEntryReader creates a reader for a file entry of one of the repository's archives.
 func (r *Repository) NewEntryReader(entry *Entry) (*EntryReader, error) {
 	if r.repo == nil {
-		return nil, errors.New("repository is closed")
+		return nil, errClosed
 	}
-
 	if entry == nil || entry.entry == nil {
-		return nil, errors.New("entry is nil")
+		return nil, errEntryClosed
 	}
-
 	if entry.Type() != EntryTypeFile {
-		return nil, errors.New("entry is not a file")
+		return nil, errors.New("ddupbak: entry is not a file")
 	}
 
-	fileEntry, err := C.entry_as_file(entry.entry)
-	if err != nil {
-		return nil, errors.New("failed to convert entry to file entry")
+	file := C.entry_as_file(entry.entry)
+	if file == nil {
+		return nil, errors.New("ddupbak: entry is not a file")
 	}
-	reader := C.repository_create_entry_reader(r.repo, fileEntry)
+
+	reader := C.repository_create_entry_reader(r.repo, file)
 	if reader == nil {
-		return nil, errors.New("failed to create entry reader")
+		return nil, lastError("ddupbak: failed to create entry reader")
 	}
 
-	result := &EntryReader{
-		reader: reader,
-		buffer: make([]byte, 4096), // Default buffer size
-	}
-	runtime.SetFinalizer(result, (*EntryReader).Close)
-
+	result := &EntryReader{reader: reader}
+	runtime.SetFinalizer(result, func(reader *EntryReader) { reader.Close() })
 	return result, nil
 }
 
-// Read implements the io.Reader interface for reading from the entry
-func (er *EntryReader) Read(p []byte) (n int, err error) {
+// Read implements io.Reader.
+func (er *EntryReader) Read(p []byte) (int, error) {
 	if er.reader == nil {
-		return 0, errors.New("reader is closed")
+		return 0, errors.New("ddupbak: reader is closed")
 	}
-
 	if len(p) == 0 {
 		return 0, nil
 	}
 
-	// Create a C buffer to hold the data
-	buffer := (*C.char)(unsafe.Pointer(&p[0]))
-	bufferSize := C.size_t(len(p))
-
-	bytesRead := C.entry_reader_read(er.reader, buffer, bufferSize)
-	if bytesRead < 0 {
-		return 0, errors.New("error reading from entry")
-	}
-
-	if bytesRead == 0 {
+	n := C.entry_reader_read(er.reader, (*C.char)(unsafe.Pointer(&p[0])), C.size_t(len(p)))
+	switch {
+	case n < 0:
+		return 0, lastError("ddupbak: read failed")
+	case n == 0:
 		return 0, io.EOF
 	}
-
-	return int(bytesRead), nil
+	return int(n), nil
 }
 
-// Close releases resources associated with the reader
+// ReadAll reads the rest of the entry.
+func (er *EntryReader) ReadAll() ([]byte, error) {
+	if er.reader == nil {
+		return nil, errors.New("ddupbak: reader is closed")
+	}
+	return io.ReadAll(er)
+}
+
+// Close releases the reader and its repository lock.
 func (er *EntryReader) Close() error {
 	if er.reader != nil {
 		C.free_entry_reader(er.reader)
 		er.reader = nil
 	}
 	return nil
-}
-
-// ReadAll reads the entire file entry content into a byte slice
-func (er *EntryReader) ReadAll() ([]byte, error) {
-	if er.reader == nil {
-		return nil, errors.New("reader is closed")
-	}
-
-	var result []byte
-	buffer := make([]byte, 4096) // Use a reasonably sized buffer
-
-	for {
-		n, err := er.Read(buffer)
-		if n > 0 {
-			result = append(result, buffer[:n]...)
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-	}
-
-	return result, nil
 }

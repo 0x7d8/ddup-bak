@@ -2,250 +2,149 @@ package ddupbak
 
 /*
 #include <stdlib.h>
-#include <stdint.h>
-#include <libddupbak.h>
-
-// Forward declarations for callback handling
-extern void goProgressChunkingCallback(char* path);
-extern void goProgressArchivingCallback(char* path);
-extern void goProgressRestoringCallback(char* path);
-extern void goProgressCleaningCallback(uint64_t chunkID, _Bool deleted);
-extern CCompressionFormat goCompressionFormatCallback(char* path);
-
-// Define proper function pointers for callbacks
-static CProgressCallback getChunkingCallback() {
-    return (CProgressCallback)goProgressChunkingCallback;
-}
-
-static CProgressCallback getArchivingCallback() {
-    return (CProgressCallback)goProgressArchivingCallback;
-}
-
-static CProgressCallback getRestoringCallback() {
-    return (CProgressCallback)goProgressRestoringCallback;
-}
-
-static CDeletionProgressCallback getCleaningCallback() {
-    return (CDeletionProgressCallback)goProgressCleaningCallback;
-}
-
-static CCompressionFormatCallback getCompressionFormatCallback() {
-	return (CCompressionFormatCallback)goCompressionFormatCallback;
-}
+#include "callbacks.h"
 */
 import "C"
+
 import (
 	"errors"
 	"runtime"
-	"sync"
 	"unsafe"
 )
 
-// Repository represents a ddupbak repository
+var errClosed = errors.New("ddupbak: repository is closed")
+
+// Nil Go callbacks become null C callbacks so the library skips the cgo transition per file or chunk.
+func cProgressCallback(cb ...ProgressCallback) C.CProgressCallback {
+	for _, cb := range cb {
+		if cb != nil {
+			return C.progressCallback()
+		}
+	}
+	return nil
+}
+
+func cDeletionCallback(cb DeletionProgressCallback) C.CDeletionProgressCallback {
+	if cb == nil {
+		return nil
+	}
+	return C.deletionCallback()
+}
+
+// Repository is a deduplicating backup repository.
 type Repository struct {
 	repo *C.struct_CRepository
 }
 
-// ProgressCallback is a callback for tracking progress operations (chunking, archiving, restoring)
-type ProgressCallback func(path string)
-
-// ChunkingProgressCallback is a callback for tracking chunking progress
-type ChunkingProgressCallback = ProgressCallback
-
-// ArchivingProgressCallback is a callback for tracking archiving progress
-type ArchivingProgressCallback = ProgressCallback
-
-// RestoringProgressCallback is a callback for tracking restoring progress
-type RestoringProgressCallback = ProgressCallback
-
-// DeletionProgressCallback is a callback for tracking deletion progress
-type DeletionProgressCallback func(chunkID uint64, deleted bool)
-
-// CleaningProgressCallback is a callback for tracking cleaning progress
-type CleaningProgressCallback = DeletionProgressCallback
-
-// CompressionFormatCallback is a callback for determining the compression format
-type CompressionFormatCallback func(path string) CompressionFormat
-
-// Callback registry maps
-var (
-	activeCallbacks     = make(map[string]interface{})
-	activeCallbacksLock sync.Mutex
-)
-
-//export goProgressChunkingCallback
-func goProgressChunkingCallback(path *C.char) {
-	pathStr := C.GoString(path)
-	activeCallbacksLock.Lock()
-	defer activeCallbacksLock.Unlock()
-
-	if cb, ok := activeCallbacks["chunking"]; ok {
-		if callback, ok := cb.(ChunkingProgressCallback); ok {
-			callback(pathStr)
-		}
-	}
-}
-
-//export goProgressArchivingCallback
-func goProgressArchivingCallback(path *C.char) {
-	pathStr := C.GoString(path)
-	activeCallbacksLock.Lock()
-	defer activeCallbacksLock.Unlock()
-
-	if cb, ok := activeCallbacks["archiving"]; ok {
-		if callback, ok := cb.(ArchivingProgressCallback); ok {
-			callback(pathStr)
-		}
-	}
-}
-
-//export goProgressRestoringCallback
-func goProgressRestoringCallback(path *C.char) {
-	pathStr := C.GoString(path)
-	activeCallbacksLock.Lock()
-	defer activeCallbacksLock.Unlock()
-
-	if cb, ok := activeCallbacks["restoring"]; ok {
-		if callback, ok := cb.(RestoringProgressCallback); ok {
-			callback(pathStr)
-		}
-	}
-}
-
-//export goProgressCleaningCallback
-func goProgressCleaningCallback(chunkID C.uint64_t, deleted C._Bool) {
-	activeCallbacksLock.Lock()
-	defer activeCallbacksLock.Unlock()
-
-	if cb, ok := activeCallbacks["cleaning"]; ok {
-		if callback, ok := cb.(CleaningProgressCallback); ok {
-			callback(uint64(chunkID), bool(deleted))
-		}
-	}
-}
-
-//export goCompressionFormatCallback
-func goCompressionFormatCallback(path *C.char) C.CCompressionFormat {
-	pathStr := C.GoString(path)
-	activeCallbacksLock.Lock()
-	defer activeCallbacksLock.Unlock()
-	if cb, ok := activeCallbacks["compression"]; ok {
-		if callback, ok := cb.(CompressionFormatCallback); ok {
-			format := callback(pathStr)
-			switch format {
-			case CompressionNone:
-				return 0
-			case CompressionGzip:
-				return 1
-			case CompressionDeflate:
-				return 2
-			case CompressionBrotli:
-				return 3
-			}
-		}
+func wrapRepository(repo *C.struct_CRepository, fallback string) (*Repository, error) {
+	if repo == nil {
+		return nil, lastError(fallback)
 	}
 
-	return 0
+	repository := &Repository{repo: repo}
+	runtime.SetFinalizer(repository, (*Repository).Free)
+	return repository, nil
 }
 
-// NewRepository creates a new repository with the specified parameters
-func NewRepository(directory string, chunkSize uint, maxChunkCount uint) (*Repository, error) {
-	cDirectory := C.CString(directory)
-	defer C.free(unsafe.Pointer(cDirectory))
+// NewRepository creates a repository with the default (BLAKE2b) chunk hash.
+func NewRepository(directory string, chunkSize, maxChunkCount uint) (*Repository, error) {
+	return NewRepositoryWithHash(directory, chunkSize, maxChunkCount, HashBlake2b256)
+}
 
-	repo := C.new_repository(
-		cDirectory,
-		C.uint(chunkSize),
-		C.uint(maxChunkCount),
+// NewRepositoryWithHash creates a repository whose chunks are named by hash.
+func NewRepositoryWithHash(directory string, chunkSize, maxChunkCount uint, hash HashAlgorithm) (*Repository, error) {
+	cDirectory := cString(directory)
+	defer freeCString(cDirectory)
+
+	return wrapRepository(
+		C.new_repository_with_hash(cDirectory, C.uint(chunkSize), C.uint(maxChunkCount), uint32(hash)),
+		"ddupbak: failed to create repository",
 	)
-
-	if repo == nil {
-		return nil, errors.New("failed to create repository")
-	}
-
-	repository := &Repository{repo: repo}
-	runtime.SetFinalizer(repository, (*Repository).Free)
-
-	return repository, nil
 }
 
-// OpenRepository opens an existing repository
+// OpenRepository opens a repository; chunksDirectory may be nil to use the default. Repositories
+// written by older versions are migrated in place.
 func OpenRepository(directory string, chunksDirectory *string) (*Repository, error) {
-	cDirectory := C.CString(directory)
-	defer C.free(unsafe.Pointer(cDirectory))
+	cDirectory, cChunks := cString(directory), optionalCString(chunksDirectory)
+	defer freeCString(cDirectory)
+	defer freeCString(cChunks)
 
-	var cChunksDirectory *C.char
-	if chunksDirectory != nil {
-		cChunksDirectory = C.CString(*chunksDirectory)
-		defer C.free(unsafe.Pointer(cChunksDirectory))
-	}
-
-	repo := C.open_repository(cDirectory, cChunksDirectory)
-	if repo == nil {
-		return nil, errors.New("failed to open repository")
-	}
-
-	repository := &Repository{repo: repo}
-	runtime.SetFinalizer(repository, (*Repository).Free)
-
-	return repository, nil
+	return wrapRepository(C.open_repository(cDirectory, cChunks), "ddupbak: failed to open repository")
 }
 
-// Free releases resources associated with the repository
+// RebuildRepository recreates the chunk index from the archives and chunk storage.
+func RebuildRepository(
+	directory string,
+	chunkSize, maxChunkCount uint,
+	chunksDirectory *string,
+	progress RebuildProgressCallback,
+) (*Repository, error) {
+	cDirectory, cChunks := cString(directory), optionalCString(chunksDirectory)
+	defer freeCString(cDirectory)
+	defer freeCString(cChunks)
+
+	data, release := userData(&callbacks{rebuild: progress})
+	defer release()
+
+	var cProgress C.CRebuildProgressCallback
+	if progress != nil {
+		cProgress = C.rebuildCallback()
+	}
+
+	return wrapRepository(
+		C.rebuild_repository(cDirectory, C.uint(chunkSize), C.uint(maxChunkCount), cChunks, cProgress, data),
+		"ddupbak: failed to rebuild repository",
+	)
+}
+
+// Free releases the repository.
 func (r *Repository) Free() {
 	if r.repo != nil {
-		activeCallbacksLock.Lock()
-		delete(activeCallbacks, "chunking")
-		delete(activeCallbacks, "archiving")
-		delete(activeCallbacks, "restoring")
-		delete(activeCallbacks, "cleaning")
-		activeCallbacksLock.Unlock()
-
 		C.free_repository(r.repo)
 		r.repo = nil
 	}
 }
 
-// Save persists the repository metadata to disk
+// Close is Free.
+func (r *Repository) Close() { r.Free() }
+
+// Save is kept for older callers; every operation persists the index itself.
 func (r *Repository) Save() error {
 	if r.repo == nil {
-		return errors.New("repository is closed")
+		return errClosed
 	}
-
-	ret := C.repository_save(r.repo)
-	return cErrorToGoError(ret)
-}
-
-// SetSaveOnDrop configures whether to save metadata on repository drop
-func (r *Repository) SetSaveOnDrop(saveOnDrop bool) error {
-	if r.repo == nil {
-		return errors.New("repository is closed")
+	if C.repository_save(r.repo) != 0 {
+		return lastError("ddupbak: save failed")
 	}
-
-	C.repository_set_save_on_drop(r.repo, C._Bool(saveOnDrop))
 	return nil
 }
 
-// Clean removes unused chunks from the repository
-func (r *Repository) Clean(progressCallback CleaningProgressCallback) error {
+// SetSaveOnDrop is kept for older callers and has no effect.
+func (r *Repository) SetSaveOnDrop(saveOnDrop bool) error {
 	if r.repo == nil {
-		return errors.New("repository is closed")
+		return errClosed
 	}
-
-	var cCallback C.CDeletionProgressCallback
-	if progressCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["cleaning"] = progressCallback
-		activeCallbacksLock.Unlock()
-
-		cCallback = C.getCleaningCallback()
-	}
-
-	ret := C.repository_clean(r.repo, cCallback)
-	return cErrorToGoError(ret)
+	C.repository_set_save_on_drop(r.repo, C.bool(saveOnDrop))
+	return nil
 }
 
-// CreateArchive creates a new archive in the repository
+// Clean deletes unreferenced chunks.
+func (r *Repository) Clean(progressCallback CleaningProgressCallback) error {
+	if r.repo == nil {
+		return errClosed
+	}
+
+	data, release := userData(&callbacks{deletion: progressCallback})
+	defer release()
+
+	if C.repository_clean(r.repo, cDeletionCallback(progressCallback), data) != 0 {
+		return lastError("ddupbak: clean failed")
+	}
+	return nil
+}
+
+// CreateArchive backs up directory (or the repository directory when empty) into a new archive.
+// Both progress callbacks are called once per file; a nil compression callback means deflate.
 func (r *Repository) CreateArchive(
 	name string,
 	directory string,
@@ -255,159 +154,132 @@ func (r *Repository) CreateArchive(
 	threads uint,
 ) (*Archive, error) {
 	if r.repo == nil {
-		return nil, errors.New("repository is closed")
+		return nil, errClosed
 	}
 
-	cName := C.CString(name)
-	defer C.free(unsafe.Pointer(cName))
+	cName, cDirectory := cString(name), optionalCString(&directory)
+	defer freeCString(cName)
+	defer freeCString(cDirectory)
 
-	cDirectory := C.CString(directory)
-	defer C.free(unsafe.Pointer(cDirectory))
+	data, release := userData(&callbacks{
+		progress:    chunkingCallback,
+		archiving:   archivingCallback,
+		compression: compressionFormatCallback,
+	})
+	defer release()
 
-	var cChunkingCallback C.CProgressCallback
-	if chunkingCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["chunking"] = chunkingCallback
-		activeCallbacksLock.Unlock()
-
-		cChunkingCallback = C.getChunkingCallback()
-	}
-
-	var cArchivingCallback C.CProgressCallback
-	if archivingCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["archiving"] = archivingCallback
-		activeCallbacksLock.Unlock()
-
-		cArchivingCallback = C.getArchivingCallback()
-	}
-
-	var cCompressionFormatCallback C.CCompressionFormatCallback
+	var cCompression C.CCompressionFormatCallback
 	if compressionFormatCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["compression"] = compressionFormatCallback
-		activeCallbacksLock.Unlock()
-		cCompressionFormatCallback = C.getCompressionFormatCallback()
+		cCompression = C.compressionCallback()
 	}
 
-	cArchive := C.repository_create_archive(
-		r.repo,
-		cName,
-		cDirectory,
-		cChunkingCallback,
-		cArchivingCallback,
-		cCompressionFormatCallback,
+	archive := C.repository_create_archive(
+		r.repo, cName, cDirectory,
+		cProgressCallback(chunkingCallback, archivingCallback), cCompression, data,
 		C.uint(threads),
 	)
-
-	if cArchive == nil {
-		return nil, errors.New("failed to create archive")
-	}
-
-	archive := &Archive{archive: cArchive}
-	runtime.SetFinalizer(archive, (*Archive).Free)
-
-	return archive, nil
+	return wrapArchive(archive, "ddupbak: failed to create archive")
 }
 
-// ListArchives returns the list of archive names in the repository
+// ListArchives returns the archive names in the repository.
 func (r *Repository) ListArchives() ([]string, error) {
 	if r.repo == nil {
-		return nil, errors.New("repository is closed")
+		return nil, errClosed
 	}
 
 	var count C.uint
-	cArchives := C.repository_list_archives(r.repo, &count)
-	if cArchives == nil {
-		return []string{}, nil
+	names := C.repository_list_archives(r.repo, &count)
+	if names == nil {
+		return nil, lastError("ddupbak: failed to list archives")
 	}
+	defer C.free_string_array(names)
 
-	result := cStringsToGoStrings(cArchives, count)
-
-	C.free_string_array(cArchives)
-
+	result := make([]string, int(count))
+	for i, name := range unsafe.Slice(names, int(count)) {
+		result[i] = C.GoString(name)
+	}
 	return result, nil
 }
 
-// GetArchive opens an existing archive
+// GetArchive opens an archive of the repository.
 func (r *Repository) GetArchive(archiveName string) (*Archive, error) {
 	if r.repo == nil {
-		return nil, errors.New("repository is closed")
+		return nil, errClosed
 	}
 
-	cArchiveName := C.CString(archiveName)
-	defer C.free(unsafe.Pointer(cArchiveName))
+	cName := cString(archiveName)
+	defer freeCString(cName)
 
-	cArchive := C.repository_get_archive(r.repo, cArchiveName)
-	if cArchive == nil {
-		return nil, errors.New("failed to open archive")
-	}
-
-	archive := &Archive{archive: cArchive}
-	runtime.SetFinalizer(archive, (*Archive).Free)
-	return archive, nil
+	return wrapArchive(C.repository_get_archive(r.repo, cName), "ddupbak: archive not found")
 }
 
-// RestoreArchive restores an archive to a directory
+// RestoreArchive restores an archive into the repository's `.ddup-bak/archives-restored/<name>`
+// directory, replacing a previous restore of the same archive, and returns that path.
 func (r *Repository) RestoreArchive(
 	archiveName string,
 	progressCallback RestoringProgressCallback,
 	threads uint,
 ) (string, error) {
 	if r.repo == nil {
-		return "", errors.New("repository is closed")
+		return "", errClosed
 	}
 
-	cArchiveName := C.CString(archiveName)
-	defer C.free(unsafe.Pointer(cArchiveName))
+	cName := cString(archiveName)
+	defer freeCString(cName)
 
-	var cCallback C.CProgressCallback
-	if progressCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["restoring"] = progressCallback
-		activeCallbacksLock.Unlock()
+	data, release := userData(&callbacks{progress: progressCallback})
+	defer release()
 
-		cCallback = C.getRestoringCallback()
+	path := C.repository_restore_archive(r.repo, cName, cProgressCallback(progressCallback), data, C.uint(threads))
+	if path == nil {
+		return "", lastError("ddupbak: restore failed")
 	}
-
-	cRestorePath := C.repository_restore_archive(
-		r.repo,
-		cArchiveName,
-		cCallback,
-		C.uint(threads),
-	)
-
-	if cRestorePath == nil {
-		return "", errors.New("failed to restore archive")
-	}
-
-	restorePath := C.GoString(cRestorePath)
-	C.free_string(cRestorePath)
-
-	return restorePath, nil
+	defer C.free_string(path)
+	return C.GoString(path), nil
 }
 
-// DeleteArchive deletes an archive from the repository
+// RestoreArchiveTo restores an archive into destination, which is created if missing. Existing
+// paths inside it are never overwritten.
+func (r *Repository) RestoreArchiveTo(
+	archiveName string,
+	destination string,
+	progressCallback RestoringProgressCallback,
+	threads uint,
+) error {
+	if r.repo == nil {
+		return errClosed
+	}
+
+	cName, cDestination := cString(archiveName), cString(destination)
+	defer freeCString(cName)
+	defer freeCString(cDestination)
+
+	data, release := userData(&callbacks{progress: progressCallback})
+	defer release()
+
+	if C.repository_restore_archive_to(r.repo, cName, cDestination, cProgressCallback(progressCallback), data, C.uint(threads)) != 0 {
+		return lastError("ddupbak: restore failed")
+	}
+	return nil
+}
+
+// DeleteArchive deletes an archive and the chunks only it referenced.
 func (r *Repository) DeleteArchive(
 	archiveName string,
 	progressCallback CleaningProgressCallback,
 ) error {
 	if r.repo == nil {
-		return errors.New("repository is closed")
+		return errClosed
 	}
 
-	cArchiveName := C.CString(archiveName)
-	defer C.free(unsafe.Pointer(cArchiveName))
+	cName := cString(archiveName)
+	defer freeCString(cName)
 
-	var cCallback C.CDeletionProgressCallback
-	if progressCallback != nil {
-		activeCallbacksLock.Lock()
-		activeCallbacks["cleaning"] = progressCallback
-		activeCallbacksLock.Unlock()
+	data, release := userData(&callbacks{deletion: progressCallback})
+	defer release()
 
-		cCallback = C.getCleaningCallback()
+	if C.repository_delete_archive(r.repo, cName, cDeletionCallback(progressCallback), data) != 0 {
+		return lastError("ddupbak: delete failed")
 	}
-
-	ret := C.repository_delete_archive(r.repo, cArchiveName, cCallback)
-	return cErrorToGoError(ret)
+	return nil
 }

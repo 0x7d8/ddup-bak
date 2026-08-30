@@ -2,220 +2,175 @@ package ddupbak
 
 /*
 #include <stdlib.h>
-#include <stdint.h>
-#include <libddupbak.h>
-
-extern enum CCompressionFormat goCompressionCallback(char* path, uint64_t size);
-extern uint64_t goRealSizeCallback(char* path);
-
-// Define proper function pointers for callbacks
-static enum CCompressionFormat (*getCompressionCallback(void))(const char*, uint64_t) {
-    return (enum CCompressionFormat(*)(const char*, uint64_t))goCompressionCallback;
-}
-
-static uint64_t (*getRealSizeCallback(void))(const char*) {
-    return (uint64_t(*)(const char*))goRealSizeCallback;
-}
+#include "callbacks.h"
 */
 import "C"
+
 import (
 	"errors"
 	"runtime"
-	"sync"
 	"unsafe"
 )
 
-// Archive represents a ddupbak archive
+var errArchiveClosed = errors.New("ddupbak: archive is closed")
+
+// Archive is a ddupbak archive, standalone or inside a repository.
 type Archive struct {
 	archive *C.struct_CArchive
+
+	entries      **C.struct_CEntry
+	entriesCount C.uint
+	releases     []func()
 }
 
-// CompressionCallback determines the compression format for a file
-type CompressionCallback func(path string, size uint64) CompressionFormat
-
-// RealSizeCallback determines the real size of a file before compression
-type RealSizeCallback func(path string) uint64
-
-var (
-	activeCompressionCallback CompressionCallback
-	activeRealSizeCallback    RealSizeCallback
-	archiveCallbacksLock      sync.Mutex
-)
-
-//export goCompressionCallback
-func goCompressionCallback(path *C.char, size C.uint64_t) C.enum_CCompressionFormat {
-	archiveCallbacksLock.Lock()
-	defer archiveCallbacksLock.Unlock()
-
-	if activeCompressionCallback != nil {
-		pathStr := C.GoString(path)
-		format := activeCompressionCallback(pathStr, uint64(size))
-		return C.enum_CCompressionFormat(format)
+func wrapArchive(archive *C.struct_CArchive, fallback string) (*Archive, error) {
+	if archive == nil {
+		return nil, lastError(fallback)
 	}
 
-	return C.enum_CCompressionFormat(0)
+	result := &Archive{archive: archive}
+	runtime.SetFinalizer(result, (*Archive).Free)
+	return result, nil
 }
 
-//export goRealSizeCallback
-func goRealSizeCallback(path *C.char) C.uint64_t {
-	archiveCallbacksLock.Lock()
-	defer archiveCallbacksLock.Unlock()
-
-	if activeRealSizeCallback != nil {
-		pathStr := C.GoString(path)
-		size := activeRealSizeCallback(pathStr)
-		return C.uint64_t(size)
-	}
-
-	return 0
-}
-
-// NewArchive creates a new empty archive
+// NewArchive creates a standalone archive file (not part of a repository).
 func NewArchive(path string) (*Archive, error) {
 	if path == "" {
-		return nil, errors.New("path cannot be empty")
+		return nil, errors.New("ddupbak: path cannot be empty")
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	cPath := cString(path)
+	defer freeCString(cPath)
 
-	archive := C.new_archive(cPath)
-	if archive == nil {
-		return nil, errors.New("failed to create archive")
-	}
-
-	result := &Archive{archive: archive}
-	runtime.SetFinalizer(result, (*Archive).Free)
-
-	return result, nil
+	return wrapArchive(C.new_archive(cPath), "ddupbak: failed to create archive")
 }
 
-// OpenArchive opens an existing archive
+// OpenArchive opens a standalone archive file.
 func OpenArchive(path string) (*Archive, error) {
 	if path == "" {
-		return nil, errors.New("path cannot be empty")
+		return nil, errors.New("ddupbak: path cannot be empty")
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	cPath := cString(path)
+	defer freeCString(cPath)
 
-	archive := C.open_archive(cPath)
-	if archive == nil {
-		return nil, errors.New("failed to open archive")
-	}
-
-	result := &Archive{archive: archive}
-	runtime.SetFinalizer(result, (*Archive).Free)
-
-	return result, nil
+	return wrapArchive(C.open_archive(cPath), "ddupbak: failed to open archive")
 }
 
-// Free releases resources associated with the archive
+// Free releases the archive and every entry returned by Entries.
 func (a *Archive) Free() {
-	if a.archive != nil {
-		archiveCallbacksLock.Lock()
-		activeCompressionCallback = nil
-		activeRealSizeCallback = nil
-		archiveCallbacksLock.Unlock()
-
-		C.free_archive(a.archive)
-		a.archive = nil
+	if a.archive == nil {
+		return
 	}
+
+	if a.entries != nil {
+		C.free_entry_array(a.entries, a.entriesCount)
+		a.entries = nil
+	}
+	C.free_archive(a.archive)
+	a.archive = nil
+
+	for _, release := range a.releases {
+		release()
+	}
+	a.releases = nil
 }
 
-// SetCompressionCallback sets a callback to determine compression format for files
+// Close is Free.
+func (a *Archive) Close() { a.Free() }
+
+// AddDirectory appends the contents of a directory to a standalone archive.
+func (a *Archive) AddDirectory(path string, progress ProgressCallback) error {
+	if a.archive == nil {
+		return errArchiveClosed
+	}
+
+	cPath := cString(path)
+	defer freeCString(cPath)
+
+	data, release := userData(&callbacks{progress: progress})
+	defer release()
+
+	if C.archive_add_directory(a.archive, cPath, cProgressCallback(progress), data) != 0 {
+		return lastError("ddupbak: failed to add directory")
+	}
+	return nil
+}
+
+// SetCompressionCallback decides the compression of files added with AddDirectory.
 func (a *Archive) SetCompressionCallback(callback CompressionCallback) error {
 	if a.archive == nil {
-		return errors.New("archive is closed")
+		return errArchiveClosed
 	}
-
 	if callback == nil {
-		return errors.New("callback cannot be nil")
+		return errors.New("ddupbak: callback cannot be nil")
 	}
 
-	archiveCallbacksLock.Lock()
-	activeCompressionCallback = callback
-	archiveCallbacksLock.Unlock()
-
-	cCallback := C.getCompressionCallback()
-	C.archive_set_compression_callback(a.archive, cCallback)
-
+	data, release := userData(&callbacks{archiveComp: callback})
+	a.releases = append(a.releases, release)
+	C.archive_set_compression_callback(a.archive, C.archiveCompressionCallback(), data)
 	return nil
 }
 
-// SetRealSizeCallback sets a callback to determine the real size of files
+// SetRealSizeCallback overrides the recorded uncompressed size of files added with AddDirectory.
 func (a *Archive) SetRealSizeCallback(callback RealSizeCallback) error {
 	if a.archive == nil {
-		return errors.New("archive is closed")
+		return errArchiveClosed
 	}
-
 	if callback == nil {
-		return errors.New("callback cannot be nil")
+		return errors.New("ddupbak: callback cannot be nil")
 	}
 
-	archiveCallbacksLock.Lock()
-	activeRealSizeCallback = callback
-	archiveCallbacksLock.Unlock()
-
-	cCallback := C.getRealSizeCallback()
-	C.archive_set_real_size_callback(a.archive, cCallback)
-
+	data, release := userData(&callbacks{realSize: callback})
+	a.releases = append(a.releases, release)
+	C.archive_set_real_size_callback(a.archive, C.realSizeCallback(), data)
 	return nil
 }
 
-// EntriesCount returns the number of entries in the archive
+// EntriesCount returns the number of top-level entries.
 func (a *Archive) EntriesCount() (uint, error) {
 	if a.archive == nil {
-		return 0, errors.New("archive is closed")
+		return 0, errArchiveClosed
 	}
-
-	count := C.archive_entries_count(a.archive)
-	return uint(count), nil
+	return uint(C.archive_entries_count(a.archive)), nil
 }
 
-// Entries returns all entries in the archive
+// Entries returns the top-level entries. They stay valid until the archive is freed.
 func (a *Archive) Entries() ([]*Entry, error) {
 	if a.archive == nil {
-		return nil, errors.New("archive is closed")
+		return nil, errArchiveClosed
 	}
 
-	raw_entries := C.archive_entries(a.archive)
-	if raw_entries == nil {
-		return nil, errors.New("failed to get entries")
-	}
-
-	entriesCount := C.archive_entries_count(a.archive)
-	entries := make([]*Entry, entriesCount)
-
-	for i := 0; i < int(entriesCount); i++ {
-		cEntry := *(**C.struct_CEntry)(unsafe.Pointer(uintptr(unsafe.Pointer(raw_entries)) + uintptr(i)*unsafe.Sizeof(*raw_entries)))
-		if cEntry == nil {
-			return nil, errors.New("failed to get entry")
+	if a.entries == nil {
+		a.entriesCount = C.archive_entries_count(a.archive)
+		a.entries = C.archive_entries(a.archive)
+		if a.entries == nil && a.entriesCount > 0 {
+			return nil, lastError("ddupbak: failed to read entries")
 		}
-
-		entry := &Entry{entry: cEntry}
-		entries[i] = entry
 	}
 
+	entries := make([]*Entry, 0, int(a.entriesCount))
+	for _, entry := range unsafe.Slice(a.entries, int(a.entriesCount)) {
+		entries = append(entries, &Entry{entry: entry})
+	}
 	return entries, nil
 }
 
-// FindEntry finds an entry by path
+// FindEntry looks up an entry by its path inside the archive. Free it when done.
 func (a *Archive) FindEntry(path string) (*Entry, error) {
 	if a.archive == nil {
-		return nil, errors.New("archive is closed")
+		return nil, errArchiveClosed
 	}
 
-	cPath := C.CString(path)
-	defer C.free(unsafe.Pointer(cPath))
+	cPath := cString(path)
+	defer freeCString(cPath)
 
-	cEntry := C.archive_find_entry(a.archive, cPath)
-	if cEntry == nil {
-		return nil, errors.New("entry not found")
+	entry := C.archive_find_entry(a.archive, cPath)
+	if entry == nil {
+		return nil, errors.New("ddupbak: entry not found")
 	}
 
-	entry := &Entry{entry: cEntry}
-	runtime.SetFinalizer(entry, (*Entry).Free)
-
-	return entry, nil
+	result := &Entry{entry: entry, owned: true}
+	runtime.SetFinalizer(result, (*Entry).Free)
+	return result, nil
 }

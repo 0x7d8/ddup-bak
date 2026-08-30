@@ -1,201 +1,118 @@
 use super::ChunkHash;
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub trait ChunkStorage: Sync + Send {
-    #[inline]
+pub trait ChunkStorage: Send + Sync {
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
-        let mut path = PathBuf::new();
-        for byte in chunk.iter().take(2) {
-            path.push(format!("{byte:02x}"));
-        }
-
-        let mut file_name = String::with_capacity(32 * 2 - 2 * 2 + 6);
-        for byte in chunk.iter().skip(2) {
-            file_name.push_str(&format!("{byte:02x}"));
-        }
-        file_name.push_str(".chunk");
-
-        path.push(file_name);
-
-        path
+        let hex = super::hex(chunk);
+        let mut path = String::with_capacity(hex.len() + 8);
+        path.push_str(&hex[..2]);
+        path.push('/');
+        path.push_str(&hex[2..4]);
+        path.push('/');
+        path.push_str(&hex[4..]);
+        path.push_str(".chunk");
+        PathBuf::from(path)
     }
 
-    fn read_chunk_content(
-        &self,
-        chunk: &ChunkHash,
-    ) -> std::io::Result<Box<dyn std::io::Read + Send>>;
-    fn write_chunk_content(
-        &self,
-        chunk: &ChunkHash,
-        content: Box<dyn std::io::Read + Send>,
-    ) -> std::io::Result<()>;
+    fn read_chunk_content(&self, chunk: &ChunkHash)
+    -> std::io::Result<Box<dyn Read + Send + Sync>>;
+    fn write_chunk_content(&self, chunk: &ChunkHash, content: &[u8]) -> std::io::Result<()>;
     fn delete_chunk_content(&self, chunk: &ChunkHash) -> std::io::Result<()>;
-
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ChunkHash>>;
+
+    /// Makes every chunk written so far durable; called once before an archive is published.
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct ChunkStorageLocal(pub PathBuf);
-
-impl ChunkStorageLocal {
-    fn parse_chunk_path(dir1: &str, dir2: &str, filename: &str) -> Option<ChunkHash> {
-        let stem = filename.strip_suffix(".chunk")?;
-
-        if dir1.len() != 2 || dir2.len() != 2 || stem.len() != 60 {
-            return None;
-        }
-
-        let mut hash = [0u8; 32];
-
-        hash[0] = u8::from_str_radix(dir1, 16).ok()?;
-        hash[1] = u8::from_str_radix(dir2, 16).ok()?;
-
-        for i in 0..30 {
-            hash[2 + i] = u8::from_str_radix(&stem[i * 2..i * 2 + 2], 16).ok()?;
-        }
-
-        Some(hash)
-    }
-}
 
 impl ChunkStorage for ChunkStorageLocal {
     fn read_chunk_content(
         &self,
         chunk: &ChunkHash,
-    ) -> std::io::Result<Box<dyn std::io::Read + Send>> {
-        let path = self.0.join(self.path_from_chunk(chunk));
-        let file = std::fs::File::open(path)?;
-
-        Ok(Box::new(file))
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        Ok(Box::new(std::fs::File::open(
+            self.0.join(self.path_from_chunk(chunk)),
+        )?))
     }
 
-    fn write_chunk_content(
-        &self,
-        chunk: &ChunkHash,
-        mut content: Box<dyn std::io::Read + Send>,
-    ) -> std::io::Result<()> {
-        let path = self.0.join(self.path_from_chunk(chunk));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    fn write_chunk_content(&self, chunk: &ChunkHash, content: &[u8]) -> std::io::Result<()> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+        let path = self.0.join(self.path_from_chunk(chunk));
         if path.exists() {
             return Ok(());
         }
 
-        static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tid = std::thread::current().id();
-        let tmp_path = path.with_extension(format!("tmp.{tid:?}.{unique}"));
+        let parent = path.parent().unwrap();
+        crate::fs::create_dir_all(parent)?;
 
-        let write_result = (|| {
-            let mut file = std::fs::File::create(&tmp_path)?;
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
+        let mut file = crate::fs::create_new_file(&tmp_path)?;
 
-            let mut buffer = [0; 4096];
-            loop {
-                let bytes_read = content.read(&mut buffer)?;
-                if bytes_read == 0 {
-                    break;
-                }
-                file.write_all(&buffer[..bytes_read])?;
-            }
-
-            file.sync_all()?;
-
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
+        if let Err(err) = file
+            .write_all(content)
+            .and_then(|()| crate::fs::flush_file(&file))
+        {
             let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
+            return Err(err);
         }
 
         std::fs::rename(&tmp_path, &path)?;
+        crate::fs::flush_dir(parent)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ChunkHash) -> std::io::Result<()> {
+        let path = self.0.join(self.path_from_chunk(chunk));
+        std::fs::remove_file(&path)?;
+
+        for parent in path.ancestors().skip(1).take(2) {
+            if std::fs::read_dir(parent)?.next().is_some() {
+                break;
+            }
+            std::fs::remove_dir(parent)?;
+        }
 
         Ok(())
     }
 
-    fn delete_chunk_content(&self, chunk: &ChunkHash) -> std::io::Result<()> {
-        let mut path = self.0.join(self.path_from_chunk(chunk));
-        std::fs::remove_file(&path)?;
-
-        while let Some(parent) = path.parent() {
-            if parent == self.0 {
-                break;
-            }
-
-            if std::fs::read_dir(parent)?.count() == 0 {
-                std::fs::remove_dir(parent)?;
-            } else {
-                break;
-            }
-
-            path = parent.to_path_buf();
-        }
-
-        Ok(())
+    fn sync(&self) -> std::io::Result<()> {
+        crate::fs::sync_filesystem(&self.0)
     }
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ChunkHash>> {
         let mut hashes = Vec::new();
 
-        let root = &self.0;
-
-        let top_entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(hashes),
-            Err(e) => return Err(e),
+        let entries = |path: PathBuf, dirs: bool| -> std::io::Result<Vec<std::fs::DirEntry>> {
+            let entries = match std::fs::read_dir(path) {
+                Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            entries
+                .into_iter()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir() == dirs))
+                .map(Ok)
+                .collect()
         };
 
-        for top_entry in top_entries {
-            let top_entry = top_entry?;
-            if !top_entry.file_type()?.is_dir() {
-                continue;
-            }
-
-            let dir1_name = match top_entry.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            if dir1_name.len() != 2 || !dir1_name.chars().all(|c| c.is_ascii_hexdigit()) {
-                continue;
-            }
-
-            for mid_entry in std::fs::read_dir(top_entry.path())? {
-                let mid_entry = mid_entry?;
-                if !mid_entry.file_type()?.is_dir() {
-                    continue;
-                }
-
-                let dir2_name = match mid_entry.file_name().into_string() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                if dir2_name.len() != 2 || !dir2_name.chars().all(|c| c.is_ascii_hexdigit()) {
-                    continue;
-                }
-
-                for file_entry in std::fs::read_dir(mid_entry.path())? {
-                    let file_entry = file_entry?;
-                    if !file_entry.file_type()?.is_file() {
-                        continue;
-                    }
-
-                    let file_name = match file_entry.file_name().into_string() {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    if file_name.contains(".tmp") {
-                        continue;
-                    }
-
-                    if let Some(hash) = Self::parse_chunk_path(&dir1_name, &dir2_name, &file_name) {
+        for first in entries(self.0.clone(), true)? {
+            for second in entries(first.path(), true)? {
+                for file in entries(second.path(), false)? {
+                    let name = format!(
+                        "{}{}{}",
+                        first.file_name().to_string_lossy(),
+                        second.file_name().to_string_lossy(),
+                        file.file_name().to_string_lossy()
+                    );
+                    if let Some(hash) = parse_chunk_name(&name) {
                         hashes.push(hash);
                     }
                 }
@@ -204,4 +121,18 @@ impl ChunkStorage for ChunkStorageLocal {
 
         Ok(hashes)
     }
+}
+
+fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
+    let hex = name.strip_suffix(".chunk")?;
+    if hex.len() != 64 {
+        return None;
+    }
+
+    let mut hash = [0; 32];
+    for (byte, pair) in hash.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+
+    Some(hash)
 }

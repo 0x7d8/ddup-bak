@@ -1,74 +1,52 @@
-use super::ChunkIndex;
-use crate::archive::entries::FileEntry;
-use std::io::Read;
+use super::{ChunkHash, HashAlgorithm, storage::ChunkStorage};
+use crate::lock::Lock;
+use std::{io::Read, sync::Arc};
 
+/// Streams a repository file entry chunk by chunk. Holds a shared repository lock so chunks
+/// cannot be deleted while it is alive.
 pub struct EntryReader {
-    pub entry: Box<FileEntry>,
-    pub chunk_index: ChunkIndex,
-
-    finished: bool,
+    hashes: std::vec::IntoIter<ChunkHash>,
+    storage: Arc<dyn ChunkStorage>,
+    algorithm: HashAlgorithm,
+    _lock: Lock,
     buffer: Vec<u8>,
-    buffer_pos: usize,
+    position: usize,
 }
 
 impl EntryReader {
-    pub fn new(entry: Box<FileEntry>, chunk_index: ChunkIndex) -> Self {
+    pub fn new(
+        hashes: Vec<ChunkHash>,
+        storage: Arc<dyn ChunkStorage>,
+        algorithm: HashAlgorithm,
+        lock: Lock,
+    ) -> Self {
         Self {
-            entry,
-            chunk_index,
-            finished: false,
+            hashes: hashes.into_iter(),
+            storage,
+            algorithm,
+            _lock: lock,
             buffer: Vec::new(),
-            buffer_pos: 0,
+            position: 0,
         }
-    }
-
-    fn fill_buffer(&mut self) -> std::io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-
-        if self.buffer_pos < self.buffer.len() {
-            return Ok(());
-        }
-
-        self.buffer.clear();
-        self.buffer_pos = 0;
-
-        let Some(chunk_id) = crate::varint::decode_u64_opt(&mut self.entry)? else {
-            self.finished = true;
-            return Ok(());
-        };
-
-        let mut chunk = self.chunk_index.read_chunk_id_content(chunk_id)?;
-        chunk.read_to_end(&mut self.buffer)?;
-
-        Ok(())
     }
 }
 
 impl Read for EntryReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.buffer_pos >= self.buffer.len() {
-            self.fill_buffer()?;
+        while self.position >= self.buffer.len() {
+            let Some(hash) = self.hashes.next() else {
+                return Ok(0);
+            };
+
+            self.buffer = super::read_chunk(&*self.storage, self.algorithm, &hash)?;
+            self.position = 0;
         }
 
-        if self.buffer_pos >= self.buffer.len() {
-            return Ok(0);
-        }
+        let available = &self.buffer[self.position..];
+        let len = available.len().min(buf.len());
+        buf[..len].copy_from_slice(&available[..len]);
+        self.position += len;
 
-        let bytes_available = self.buffer.len() - self.buffer_pos;
-        let bytes_to_copy = std::cmp::min(bytes_available, buf.len());
-
-        buf[..bytes_to_copy]
-            .copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + bytes_to_copy]);
-
-        self.buffer_pos += bytes_to_copy;
-
-        if bytes_to_copy < buf.len() && self.buffer_pos >= self.buffer.len() && !self.finished {
-            let additional_bytes = self.read(&mut buf[bytes_to_copy..])?;
-            return Ok(bytes_to_copy + additional_bytes);
-        }
-
-        Ok(bytes_to_copy)
+        Ok(len)
     }
 }

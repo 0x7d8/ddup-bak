@@ -1,21 +1,27 @@
 package ddupbak
 
-// #include <stdlib.h>
-// #include <stdint.h>
-// #include <libddupbak.h>
+/*
+#include <libddupbak.h>
+*/
 import "C"
+
 import (
 	"errors"
 	"time"
 	"unsafe"
 )
 
-// Entry represents a filesystem entry in an archive
+var errEntryClosed = errors.New("ddupbak: entry is closed")
+
+// Entry is a file, directory or symlink inside an archive. Entries from Archive.Entries or
+// DirectoryEntry.Entries are owned by their archive and freed with it; Free on them is a no-op.
+// Entries from Archive.FindEntry are owned by the caller.
 type Entry struct {
 	entry *C.struct_CEntry
+	owned bool
 }
 
-// EntryCommon contains common metadata for all entry types
+// EntryCommon is the metadata every entry type has.
 type EntryCommon struct {
 	Name  string
 	Mode  uint16
@@ -25,7 +31,6 @@ type EntryCommon struct {
 	Type  EntryType
 }
 
-// FileEntry represents a file in an archive
 type FileEntry struct {
 	Common         EntryCommon
 	Compression    CompressionFormat
@@ -34,223 +39,163 @@ type FileEntry struct {
 	SizeCompressed uint64
 }
 
-// DirectoryEntry represents a directory in an archive
 type DirectoryEntry struct {
 	Common  EntryCommon
 	Entries []*Entry
 }
 
-// SymlinkEntry represents a symbolic link in an archive
 type SymlinkEntry struct {
 	Common    EntryCommon
 	Target    string
 	TargetDir bool
 }
 
-// Free releases resources associated with the entry
+// Free releases an entry obtained from Archive.FindEntry; a no-op for archive-owned entries.
 func (e *Entry) Free() {
-	if e.entry != nil {
+	if e.entry != nil && e.owned {
 		C.free_entry(e.entry)
-		e.entry = nil
 	}
+	e.entry = nil
 }
 
-// Type returns the type of this entry
+// Close is Free.
+func (e *Entry) Close() { e.Free() }
+
 func (e *Entry) Type() EntryType {
 	if e.entry == nil {
 		return EntryTypeFile
 	}
-
-	entryType := C.get_entry_type(e.entry)
-	return EntryType(entryType)
+	return EntryType(C.get_entry_type(e.entry))
 }
 
-// Name returns the name of this entry
 func (e *Entry) Name() string {
 	if e.entry == nil {
 		return ""
 	}
-
-	cName := C.entry_name(e.entry)
-	if cName == nil {
-		return ""
-	}
-
-	return C.GoString(cName)
+	return C.GoString(C.entry_name(e.entry))
 }
 
-// GetCommon returns common metadata for this entry
+// GetCommon returns the metadata shared by all entry types.
 func (e *Entry) GetCommon() (EntryCommon, error) {
 	if e.entry == nil {
-		return EntryCommon{}, errors.New("entry is closed")
+		return EntryCommon{}, errEntryClosed
 	}
 
-	cCommon := C.entry_get_common(e.entry)
-	if cCommon == nil {
-		return EntryCommon{}, errors.New("failed to get entry common data")
+	common := C.entry_get_common(e.entry)
+	if common == nil {
+		return EntryCommon{}, errors.New("ddupbak: invalid entry")
 	}
 
-	result := EntryCommon{
-		Name:  C.GoString(cCommon.name),
-		Mode:  uint16(cCommon.mode),
-		UID:   uint32(cCommon.uid),
-		GID:   uint32(cCommon.gid),
-		MTime: time.Unix(int64(cCommon.mtime), 0),
-		Type:  EntryType(cCommon.entry_type),
-	}
-
-	return result, nil
+	return EntryCommon{
+		Name:  C.GoString(common.name),
+		Mode:  uint16(common.mode),
+		UID:   uint32(common.uid),
+		GID:   uint32(common.gid),
+		MTime: time.Unix(int64(common.mtime), 0),
+		Type:  EntryType(common.entry_type),
+	}, nil
 }
 
-// AsFile converts this entry to a FileEntry
+// Common is GetCommon.
+func (e *Entry) Common() (EntryCommon, error) { return e.GetCommon() }
+
 func (e *Entry) AsFile() (*FileEntry, error) {
-	if e.entry == nil {
-		return nil, errors.New("entry is closed")
-	}
-
-	if e.Type() != EntryTypeFile {
-		return nil, errors.New("entry is not a file")
-	}
-
-	cFile := C.entry_as_file(e.entry)
-	if cFile == nil {
-		return nil, errors.New("failed to convert entry to file")
-	}
-
 	common, err := e.GetCommon()
 	if err != nil {
 		return nil, err
 	}
 
-	result := &FileEntry{
+	file := C.entry_as_file(e.entry)
+	if file == nil {
+		return nil, errors.New("ddupbak: entry is not a file")
+	}
+
+	return &FileEntry{
 		Common:         common,
-		Compression:    CompressionFormat(cFile.compression),
-		Size:           uint64(cFile.size),
-		SizeReal:       uint64(cFile.size_real),
-		SizeCompressed: uint64(cFile.size_compressed),
-	}
-
-	return result, nil
+		Compression:    CompressionFormat(file.compression),
+		Size:           uint64(file.size),
+		SizeReal:       uint64(file.size_real),
+		SizeCompressed: uint64(file.size_compressed),
+	}, nil
 }
 
-// AsDirectory converts this entry to a DirectoryEntry
 func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
-	if e.entry == nil {
-		return nil, errors.New("entry is closed")
-	}
-
-	if e.Type() != EntryTypeDirectory {
-		return nil, errors.New("entry is not a directory")
-	}
-
-	cDir := C.entry_as_directory(e.entry)
-	if cDir == nil {
-		return nil, errors.New("failed to convert entry to directory")
-	}
-
 	common, err := e.GetCommon()
 	if err != nil {
 		return nil, err
 	}
 
-	entriesCount := int(cDir.entries_count)
-	entries := make([]*Entry, 0, entriesCount)
-
-	for i := 0; i < entriesCount; i++ {
-		// Get pointer to the i-th entry
-		entryPtrPtr := (**C.struct_CEntry)(unsafe.Pointer(
-			uintptr(unsafe.Pointer(cDir.entries)) + uintptr(i)*unsafe.Sizeof(uintptr(0)),
-		))
-
-		if *entryPtrPtr != nil {
-			// Create a new Entry wrapper around the C pointer
-			entry := &Entry{entry: *entryPtrPtr}
-			entries = append(entries, entry)
-		}
+	dir := C.entry_as_directory(e.entry)
+	if dir == nil {
+		return nil, errors.New("ddupbak: entry is not a directory")
 	}
 
-	result := &DirectoryEntry{
-		Common:  common,
-		Entries: entries,
+	entries := make([]*Entry, 0, int(dir.entries_count))
+	for _, child := range unsafe.Slice(dir.entries, int(dir.entries_count)) {
+		entries = append(entries, &Entry{entry: child})
 	}
 
-	return result, nil
+	return &DirectoryEntry{Common: common, Entries: entries}, nil
 }
 
-// AsSymlink converts this entry to a SymlinkEntry
 func (e *Entry) AsSymlink() (*SymlinkEntry, error) {
-	if e.entry == nil {
-		return nil, errors.New("entry is closed")
-	}
-
-	if e.Type() != EntryTypeSymlink {
-		return nil, errors.New("entry is not a symlink")
-	}
-
-	cSymlink := C.entry_as_symlink(e.entry)
-	if cSymlink == nil {
-		return nil, errors.New("failed to convert entry to symlink")
-	}
-
 	common, err := e.GetCommon()
 	if err != nil {
 		return nil, err
 	}
 
-	result := &SymlinkEntry{
-		Common:    common,
-		Target:    C.GoString(cSymlink.target),
-		TargetDir: bool(cSymlink.target_dir),
+	link := C.entry_as_symlink(e.entry)
+	if link == nil {
+		return nil, errors.New("ddupbak: entry is not a symlink")
 	}
 
-	return result, nil
+	return &SymlinkEntry{
+		Common:    common,
+		Target:    C.GoString(link.target),
+		TargetDir: bool(link.target_dir),
+	}, nil
 }
 
-// RecursiveFree frees an entry and all its children if it's a directory
+// RecursiveFree frees an entry and, for directories, its children. Archive-owned entries are
+// left to the archive.
 func RecursiveFree(e *Entry) {
-	if e == nil {
+	if e == nil || e.entry == nil {
 		return
 	}
 
-	// If it's a directory, free all its children first
 	if e.Type() == EntryTypeDirectory {
-		dir, err := e.AsDirectory()
-		if err == nil && dir != nil {
-			for _, childEntry := range dir.Entries {
-				RecursiveFree(childEntry)
+		if dir, err := e.AsDirectory(); err == nil {
+			for _, child := range dir.Entries {
+				RecursiveFree(child)
 			}
 		}
 	}
-
-	// Then free the entry itself
 	e.Free()
 }
 
-// ProcessDirectoryEntries processes all entries in a directory recursively
-// This is a helper function that can be used to traverse directories
+// ProcessDirectoryEntries calls processFn for every entry below dirEntry, depth first.
 func ProcessDirectoryEntries(dirEntry *DirectoryEntry, processFn func(*Entry) error) error {
 	if dirEntry == nil {
-		return errors.New("directory entry is nil")
+		return errors.New("ddupbak: directory entry is nil")
 	}
 
 	for _, entry := range dirEntry.Entries {
-		// Process this entry
 		if err := processFn(entry); err != nil {
 			return err
 		}
 
-		// If it's a directory, process its entries recursively
 		if entry.Type() == EntryTypeDirectory {
-			subDir, err := entry.AsDirectory()
+			sub, err := entry.AsDirectory()
 			if err != nil {
 				return err
 			}
-
-			if err := ProcessDirectoryEntries(subDir, processFn); err != nil {
+			if err := ProcessDirectoryEntries(sub, processFn); err != nil {
 				return err
 			}
 		}
 	}
-
 	return nil
 }
+
+// Walk is ProcessDirectoryEntries.
+func Walk(dir *DirectoryEntry, fn func(*Entry) error) error { return ProcessDirectoryEntries(dir, fn) }

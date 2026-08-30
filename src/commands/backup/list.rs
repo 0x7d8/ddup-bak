@@ -3,7 +3,7 @@ use clap::ArgMatches;
 use colored::Colorize;
 
 pub fn list(_matches: &ArgMatches) -> std::io::Result<i32> {
-    let repository = open_repository(false);
+    let repository = open_repository();
 
     println!("{}", "listing backups...".bright_black());
 

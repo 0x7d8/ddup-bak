@@ -4,13 +4,13 @@ use colored::Colorize;
 use std::sync::Arc;
 
 pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
-    let repository = open_repository(true);
+    let repository = open_repository();
     let name = matches.get_one::<String>("name").expect("required");
 
     if !repository
         .list_archives()?
-        .into_iter()
-        .any(|name| name == *name)
+        .iter()
+        .any(|backup| backup == name)
     {
         println!(
             "{} {} {}",
@@ -18,7 +18,6 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
             name.cyan(),
             "does not exist!".red()
         );
-
         return Ok(1);
     }
 
@@ -38,15 +37,14 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
         name,
         Some({
             let progress = progress.clone();
-
-            Arc::new(move |chunk, deleted| {
+            Arc::new(move |hash, deleted| {
                 progress.set_text(format!(
                     "{} {}",
-                    format!("chunk #{chunk}").cyan(),
+                    ddup_bak::chunks::hex(hash)[..12].cyan(),
                     if deleted {
                         "(deleted)".green()
                     } else {
-                        "(not deleted)".red()
+                        "(kept)".bright_black()
                     }
                 ));
             })
@@ -54,7 +52,6 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
     )?;
 
     progress.finish();
-
     println!(
         "{} {}",
         "deleting backup...".bright_black(),

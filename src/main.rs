@@ -42,6 +42,15 @@ fn cli() -> Command {
                         .value_parser(clap::value_parser!(usize))
                         .required(false),
                 )
+                .arg(
+                    Arg::new("hash")
+                        .help("The hash identifying chunks. Fixed for the lifetime of the repository")
+                        .long("hash")
+                        .num_args(1)
+                        .value_parser(["blake2b", "blake3"])
+                        .default_value("blake2b")
+                        .required(false),
+                )
                 .arg_required_else_help(false),
         )
         .subcommand(
@@ -115,6 +124,7 @@ fn cli() -> Command {
                                 .short('c')
                                 .long("compression")
                                 .num_args(1)
+                                .value_parser(["none", "gzip", "deflate", "brotli", "zstd"])
                                 .default_value("deflate")
                                 .required(false),
                         )

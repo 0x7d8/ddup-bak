@@ -1,4 +1,8 @@
 pub mod archive;
 pub mod chunks;
+pub mod lock;
 pub mod repository;
+
+mod cache;
+mod fs;
 mod varint;

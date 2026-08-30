@@ -11,9 +11,8 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         .get_one::<usize>("max_chunk_count")
         .expect("required");
 
-    if !std::path::Path::new(directory).join(".ddup-bak").exists() {
+    if !Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "does not exist!".red());
-
         return Ok(1);
     }
 
@@ -34,9 +33,7 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         )
     });
 
-    progress.finish();
-
-    Repository::open_or_rebuild(
+    let repository = Repository::rebuild(
         Path::new(directory),
         chunk_size,
         max_chunk_count,
@@ -44,17 +41,16 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         None,
         Some({
             let progress = progress.clone();
-
-            Arc::new(move |chunk, _chunk_hash, references| {
+            Arc::new(move |hash, references| {
                 progress.set_text(format!(
-                    "{} ({} references)",
-                    format!("chunk #{chunk}").cyan(),
-                    references
+                    "{} ({references} references)",
+                    ddup_bak::chunks::hex(hash)[..12].cyan()
                 ));
             })
         }),
     )?;
 
+    progress.finish();
     println!(
         "{} {} {} {}",
         "rebuilding".bright_black(),
@@ -62,6 +58,25 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         "...".bright_black(),
         "DONE".green().bold()
     );
+
+    // Anything left unreadable is what the rebuild could not account for, and it is why
+    // cleaning is now refused, so say so rather than leaving it to be discovered.
+    let unreadable = repository.unreadable_archives()?;
+    if !unreadable.is_empty() {
+        println!();
+        println!(
+            "{} {}",
+            "could not read:".red(),
+            unreadable.join(", ").cyan()
+        );
+        if let Err(err) = repository.get_archive(&unreadable[0]) {
+            println!("{} {}", unreadable[0].cyan(), err);
+        }
+        println!(
+            "{}",
+            "their chunks are kept and no chunk can be deleted until they are gone".bright_black()
+        );
+    }
 
     Ok(0)
 }

@@ -135,8 +135,29 @@ index and then removes it from there. an archive left in `deleting` means the in
 the next delete, clean or rebuild recounts those chunks from the archives that remain before going on,
 and a delete does so without saving the index until its own chunks are freed. a backup meanwhile checks
 that every chunk it reuses is there, so it needs no recount. a backup writes `.partial-<hash>` in
-`archives` and moves it into place last; `clean` removes any left behind. restoring an archive into `.ddup-bak/archives-restored/<name>` takes
-`.ddup-bak/restore-locks/<name>` exclusively, so two such restores run in turn.
+`archives` and moves it into place last; `clean` removes any left behind. the archive-name existence
+check is made under the exclusive index lock, so a waiting creator cannot replace a just-published
+archive with the same name. existing symlinks also reserve archive names.
+
+CLI restores and restores into `.ddup-bak/archives-restored/<name>` take a lock in
+`.ddup-bak/restore-locks/destination-<hash>` keyed by the canonical destination. the destination
+must be a directory, not a symlink. each operation exclusively creates a private
+`.ddup-bak-restore-<pid>-<counter>` directory inside it, on the same filesystem. restored data goes
+into `new`; only after every entry has decoded successfully are old destination entries renamed
+into `previous` and new entries moved into place. original entries are removed only after all
+publication moves succeed. ownership is applied before final permissions, preserving setuid/setgid.
+
+a failed move rolls back the entries already moved. if rollback also fails, the error names the
+recovery directory; originals remain in the destination and/or `previous`, and that directory is
+not removed. `.ddup-bak`, `.ddup-bak-restore`, and `.ddup-bak-restore-*` destination entries are
+reserved and preserved, including recovery directories from interrupted operations. archives
+containing those top-level names cannot replace destination contents through this operation.
+inspect and recover any retained `previous` entries before manually removing their staging
+directory. a process killed during publication can leave a mixture of old and new entries;
+this rollback protocol is not a whole-directory atomic swap or a power-loss guarantee. other
+writers, including restores from another repository, must not modify the same destination during
+publication. the non-replacing `restore_archive_to` / `restore_entries_to` APIs retain their
+existing behavior: they do not overwrite existing destination paths.
 
 ### changes from version 1
 

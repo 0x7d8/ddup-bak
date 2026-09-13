@@ -487,15 +487,20 @@ impl Repository {
         threads: usize,
     ) -> std::io::Result<Archive> {
         let archive_path = self.archive_path(name)?;
-        if archive_path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("archive {name} already exists"),
-            ));
-        }
-
         let _chunks_lock = Lock::shared(&self.chunks_lock_path())?;
         let _index_lock = Lock::exclusive(&self.index_lock_path())?;
+        // Check while holding the writer lock: a caller waiting for another creator must
+        // observe the archive that creator published. A dangling symlink also reserves a name.
+        match archive_path.symlink_metadata() {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("archive {name} already exists"),
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
         let index = ChunkIndex::load(&self.index_path())?;
 
         let root = root.unwrap_or(&self.directory);
@@ -708,17 +713,45 @@ impl Repository {
         threads: usize,
     ) -> std::io::Result<PathBuf> {
         let destination = self.restored_path(name)?;
-        // Restores into an archive's own place take turns. The lock carries the archive's name,
-        // so the file system decides which names are one archive.
+        self.restore_entries_replacing(entries, &destination, progress, threads)?;
+        Ok(destination)
+    }
+
+    /// Replaces a destination's contents after restoring every entry into private staging.
+    /// Existing entries are retained until publication succeeds, and restored on a move error.
+    /// If rollback also fails, the error names the directory retaining the original entries.
+    /// Repository metadata and existing `.ddup-bak-restore` / `.ddup-bak-restore-*` entries
+    /// are reserved and preserved, including leftovers of an interrupted restore.
+    /// Like other filesystem operations, publication is not atomic against external writers
+    /// or a machine crash. Restores from this repository to the same destination take turns.
+    pub fn restore_entries_replacing(
+        &self,
+        entries: Vec<Entry>,
+        destination: &Path,
+        progress: ProgressCallback,
+        threads: usize,
+    ) -> std::io::Result<()> {
+        let _lock = Lock::shared(&self.chunks_lock_path())?;
+        match destination.symlink_metadata() {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "restore destination must be a directory, not a file or symlink",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        crate::fs::create_dir_all(destination)?;
+        let destination = destination.canonicalize()?;
         let locks = self.directory.join(".ddup-bak/restore-locks");
         crate::fs::create_dir_all(&locks)?;
-        crate::fs::create_dir_all(destination.parent().unwrap())?;
-        let _turn = Lock::exclusive(&locks.join(name))?;
-        if destination.symlink_metadata().is_ok() {
-            remove_restored(&destination)?;
-        }
-        self.restore_entries_to(entries, &destination, progress, threads)?;
-        Ok(destination)
+        let key = chunks::hex(blake3::hash(destination.as_os_str().as_encoded_bytes()).as_bytes());
+        let _turn = Lock::exclusive(&locks.join(format!("destination-{}", &key[..16])))?;
+        let mut staging = crate::restore::StagedRestore::new(&destination)?;
+        self.restore_entries_to(entries, &staging.path(), progress, threads)?;
+        staging.publish(&destination)
     }
 
     pub fn restore_archive_to(
@@ -1149,9 +1182,10 @@ fn restore_entry(
                 )));
             }
 
-            file_entry.mode.apply(&path)?;
+            // chown can clear setuid/setgid, so permissions must be applied last.
+            chown(&path, file_entry.owner)?;
             file.set_times(FileTimes::new().set_modified(file_entry.mtime))?;
-            chown(&path, file_entry.owner)
+            file_entry.mode.apply(&path)
         }
         Entry::Directory(dir_entry) => {
             let DirectoryEntry {
@@ -1180,9 +1214,9 @@ fn restore_entry(
 
             // Opened before the mode goes on, which may take away the right to open it.
             let directory = File::open(&path)?;
-            mode.apply(&path)?;
+            chown(&path, owner)?;
             directory.set_times(FileTimes::new().set_modified(mtime))?;
-            chown(&path, owner)
+            mode.apply(&path)
         }
         Entry::Symlink(link_entry) => {
             symlink(&link_entry, &path)?;

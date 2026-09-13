@@ -1,13 +1,11 @@
 use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::{archive::entries::Entry, lock::Lock};
+use ddup_bak::archive::entries::Entry;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-const STAGING_DIR: &str = ".ddup-bak-restore";
 
 pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository();
@@ -52,36 +50,19 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
         let progress = progress.clone();
         Arc::new(move |_: &Path| progress.incr(1usize)) as Arc<_>
     });
-    // Restore into a fresh directory on the destination's filesystem, then swap it in, so a
-    // failed restore never touches the existing destination contents. Without a destination
-    // the repository restores into its own place, where restores of one archive take turns.
-    // Restores into one destination take turns, from staging through the swap below.
-    let mut turn = None;
-    let staging = match &destination {
+    match &destination {
         Some(destination) => {
-            std::fs::create_dir_all(destination)?;
-            let locks = repository.directory.join(".ddup-bak/restore-locks");
-            std::fs::create_dir_all(&locks)?;
-            let key = ddup_bak::chunks::hex(
-                blake3::hash(destination.canonicalize()?.as_os_str().as_encoded_bytes()).as_bytes(),
-            );
-            turn = Some(Lock::exclusive(
-                &locks.join(format!("destination-{}", &key[..16])),
-            )?);
-            let staging = destination.join(STAGING_DIR);
-            remove_if_exists(&staging)?;
-            repository.restore_entries_to(
+            repository.restore_entries_replacing(
                 archive.into_entries(),
-                &staging,
+                destination,
                 progress_callback,
                 threads,
             )?;
-            staging
         }
         None => {
-            repository.restore_entries(name, archive.into_entries(), progress_callback, threads)?
+            repository.restore_entries(name, archive.into_entries(), progress_callback, threads)?;
         }
-    };
+    }
 
     progress.finish();
     println!(
@@ -89,38 +70,6 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
         "restoring backup...".bright_black(),
         "DONE".green().bold()
     );
-
-    if let Some(destination) = destination {
-        println!(
-            "{} {}{}",
-            "restoring to".bright_black(),
-            destination.display().to_string().cyan(),
-            "...".bright_black()
-        );
-
-        for entry in std::fs::read_dir(&destination)? {
-            let entry = entry?;
-            if entry.file_name() == ".ddup-bak" || entry.file_name() == STAGING_DIR {
-                continue;
-            }
-            remove_if_exists(&entry.path())?;
-        }
-
-        for entry in std::fs::read_dir(&staging)? {
-            let entry = entry?;
-            std::fs::rename(entry.path(), destination.join(entry.file_name()))?;
-        }
-        std::fs::remove_dir(&staging)?;
-        drop(turn);
-
-        println!(
-            "{} {} {} {}",
-            "restoring to".bright_black(),
-            destination.display().to_string().cyan(),
-            "...".bright_black(),
-            "DONE".green().bold()
-        );
-    }
 
     Ok(0)
 }
@@ -130,8 +79,4 @@ fn count_entries(entry: &Entry) -> usize {
         Entry::Directory(dir) => 1 + dir.entries.iter().map(count_entries).sum::<usize>(),
         _ => 1,
     }
-}
-
-fn remove_if_exists(path: &Path) -> std::io::Result<()> {
-    ddup_bak::repository::remove_restored(path)
 }

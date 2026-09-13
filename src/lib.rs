@@ -6,3 +6,4 @@ pub mod varint;
 
 mod cache;
 mod fs;
+mod restore;

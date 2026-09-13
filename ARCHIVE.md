@@ -118,20 +118,23 @@ and fixed for its lifetime, since chunk files are named by it.
 
 `.ddup-bak/chunks/index` caches reference counts and can always be rebuilt from the archives:
 
-`    u8[8]      ` - `DDUPIDX3`<br>
+`    u8[8]      ` - `DDUPIDX4`<br>
 `    u32        ` - LE average chunk size<br>
 `    u32        ` - LE max chunk count per file (0 = unlimited)<br>
 `    u8         ` - hash algorithm<br>
 `    u64        ` - LE entry count<br>
-`...entry      ` - `u8[32]` chunk hash followed by `varint(u64)` reference count
+`...entry      ` - `u8[32]` chunk hash followed by `varint(u64)` reference count<br>
+`    u8[32]     ` - BLAKE3 hash of everything above, checked when the index is loaded
 
-two older index formats are still read: `DDUPIDX2`, a deflate stream with the same fields minus the hash
+three older index formats are still read: `DDUPIDX3`, the same without the trailing hash; `DDUPIDX2`, a deflate stream with the same fields minus the hash
 algorithm byte and always BLAKE3-256, and format 1, a deflate stream keyed by index-assigned chunk ids.
 
-deleting an archive moves it to `.ddup-bak/deleting/<name>.ddup`, removes the chunks only it referenced,
-saves the index and then removes it from there. an archive left in `deleting` means the index may still
-count it; the next backup, delete, clean or rebuild recounts those chunks from the archives that remain
-before going on, and a delete does so without saving the index until its own chunks are freed.
+deleting an archive moves it to `.ddup-bak/deleting/<name>.ddup` (`<name>.ddup.1` and so on while that
+is taken, the name cut to fit), removes the chunks only it referenced, saves the index and then removes it from there. an
+archive left in `deleting` means the index may still count it; the next backup, delete, clean or rebuild
+recounts those chunks from the archives that remain before going on, and a delete does so without saving
+the index until its own chunks are freed. restoring an archive into `.ddup-bak/archives-restored/<name>` takes
+`.ddup-bak/restore-locks/<name>` exclusively, so two such restores run in turn.
 
 ### changes from version 1
 

@@ -323,6 +323,12 @@ impl Archive {
         for _ in 0..entries_count {
             entries.push(Self::decode_entry(&mut decoder, &file, &limits, 0)?);
         }
+        // Entries the footer leaves out would go uncounted and have their chunks cleaned away.
+        if decoder.read(&mut [0])? != 0 {
+            return Err(invalid(
+                "entry table holds more entries than the footer counts",
+            ));
+        }
 
         Ok(Self {
             file,
@@ -674,8 +680,9 @@ impl Archive {
 
         let uid = varint::decode_u32(decoder)?;
         let gid = varint::decode_u32(decoder)?;
-        let mtime =
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(varint::decode(decoder)?);
+        let mtime = SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(varint::decode(decoder)?))
+            .ok_or_else(|| invalid("entry timestamp is out of range"))?;
         let size = varint::decode(decoder)?;
 
         match entry_type {

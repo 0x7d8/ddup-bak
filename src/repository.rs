@@ -104,6 +104,8 @@ impl Repository {
         if header.version == 1 {
             repository.migrate_v1(Salvage::No)?;
         }
+        // Created now so a delete on a full disk does not have to. Failing is fine here.
+        let _ = crate::fs::create_dir_all(&repository.directory.join(".ddup-bak/deleting"));
         Ok(repository)
     }
 
@@ -127,32 +129,46 @@ impl Repository {
 
         // Format 1 archives can only be resolved through the index of their era, so finish that
         // migration while it is still possible, keeping whatever a damaged index still decodes.
-        if ChunkIndex::load_header(&repository.index_path()).is_ok_and(|header| header.version == 1)
-        {
-            repository.migrate_v1(Salvage::Yes)?;
+        match ChunkIndex::load_header(&repository.index_path()) {
+            Ok(header) if header.version == 1 => repository.migrate_v1(Salvage::Yes)?,
+            Ok(_) => {}
+            // No index, or one too damaged to say what it is, leaves nothing to migrate from.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound || chunks::is_damage(&err) => {}
+            Err(err) => return Err(err),
         }
 
         let _lock = Lock::exclusive(&repository.chunks_lock_path())?;
-        repository.hash_algorithm = chunks::detect_hash_algorithm(&*repository.storage)?;
+        repository.hash_algorithm = match chunks::detect_hash_algorithm(&*repository.storage)? {
+            Some(algorithm) => algorithm,
+            // Nothing stored to tell from: keep what the archives were written with.
+            None => match ChunkIndex::load_header(&repository.index_path()) {
+                Ok(header) => header.hash_algorithm,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound || chunks::is_damage(&err) =>
+                {
+                    HashAlgorithm::default()
+                }
+                Err(err) => return Err(err),
+            },
+        };
 
-        let names = repository.list_archives()?;
         let index = ChunkIndex::rebuild(
             chunk_size,
             max_chunk_count,
             repository.hash_algorithm,
             &*repository.storage,
-            names
-                .iter()
-                .filter_map(|name| repository.get_archive(name).ok().map(Ok)),
+            repository.countable_archives()?,
             |hash, references| {
                 if let Some(progress) = &progress {
                     progress(hash, references);
                 }
             },
         )?;
+        // The index leaves out what was moved into `deleting`, so those moves go on disk first.
+        repository.sync_archive_dirs()?;
         index.save(&repository.index_path())?;
-        for name in repository.pending_deletions()? {
-            std::fs::remove_file(repository.deleting_path(&name))?;
+        for marker in repository.pending_markers()? {
+            std::fs::remove_file(marker)?;
         }
 
         Ok(repository)
@@ -176,10 +192,11 @@ impl Repository {
         }
         let _chunks_lock = Lock::exclusive(&self.chunks_lock_path())?;
         let _index_lock = Lock::exclusive(&self.index_lock_path())?;
-        if ChunkIndex::load_header(&self.index_path())?.version != 1 {
+        let header = ChunkIndex::load_header(&self.index_path())?;
+        if header.version != 1 {
             return Ok(());
         }
-        let (index, ids) = if salvage == Salvage::Yes {
+        let (_, ids) = if salvage == Salvage::Yes {
             ChunkIndex::salvage_v1(&self.index_path())
         } else {
             ChunkIndex::load_v1(&self.index_path())
@@ -188,12 +205,7 @@ impl Repository {
         // An archive that is already damaged is left exactly as it is rather than failing the
         // migration, which would lock the reader out of every other archive beside it. Opening
         // that one archive still reports what is wrong with it.
-        let damaged = |err: &std::io::Error| {
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
-            )
-        };
+        let damaged = chunks::is_damage;
 
         for name in self.list_archives()? {
             let path = self.archive_path(&name)?;
@@ -206,7 +218,11 @@ impl Repository {
                 continue;
             }
 
-            let tmp_path = path.with_extension("ddup.migrate");
+            // Short, so the longest names migrate; set by the name, so a leftover is replaced.
+            let tmp_path = path.with_file_name(format!(
+                ".migrate-{}",
+                &chunks::hex(blake3::hash(name.as_bytes()).as_bytes())[..16]
+            ));
             let _ = std::fs::remove_file(&tmp_path);
             let mut migrated = Archive::new(crate::fs::create_new_file(&tmp_path)?)?;
             let result = migrate_v1_entries(archive.into_entries(), &migrated, &ids)
@@ -225,7 +241,45 @@ impl Repository {
         }
         crate::fs::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
 
-        index.save(&self.index_path())
+        // A salvage is followed by a rebuild, which must not find a partial index in the way.
+        if salvage == Salvage::Yes {
+            return Ok(());
+        }
+        // The old counts are not carried over: an interrupted backup of that era left them short.
+        ChunkIndex::rebuild(
+            header.chunk_size,
+            header.max_chunk_count,
+            header.hash_algorithm,
+            &*self.storage,
+            self.countable_archives()?,
+            |_, _| {},
+        )?
+        .save(&self.index_path())
+    }
+
+    /// What a recount takes in. Damaged and unmigrated archives count for nothing, and deletions
+    /// refuse to run while one is present; any other failure to read is passed on.
+    fn countable_archives(
+        &self,
+    ) -> std::io::Result<impl Iterator<Item = std::io::Result<Archive>> + '_> {
+        let mut names = Vec::new();
+        for name in self.list_archives()? {
+            match self.readability(&name)? {
+                Readability::Whole => names.push(name),
+                Readability::Damaged => {}
+                // Skipping it would save counts a build that reads it would then trust.
+                Readability::Unsupported => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "archive {name} uses a compression this build was made without, \
+                             so its chunks cannot be counted; use a build that has it"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(names.into_iter().map(move |name| self.get_archive(&name)))
     }
 
     fn legacy_writer(&self) -> Option<u32> {
@@ -269,7 +323,10 @@ impl Repository {
         storage: Option<Arc<dyn ChunkStorage>>,
         progress: RebuildProgressCallback,
     ) -> std::io::Result<Self> {
-        match Self::open(directory, chunks_directory, storage.clone()) {
+        // Opening reads only the index header; here the records are checked too.
+        let opened = Self::open(directory, chunks_directory, storage.clone())
+            .and_then(|repository| ChunkIndex::load(&repository.index_path()).map(|_| repository));
+        match opened {
             Ok(repository) => Ok(repository),
             Err(_) => Self::rebuild(
                 directory,
@@ -308,6 +365,11 @@ impl Repository {
 
     fn index_path(&self) -> PathBuf {
         self.chunks_directory.join("index")
+    }
+
+    /// Shared lock on the chunks, for holding an archive's entries across calls.
+    pub fn shared_lock(&self) -> std::io::Result<Lock> {
+        Lock::shared(&self.chunks_lock_path())
     }
 
     fn chunks_lock_path(&self) -> PathBuf {
@@ -392,12 +454,13 @@ impl Repository {
         self.recover()?;
         let _chunks_lock = Lock::shared(&self.chunks_lock_path())?;
         let _index_lock = Lock::exclusive(&self.index_lock_path())?;
-        if let Some(pending) = self.pending_deletions()?.first() {
+        if let Some(marker) = self.pending_markers()?.first() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 format!(
-                    "archive {pending} was not fully deleted, so the index cannot be trusted. \
-                     Run clean, then back up again"
+                    "{} was not fully deleted, so the index cannot be trusted. Run clean, \
+                     then back up again",
+                    marker.display()
                 ),
             ));
         }
@@ -412,7 +475,14 @@ impl Repository {
         });
 
         let cache = FileCache::load(&self.file_cache_path());
-        let archive = Archive::new(crate::fs::create_new_file(&archive_path)?)?;
+        let archive = match Archive::new(crate::fs::create_new_file(&archive_path)?) {
+            Ok(archive) => archive,
+            Err(err) => {
+                let _ = std::fs::remove_file(&archive_path);
+                return Err(err);
+            }
+        };
+        let mut published = false;
         let result = self
             .write_entries(
                 archive,
@@ -427,13 +497,16 @@ impl Repository {
             .and_then(|(mut archive, seen)| {
                 self.storage.sync()?;
                 index.save(&self.index_path())?;
-                FileCache::save(&self.file_cache_path(), seen)?;
                 archive.write_end_header()?;
+                published = true;
                 crate::fs::sync_dir(archive_path.parent().unwrap())?;
+                // The cache only saves work next time; its failure must not undo the backup.
+                let _ = FileCache::save(&self.file_cache_path(), seen);
                 Ok(archive)
             });
 
-        if result.is_err() {
+        // An archive without its end header goes; a complete one stays, since the index counts it.
+        if result.is_err() && !published {
             let _ = std::fs::remove_file(&archive_path);
         }
         result
@@ -478,7 +551,18 @@ impl Repository {
                     break;
                 }
 
-                let item = item.map_err(std::io::Error::other)?;
+                let item = match item {
+                    Ok(item) => item,
+                    // The repository's own directories are skipped below; errors in them are too.
+                    Err(err)
+                        if walk_error_path(&err).is_some_and(|path| {
+                            path.strip_prefix(root).is_ok_and(is_repository_internal)
+                        }) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(std::io::Error::other(err)),
+                };
                 let path = item.path();
                 let relative = path.strip_prefix(root).map_err(|_| {
                     invalid(format!("{} is outside {}", path.display(), root.display()))
@@ -492,8 +576,17 @@ impl Repository {
                         invalid(format!("{} is not a valid UTF-8 file name", path.display()))
                     })?
                     .to_owned();
-                if name.starts_with(".ddup-bak") {
+                // At any depth: skipping only the directory would still chunk what is under it.
+                if is_repository_internal(relative) {
                     continue;
+                }
+                // What the reader will refuse is refused here, before the archive is published.
+                let max_depth = crate::archive::DecodeLimits::default().max_depth;
+                if relative.iter().count() > max_depth {
+                    return Err(invalid(format!(
+                        "{} is nested deeper than the {max_depth} levels an archive can hold",
+                        path.display()
+                    )));
                 }
                 let parent = relative.parent().map(Path::to_path_buf).unwrap_or_default();
 
@@ -560,6 +653,8 @@ impl Repository {
         progress: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
+        // Taken before the archive is read, so no delete slips in between.
+        let _lock = Lock::shared(&self.chunks_lock_path())?;
         let archive = self.get_archive(name)?;
         self.restore_entries(name, archive.into_entries(), progress, threads)
     }
@@ -573,8 +668,14 @@ impl Repository {
         threads: usize,
     ) -> std::io::Result<PathBuf> {
         let destination = self.restored_path(name)?;
+        // Restores into an archive's own place take turns. The lock carries the archive's name,
+        // so the file system decides which names are one archive.
+        let locks = self.directory.join(".ddup-bak/restore-locks");
+        crate::fs::create_dir_all(&locks)?;
+        crate::fs::create_dir_all(destination.parent().unwrap())?;
+        let _turn = Lock::exclusive(&locks.join(name))?;
         if destination.symlink_metadata().is_ok() {
-            std::fs::remove_dir_all(&destination)?;
+            remove_restored(&destination)?;
         }
         self.restore_entries_to(entries, &destination, progress, threads)?;
         Ok(destination)
@@ -587,6 +688,7 @@ impl Repository {
         progress: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<()> {
+        let _lock = Lock::shared(&self.chunks_lock_path())?;
         let archive = self.get_archive(name)?;
         self.restore_entries_to(archive.into_entries(), destination, progress, threads)
     }
@@ -642,6 +744,7 @@ impl Repository {
         let lock = Lock::reader(&self.chunks_lock_path())?;
         Ok(EntryReader::new(
             chunks::entry_hashes(&mut file)?,
+            file.size_real,
             Arc::clone(&self.storage),
             self.hash_algorithm,
             lock,
@@ -649,11 +752,34 @@ impl Repository {
     }
 
     pub fn unreadable_archives(&self) -> std::io::Result<Vec<String>> {
-        Ok(self
-            .list_archives()?
-            .into_iter()
-            .filter(|name| self.get_archive(name).is_err())
-            .collect())
+        let mut unreadable = Vec::new();
+        for name in self.list_archives()? {
+            if self.readability(&name)? != Readability::Whole {
+                unreadable.push(name);
+            }
+        }
+        Ok(unreadable)
+    }
+
+    /// How much of an archive this build can read; any other error is passed on.
+    fn readability(&self, name: &str) -> std::io::Result<Readability> {
+        let archive = match self.get_archive(name) {
+            Ok(archive) => archive,
+            Err(err)
+                if chunks::is_damage(&err) || err.kind() == std::io::ErrorKind::Unsupported =>
+            {
+                return Ok(Readability::Damaged);
+            }
+            Err(err) => return Err(err),
+        };
+        match collect_hashes(archive.into_entries(), &mut Vec::new()) {
+            Ok(()) => Ok(Readability::Whole),
+            Err(err) if chunks::is_damage(&err) => Ok(Readability::Damaged),
+            Err(err) if err.kind() == std::io::ErrorKind::Unsupported => {
+                Ok(Readability::Unsupported)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn refuse_deletion_while_unreadable(&self) -> std::io::Result<()> {
@@ -675,7 +801,7 @@ impl Repository {
     /// Chunks are deleted before the index is saved, so pruning frees space even when the
     /// disk is too full for the index. The archive is moved to `.ddup-bak/deleting` first,
     /// which needs no space, and removed from there last; one left behind by a crash or error
-    /// is settled by `settle_pending` before anything trusts the index again.
+    /// is settled by `settle_pending`, and saved only once this archive's chunks are freed.
     pub fn delete_archive(
         &self,
         name: &str,
@@ -684,20 +810,34 @@ impl Repository {
         let archive_path = self.archive_path(name)?;
         let marker = self.deleting_path(name);
         let _lock = Lock::exclusive(&self.chunks_lock_path())?;
+        let live = archive_path.exists();
+        // An unreadable archive holds references nobody can take back: the file goes, and a
+        // rebuild reclaims what the index still counts for it.
+        if live && self.readability(name)? != Readability::Whole {
+            return std::fs::remove_file(&archive_path);
+        }
         self.refuse_deletion_while_unreadable()?;
-        let archive = if marker.exists() {
-            None
-        } else {
-            Some(self.get_archive(name)?)
-        };
+        if !live
+            && !self
+                .pending_deletions()?
+                .iter()
+                .any(|pending| pending == name)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("archive {name} does not exist"),
+            ));
+        }
         let index = ChunkIndex::load(&self.index_path())?;
         let mut markers = self.settle_pending(&index)?;
 
-        if let Some(archive) = archive {
+        if live {
             let mut hashes = Vec::new();
-            collect_hashes(archive.into_entries(), &mut hashes)?;
+            collect_hashes(self.get_archive(name)?.into_entries(), &mut hashes)?;
             crate::fs::create_dir_all(marker.parent().unwrap())?;
+            let marker = self.free_marker(name, marker);
             std::fs::rename(&archive_path, &marker)?;
+            self.sync_archive_dirs()?;
             markers.push(marker);
 
             let deletions: Vec<_> = hashes
@@ -724,6 +864,26 @@ impl Repository {
         self.save_settled(&index, markers)
     }
 
+    /// `marker` unless a pending deletion holds it, then `<name>.ddup.1` and so on, which is no
+    /// archive name. The file system decides what is the same name.
+    fn free_marker(&self, name: &str, marker: PathBuf) -> PathBuf {
+        let dir = marker.parent().unwrap().to_path_buf();
+        let mut candidate = marker;
+        let mut n = 1;
+        while candidate.exists() {
+            // Left off rather than cut past the 255-byte limit: a cut name could be another's.
+            let suffix = format!(".ddup.{n}");
+            let stem = if name.len() + suffix.len() <= 255 {
+                name
+            } else {
+                ""
+            };
+            candidate = dir.join(format!("{stem}{suffix}"));
+            n += 1;
+        }
+        candidate
+    }
+
     fn deleting_path(&self, name: &str) -> PathBuf {
         self.directory
             .join(".ddup-bak/deleting")
@@ -733,18 +893,41 @@ impl Repository {
     /// Names of archives whose deletion did not finish. The index may or may not have been
     /// saved without them, and some of their chunks may be gone.
     pub fn pending_deletions(&self) -> std::io::Result<Vec<String>> {
+        let mut names: Vec<String> = self
+            .pending_markers()?
+            .iter()
+            .filter_map(|marker| pending_name(marker))
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    /// The archives in `deleting`, each an archive file awaiting settlement.
+    fn pending_markers(&self) -> std::io::Result<Vec<PathBuf>> {
         let entries = match std::fs::read_dir(self.directory.join(".ddup-bak/deleting")) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             entries => entries?,
         };
-        let mut pending = Vec::new();
+        let mut markers = Vec::new();
         for entry in entries {
-            let name = entry?.file_name();
-            if let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".ddup")) {
-                pending.push(name.to_owned());
+            let path = entry?.path();
+            if pending_name(&path).is_some() {
+                markers.push(path);
             }
         }
-        Ok(pending)
+        Ok(markers)
+    }
+
+    /// Makes moves between `archives` and `deleting` durable before chunks or the index change.
+    fn sync_archive_dirs(&self) -> std::io::Result<()> {
+        crate::fs::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
+        let deleting = self.directory.join(".ddup-bak/deleting");
+        if deleting.is_dir() {
+            crate::fs::sync_dir(&deleting)?;
+        }
+        Ok(())
     }
 
     /// Settles pending deletions in `index` and returns their markers, to be removed once the
@@ -753,16 +936,12 @@ impl Repository {
     /// left to the caller so that a delete which frees space comes before it. Needs the chunks
     /// lock held exclusively.
     fn settle_pending(&self, index: &ChunkIndex) -> std::io::Result<Vec<PathBuf>> {
-        let pending = self.pending_deletions()?;
-        if pending.is_empty() {
+        let markers = self.pending_markers()?;
+        if markers.is_empty() {
             return Ok(Vec::new());
         }
         self.refuse_deletion_while_unreadable()?;
 
-        let markers: Vec<_> = pending
-            .iter()
-            .map(|name| self.deleting_path(name))
-            .collect();
         let mut hashes = Vec::new();
         for path in &markers {
             collect_hashes(Archive::open(path)?.into_entries(), &mut hashes)?;
@@ -777,6 +956,8 @@ impl Repository {
                 }
             }
         }
+        // The attempt that left these behind may have failed before it could sync them.
+        self.sync_archive_dirs()?;
         for (hash, count) in counts {
             if count == 0 {
                 self.delete_chunk(&hash)?;
@@ -788,8 +969,10 @@ impl Repository {
         Ok(markers)
     }
 
-    fn save_settled(&self, index: &ChunkIndex, markers: Vec<PathBuf>) -> std::io::Result<()> {
+    fn save_settled(&self, index: &ChunkIndex, mut markers: Vec<PathBuf>) -> std::io::Result<()> {
         index.save(&self.index_path())?;
+        // Nameless markers go first, so what a crash leaves can still be retried by name.
+        markers.sort_by_key(|marker| pending_name(marker).is_some_and(|name| !name.is_empty()));
         for marker in markers {
             std::fs::remove_file(marker)?;
         }
@@ -799,7 +982,7 @@ impl Repository {
     /// Settles pending deletions under the lock they need, before an operation that takes the
     /// chunks lock shared. Nothing to settle is the usual case and costs a directory read.
     fn recover(&self) -> std::io::Result<()> {
-        if self.pending_deletions()?.is_empty() {
+        if self.pending_markers()?.is_empty() {
             return Ok(());
         }
         let _lock = Lock::exclusive(&self.chunks_lock_path())?;
@@ -815,6 +998,7 @@ impl Repository {
         let index = ChunkIndex::load(&self.index_path())?;
         let markers = self.settle_pending(&index)?;
 
+        self.storage.remove_leftovers()?;
         let orphans = self
             .storage
             .list_chunk_hashes()?
@@ -859,6 +1043,7 @@ fn restore_entry(
             if hashes.len() > 1 {
                 file.set_len(file_entry.size_real)?;
             }
+            let mut written = 0;
             for window in hashes.chunks(RESTORE_WINDOW) {
                 let data = match window {
                     [hash] => vec![chunks::read_chunk(&**storage, algorithm, hash)?],
@@ -869,7 +1054,16 @@ fn restore_entry(
                 };
                 for chunk in data {
                     file.write_all(&chunk)?;
+                    written += chunk.len() as u64;
                 }
+            }
+            // Chunks short of the recorded size would leave zeros passed off as content.
+            if written != file_entry.size_real {
+                return Err(invalid(format!(
+                    "{} restored {written} bytes of the {} recorded",
+                    path.display(),
+                    file_entry.size_real
+                )));
             }
 
             file_entry.mode.apply(&path)?;
@@ -901,8 +1095,10 @@ fn restore_entry(
                 return Ok(());
             }
 
+            // Opened before the mode goes on, which may take away the right to open it.
+            let directory = File::open(&path)?;
             mode.apply(&path)?;
-            File::open(&path)?.set_times(FileTimes::new().set_modified(mtime))?;
+            directory.set_times(FileTimes::new().set_modified(mtime))?;
             chown(&path, owner)
         }
         Entry::Symlink(link_entry) => {
@@ -962,6 +1158,73 @@ fn migrate_v1_entries(
             })
         })
         .collect()
+}
+
+/// The archive name a marker stands for: `<name>.ddup` or `<name>.ddup.<n>`. Anything else is
+/// no marker.
+fn pending_name(marker: &Path) -> Option<String> {
+    let file = marker.file_name()?.to_str()?;
+    if let Some(name) = file.strip_suffix(".ddup") {
+        return Some(name.to_owned());
+    }
+    let (name, n) = file.rsplit_once(".ddup.")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| name.to_owned())
+}
+
+/// Removes an earlier restore, whose directories may be read-only. Nothing at `path` is fine.
+pub fn remove_restored(path: &Path) -> std::io::Result<()> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !metadata.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        {
+            let mode = metadata.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700))?;
+            }
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?.path();
+                if entry.symlink_metadata()?.is_dir() {
+                    remove_restored(&entry)?;
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(path)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readability {
+    Whole,
+    Damaged,
+    Unsupported,
+}
+
+/// Whether a path relative to the backup root lies in a repository's own directory.
+fn is_repository_internal(relative: &Path) -> bool {
+    relative.iter().any(|part| {
+        part.to_str()
+            .is_some_and(|part| part.starts_with(".ddup-bak"))
+    })
+}
+
+/// The path a walk error is about, if it names one.
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Loop { child, .. } => Some(child),
+        _ => None,
+    }
 }
 
 fn collect_hashes(entries: Vec<Entry>, hashes: &mut Vec<ChunkHash>) -> std::io::Result<()> {
@@ -1026,10 +1289,14 @@ impl Job<'_> {
         }
 
         let fingerprint = Fingerprint::of(&metadata);
-        let cached = self
-            .cache
-            .get(relative, fingerprint)
-            .filter(|hashes| hashes.iter().all(|hash| self.index.contains(hash)));
+        // Used only when every chunk is counted and present and the list fits the file; else the
+        // file is read and `store` writes what is missing.
+        let cached = self.cache.get(relative, fingerprint).filter(|hashes| {
+            hashes.is_empty() == (metadata.len() == 0)
+                && hashes.iter().all(|hash| {
+                    self.index.references(hash) > 0 && self.storage.has_chunk(hash).unwrap_or(false)
+                })
+        });
 
         let (hashes, size, metadata) = match cached {
             Some(hashes) => {
@@ -1121,7 +1388,8 @@ impl Job<'_> {
         compression: CompressionFormat,
     ) -> std::io::Result<ChunkHash> {
         let hash = self.index.hash_algorithm.hash(&data);
-        if self.index.reference(&hash) > 1 {
+        // A count alone does not say the chunk is there; a lost one is written back here.
+        if self.index.reference(&hash) > 1 && self.storage.has_chunk(&hash)? {
             return Ok(hash);
         }
 

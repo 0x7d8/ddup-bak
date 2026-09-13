@@ -23,6 +23,10 @@ pub type ChunkHash = [u8; 32];
 /// Largest chunk `cdc_parameters` can produce, and therefore the most memory a single
 /// verified chunk read will use.
 pub const MAX_CHUNK_SIZE: usize = 4 * fastcdc::v2020::AVERAGE_MAX;
+/// Read limit for stored chunks. Older versions cut fixed-size chunks of any configured size.
+const MAX_STORED_CHUNK_SIZE: usize = 1 << 30;
+/// The most references a chunk is accepted with when the index is loaded.
+const MAX_REFERENCES: u64 = 1 << 62;
 
 /// Chunk file: a format byte followed by the data.
 const CHUNK_HEADER_LEN: u64 = 1;
@@ -30,6 +34,8 @@ const CHUNK_HEADER_LEN: u64 = 1;
 /// Index format 3: raw, header carries the hash algorithm. Format 2 was Deflate-compressed
 /// and always BLAKE3. Format 1 (before `DDUPIDX` magics) was Deflate-compressed, BLAKE2b and
 /// keyed by chunk id; see `ChunkIndex::load_v1`.
+/// Format 4 is format 3 plus the BLAKE3 hash of everything before it, checked on load.
+const INDEX_MAGIC_V4: &[u8; 8] = b"DDUPIDX4";
 const INDEX_MAGIC_V3: &[u8; 8] = b"DDUPIDX3";
 const INDEX_MAGIC_V2: &[u8; 8] = b"DDUPIDX2";
 
@@ -129,7 +135,15 @@ impl ChunkIndex {
         let mut hash = [0; 32];
         for _ in 0..count {
             reader.read_exact(&mut hash)?;
-            index.chunks.insert(hash, varint::decode(&mut reader)?);
+            let references = varint::decode(&mut reader)?;
+            // No repository has this many archives; one more reference would wrap the count.
+            if references > MAX_REFERENCES {
+                return Err(invalid(format!(
+                    "chunk {} has an impossible reference count",
+                    hex(&hash)
+                )));
+            }
+            index.chunks.insert(hash, references);
         }
         if reader.read(&mut [0])? != 0 {
             return Err(invalid("index has trailing data"));
@@ -163,6 +177,13 @@ impl ChunkIndex {
             index.chunks.insert(hash, references);
             ids.insert(id, hash);
         }
+        // The stream can end cleanly short of the records the header promises.
+        if (ids.len() as u64) < count {
+            return Err(invalid(format!(
+                "format 1 index holds {} of the {count} chunks it was written with",
+                ids.len()
+            )));
+        }
 
         Ok((index, ids))
     }
@@ -187,15 +208,30 @@ impl ChunkIndex {
         );
         let mut ids = HashMap::with_capacity(count.min(1 << 20) as usize);
         let mut hash = [0; 32];
-        while matches!(reader.read(&mut hash[..1]), Ok(1)) {
-            let Ok(()) = reader.read_exact(&mut hash[1..]) else {
+        // Damage ends the records; any other error is passed on, since a retry may read them.
+        let damaged = |result: std::io::Result<()>| match result {
+            Ok(()) => Ok(false),
+            Err(err) if is_damage(&err) => Ok(true),
+            Err(err) => Err(err),
+        };
+        loop {
+            match reader.read(&mut hash[..1]) {
+                Ok(1) => {}
+                Ok(_) => break,
+                Err(err) if is_damage(&err) => break,
+                Err(err) => return Err(err),
+            }
+            if damaged(reader.read_exact(&mut hash[1..]))? {
                 break;
-            };
-            let (Ok(id), Ok(references)) =
-                (varint::decode(&mut reader), varint::decode(&mut reader))
-            else {
+            }
+            let mut id = 0;
+            if damaged(varint::decode(&mut reader).map(|v| id = v))? {
                 break;
-            };
+            }
+            let mut references = 0;
+            if damaged(varint::decode(&mut reader).map(|v| references = v))? {
+                break;
+            }
             index.chunks.insert(hash, references);
             ids.insert(id, hash);
         }
@@ -212,16 +248,32 @@ impl ChunkIndex {
     fn open(path: &Path) -> std::io::Result<(IndexHeader, Box<dyn Read>, u64)> {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; 8];
-        if file.read_exact(&mut magic).is_ok() && magic == *INDEX_MAGIC_V3 {
+        let has_magic = file.read_exact(&mut magic).is_ok();
+        if has_magic && magic == *INDEX_MAGIC_V4 {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let Some(body) = bytes.len().checked_sub(32) else {
+                return Err(invalid("index is cut short"));
+            };
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&magic);
+            hasher.update(&bytes[..body]);
+            if hasher.finalize().as_bytes() != &bytes[body..] {
+                return Err(invalid("index does not match its checksum"));
+            }
+            bytes.truncate(body);
+            let header = bytes
+                .get(..17)
+                .ok_or_else(|| invalid("index is cut short"))?;
+            let (header_out, count) = Self::parse_header(header, 4)?;
+            let mut cursor = Cursor::new(bytes);
+            cursor.set_position(17);
+            return Ok((header_out, Box::new(cursor), count));
+        }
+        if has_magic && magic == *INDEX_MAGIC_V3 {
             let mut header = [0; 17];
             file.read_exact(&mut header)?;
-            let header_out = IndexHeader {
-                version: 3,
-                chunk_size: u32::from_le_bytes(header[..4].try_into().unwrap()) as usize,
-                max_chunk_count: u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
-                hash_algorithm: HashAlgorithm::try_decode(header[8])?,
-            };
-            let count = u64::from_le_bytes(header[9..].try_into().unwrap());
+            let (header_out, count) = Self::parse_header(&header, 3)?;
             return Ok((header_out, Box::new(file), count));
         }
 
@@ -258,11 +310,26 @@ impl ChunkIndex {
         Ok((header_out, Box::new(decoder), count))
     }
 
+    /// The 17 bytes after the magic of formats 3 and 4.
+    fn parse_header(header: &[u8], version: u8) -> std::io::Result<(IndexHeader, u64)> {
+        let header_out = IndexHeader {
+            version,
+            chunk_size: u32::from_le_bytes(header[..4].try_into().unwrap()) as usize,
+            max_chunk_count: u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize,
+            hash_algorithm: HashAlgorithm::try_decode(header[8])?,
+        };
+        let count = u64::from_le_bytes(header[9..].try_into().unwrap());
+        Ok((header_out, count))
+    }
+
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp_path = path.with_extension("tmp");
-        let mut writer = BufWriter::new(crate::fs::create_file(&tmp_path)?);
+        let mut writer = Hashing {
+            inner: BufWriter::new(crate::fs::create_file(&tmp_path)?),
+            hasher: blake3::Hasher::new(),
+        };
 
-        writer.write_all(INDEX_MAGIC_V3)?;
+        writer.write_all(INDEX_MAGIC_V4)?;
         writer.write_all(&(self.chunk_size as u32).to_le_bytes())?;
         writer.write_all(&(self.max_chunk_count as u32).to_le_bytes())?;
         writer.write_all(&[self.hash_algorithm.encode()])?;
@@ -271,7 +338,9 @@ impl ChunkIndex {
             writer.write_all(entry.key())?;
             varint::encode(&mut writer, *entry.value())?;
         }
-        writer.into_inner()?.sync_all()?;
+        let Hashing { mut inner, hasher } = writer;
+        inner.write_all(hasher.finalize().as_bytes())?;
+        inner.into_inner()?.sync_all()?;
 
         std::fs::rename(&tmp_path, path)?;
         crate::fs::sync_dir(path.parent().unwrap_or(Path::new(".")))
@@ -342,7 +411,8 @@ impl ChunkIndex {
     /// Increments the reference count and returns the new count (1 means the chunk is new).
     pub fn reference(&self, hash: &ChunkHash) -> u64 {
         let mut count = self.chunks.entry(*hash).or_insert(0);
-        *count += 1;
+        // Held to what `load` accepts.
+        *count = count.saturating_add(1).min(MAX_REFERENCES);
         *count
     }
 
@@ -372,21 +442,62 @@ impl ChunkIndex {
 }
 
 /// Works out which algorithm named the chunks in `storage` by hashing one of them. Empty
-/// storage gets the default.
-pub fn detect_hash_algorithm(storage: &dyn ChunkStorage) -> std::io::Result<HashAlgorithm> {
-    let Some(hash) = storage.list_chunk_hashes()?.into_iter().next() else {
-        return Ok(HashAlgorithm::default());
-    };
-    let data = read_chunk_unverified(storage, &hash)?;
-    HashAlgorithm::ALL
-        .into_iter()
-        .find(|algorithm| algorithm.hash(&data) == hash)
-        .ok_or_else(|| {
+/// storage tells nothing.
+pub fn detect_hash_algorithm(storage: &dyn ChunkStorage) -> std::io::Result<Option<HashAlgorithm>> {
+    // A damaged chunk tells nothing; the damage is the answer only when no chunk is whole.
+    let mut damage = None;
+    for hash in storage.list_chunk_hashes()? {
+        let data = match read_chunk_unverified(storage, &hash) {
+            Ok(data) => data,
+            Err(err) if is_damage(&err) => {
+                damage.get_or_insert(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if let Some(algorithm) = HashAlgorithm::ALL
+            .into_iter()
+            .find(|algorithm| algorithm.hash(&data) == hash)
+        {
+            return Ok(Some(algorithm));
+        }
+        damage.get_or_insert_with(|| {
             invalid(format!(
                 "chunk {} does not match its content under any hash algorithm",
                 hex(&hash)
             ))
-        })
+        });
+    }
+    damage.map_or(Ok(None), Err)
+}
+
+/// Hashes what passes through it on the way to `inner`.
+struct Hashing<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: Write> Write for Hashing<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Whether an error means the data is broken rather than the environment (permissions, a
+/// vanished mount). Deflate reports a corrupt stream as invalid input.
+pub(crate) fn is_damage(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::InvalidData
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 pub fn hex(hash: &ChunkHash) -> String {
@@ -428,7 +539,8 @@ pub fn cdc_parameters(
 /// Chunk hashes referenced by a repository file entry (archive format 2 and later).
 pub fn entry_hashes(entry: &mut FileEntry) -> std::io::Result<Vec<ChunkHash>> {
     let body = entry_body(entry)?;
-    if body.len() % 32 != 0 {
+    // Content without chunks would count for nothing and come back empty.
+    if body.len() % 32 != 0 || body.is_empty() != (entry.size_real == 0) {
         return Err(invalid(format!(
             "entry {} has a malformed chunk list",
             entry.name
@@ -460,8 +572,16 @@ pub fn entry_hashes_v1(
 }
 
 fn entry_body(entry: &mut FileEntry) -> std::io::Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0));
-    entry.read_to_end(&mut body)?;
+    // A damaged entry may declare any size; the read below ends short for it.
+    let mut body = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0).min(1 << 20));
+    // Decoder errors are damage; an unsupported compression or the environment keep their kinds.
+    entry.read_to_end(&mut body).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::Other {
+            invalid(format!("hash list of {} is corrupted: {err}", entry.name))
+        } else {
+            err
+        }
+    })?;
     Ok(body)
 }
 
@@ -535,9 +655,11 @@ fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::i
     let mut content = Vec::new();
     storage
         .read_chunk_content(hash)?
-        .take(MAX_CHUNK_SIZE as u64 + CHUNK_HEADER_LEN + 1)
+        .take(MAX_STORED_CHUNK_SIZE as u64 + CHUNK_HEADER_LEN + 1)
         .read_to_end(&mut content)?;
     let corrupted = || invalid(format!("chunk {} is corrupted", hex(hash)));
+    // Decoders report broken input under kinds of their own; here it is all damage.
+    let broken = |err: std::io::Error| invalid(format!("chunk {} is corrupted: {err}", hex(hash)));
 
     let Some(&format) = content.first() else {
         return Err(corrupted());
@@ -550,29 +672,32 @@ fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::i
         CompressionFormat::Zstd
             if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&content) =>
         {
-            if size > MAX_CHUNK_SIZE as u64 {
+            if size > MAX_STORED_CHUNK_SIZE as u64 {
                 return Err(corrupted());
             }
             let mut data = Vec::with_capacity(size as usize);
-            ZSTD_DECOMPRESSOR.with_borrow_mut(|decompressor| {
-                match decompressor {
-                    Some(decompressor) => decompressor,
-                    None => decompressor.insert(zstd::bulk::Decompressor::new()?),
-                }
-                .decompress_to_buffer(&content, &mut data)
-            })?;
+            ZSTD_DECOMPRESSOR
+                .with_borrow_mut(|decompressor| {
+                    match decompressor {
+                        Some(decompressor) => decompressor,
+                        None => decompressor.insert(zstd::bulk::Decompressor::new()?),
+                    }
+                    .decompress_to_buffer(&content, &mut data)
+                })
+                .map_err(broken)?;
             data
         }
         format => {
             let mut data = Vec::new();
             decompressor(format, Cursor::new(content))?
-                .take(MAX_CHUNK_SIZE as u64 + 1)
-                .read_to_end(&mut data)?;
+                .take(MAX_STORED_CHUNK_SIZE as u64 + 1)
+                .read_to_end(&mut data)
+                .map_err(broken)?;
             data
         }
     };
 
-    if data.len() > MAX_CHUNK_SIZE {
+    if data.len() > MAX_STORED_CHUNK_SIZE {
         return Err(corrupted());
     }
     Ok(data)

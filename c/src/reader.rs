@@ -39,7 +39,9 @@ pub unsafe extern "C" fn repository_create_entry_reader(
             .into_owned(),
         mode: EntryMode::from(entry.common.mode),
         owner: (entry.common.uid, entry.common.gid),
-        mtime: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(entry.common.mtime),
+        mtime: SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(entry.common.mtime))
+            .unwrap_or(SystemTime::UNIX_EPOCH),
         compression,
         size_compressed: match compression {
             ddup_bak::archive::CompressionFormat::None => None,

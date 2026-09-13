@@ -4,13 +4,15 @@
 use crate::{chunks::ChunkHash, varint};
 use std::{
     collections::HashMap,
-    fs::{File, Metadata},
-    io::{BufReader, BufWriter, Read, Write},
+    fs::Metadata,
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
-const MAGIC: &[u8; 8] = b"DDUPFCH1";
+/// Records, then the BLAKE3 hash of everything before it. A damaged cache is discarded: a record
+/// that does not match its file would be backed up as the cache says.
+const MAGIC: &[u8; 8] = b"DDUPFCH2";
 
 /// Metadata that changes whenever a file's content could have. `ctime` is what makes this
 /// robust: unlike mtime it cannot be set by userspace, and any write bumps it.
@@ -59,10 +61,15 @@ pub struct FileCache {
 impl FileCache {
     /// Loads the cache, treating a missing or unreadable one as empty; it only affects speed.
     pub fn load(path: &Path) -> Self {
-        let files = File::open(path)
-            .map(BufReader::new)
+        let files = std::fs::read(path)
             .ok()
-            .and_then(|mut reader| Self::read(&mut reader).ok())
+            .and_then(|bytes| {
+                let records = bytes.len().checked_sub(32)?;
+                let (records, checksum) = bytes.split_at(records);
+                (blake3::hash(records).as_bytes() == checksum)
+                    .then(|| Self::read(&mut Cursor::new(records)).ok())
+                    .flatten()
+            })
             .unwrap_or_default();
         Self { files }
     }
@@ -80,7 +87,12 @@ impl FileCache {
             if reader.read(&mut length)? == 0 {
                 return Ok(files);
             }
-            let mut path = vec![0; varint::decode(&mut length.chain(&mut *reader))? as usize];
+            let length = varint::decode(&mut length.chain(&mut *reader))?;
+            // Bounded so damage fails the parse instead of the allocation.
+            if length > 1 << 16 {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            let mut path = vec![0; length as usize];
             reader.read_exact(&mut path)?;
             let path = PathBuf::from(
                 String::from_utf8(path).map_err(|_| std::io::ErrorKind::InvalidData)?,
@@ -129,7 +141,7 @@ impl FileCache {
         files: impl IntoIterator<Item = (PathBuf, CachedFile)>,
     ) -> std::io::Result<()> {
         let tmp_path = path.with_extension("tmp");
-        let mut writer = BufWriter::new(crate::fs::create_file(&tmp_path)?);
+        let mut writer = Vec::new();
         writer.write_all(MAGIC)?;
 
         for (path, file) in files {
@@ -156,7 +168,8 @@ impl FileCache {
             }
         }
 
-        writer.into_inner()?;
+        writer.extend_from_slice(blake3::hash(&writer).as_bytes());
+        std::fs::write(&tmp_path, writer)?;
         std::fs::rename(&tmp_path, path)
     }
 }

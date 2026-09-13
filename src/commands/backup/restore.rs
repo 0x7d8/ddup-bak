@@ -1,7 +1,7 @@
 use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
-use ddup_bak::archive::entries::Entry;
+use ddup_bak::{archive::entries::Entry, lock::Lock};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,6 +31,8 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
 
     println!("{}", "restoring backup...".bright_black());
 
+    // Held until the restore is done, so no delete takes the chunks between here and there.
+    let _lock = repository.shared_lock()?;
     let archive = repository.get_archive(name)?;
     let total = archive.entries().iter().map(count_entries).sum();
 
@@ -46,23 +48,37 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
         )
     });
 
+    let progress_callback = Some({
+        let progress = progress.clone();
+        Arc::new(move |_: &Path| progress.incr(1usize)) as Arc<_>
+    });
     // Restore into a fresh directory on the destination's filesystem, then swap it in, so a
-    // failed restore never touches the existing destination contents.
+    // failed restore never touches the existing destination contents. Without a destination
+    // the repository restores into its own place, where restores of one archive take turns.
     let staging = match &destination {
-        Some(destination) => destination.join(STAGING_DIR),
-        None => Path::new(".ddup-bak/archives-restored").join(name),
+        Some(destination) => {
+            // Restores into one destination take turns, so none removes the staging another fills.
+            std::fs::create_dir_all(destination)?;
+            let locks = repository.directory.join(".ddup-bak/restore-locks");
+            std::fs::create_dir_all(&locks)?;
+            let key = ddup_bak::chunks::hex(
+                blake3::hash(destination.canonicalize()?.as_os_str().as_encoded_bytes()).as_bytes(),
+            );
+            let _turn = Lock::exclusive(&locks.join(format!("destination-{}", &key[..16])))?;
+            let staging = destination.join(STAGING_DIR);
+            remove_if_exists(&staging)?;
+            repository.restore_entries_to(
+                archive.into_entries(),
+                &staging,
+                progress_callback,
+                threads,
+            )?;
+            staging
+        }
+        None => {
+            repository.restore_entries(name, archive.into_entries(), progress_callback, threads)?
+        }
     };
-    remove_if_exists(&staging)?;
-
-    repository.restore_entries_to(
-        archive.into_entries(),
-        &staging,
-        Some({
-            let progress = progress.clone();
-            Arc::new(move |_| progress.incr(1usize))
-        }),
-        threads,
-    )?;
 
     progress.finish();
     println!(
@@ -113,13 +129,5 @@ fn count_entries(entry: &Entry) -> usize {
 }
 
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {
-    let Ok(metadata) = path.symlink_metadata() else {
-        return Ok(());
-    };
-
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else {
-        std::fs::remove_file(path)
-    }
+    ddup_bak::repository::remove_restored(path)
 }

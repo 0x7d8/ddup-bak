@@ -9,13 +9,19 @@ pub struct EntryReader {
     storage: Arc<dyn ChunkStorage>,
     algorithm: HashAlgorithm,
     _lock: Lock,
+    /// The chunk being fetched, kept so that a failed read retries it rather than skipping it.
+    pending: Option<ChunkHash>,
     buffer: Vec<u8>,
     position: usize,
+    /// The recorded file size, checked against the chunks once all are read.
+    size: u64,
+    total: u64,
 }
 
 impl EntryReader {
     pub fn new(
         hashes: Vec<ChunkHash>,
+        size: u64,
         storage: Arc<dyn ChunkStorage>,
         algorithm: HashAlgorithm,
         lock: Lock,
@@ -25,8 +31,11 @@ impl EntryReader {
             storage,
             algorithm,
             _lock: lock,
+            pending: None,
             buffer: Vec::new(),
             position: 0,
+            size,
+            total: 0,
         }
     }
 }
@@ -34,11 +43,28 @@ impl EntryReader {
 impl Read for EntryReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while self.position >= self.buffer.len() {
-            let Some(hash) = self.hashes.next() else {
-                return Ok(0);
+            let hash = match self.pending {
+                Some(hash) => hash,
+                None => {
+                    let Some(hash) = self.hashes.next() else {
+                        if self.total != self.size {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "chunks hold {} bytes of a file recorded as {}",
+                                    self.total, self.size
+                                ),
+                            ));
+                        }
+                        return Ok(0);
+                    };
+                    *self.pending.insert(hash)
+                }
             };
 
             self.buffer = super::read_chunk(&*self.storage, self.algorithm, &hash)?;
+            self.total += self.buffer.len() as u64;
+            self.pending = None;
             self.position = 0;
         }
 

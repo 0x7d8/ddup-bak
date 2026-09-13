@@ -391,6 +391,1199 @@ fn a_pending_deletion_does_not_hold_up_the_next_one() {
 }
 
 #[test]
+fn a_live_archive_named_like_a_pending_deletion_is_deleted_too() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    // An older version, unaware of pending deletions, could create this state.
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    fixture
+        .backup("b", &fixture.source("other", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join("archives/a.ddup"),
+    )
+    .unwrap();
+
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn a_live_archive_whose_name_the_file_system_equates_with_a_pending_one_is_deleted_too() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    fixture
+        .backup("b", &fixture.source("other", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join("archives/A.ddup"),
+    )
+    .unwrap();
+
+    // On a case-insensitive file system the marker for `A` is the pending `a`.
+    fixture.repository.delete_archive("A", None).unwrap();
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn the_file_cache_is_not_trusted_for_chunks_the_index_no_longer_references() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    // What an interrupted clean leaves: entries at zero whose files are already gone.
+    let index_path = fixture.chunks_dir().join("index");
+    let index = ChunkIndex::load(&index_path).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    for (hash, _) in index.iter().collect::<Vec<_>>() {
+        index.set(&hash, 0);
+        storage.delete_chunk_content(&hash).unwrap();
+    }
+    index.save(&index_path).unwrap();
+
+    // The file is unchanged, so its cached chunk list applies, but the chunks must be written.
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+/// Local storage that removes the directory `blocker` once a chunk has been deleted, standing
+/// in for a full disk that a delete makes room on.
+struct UnlockOnDelete {
+    inner: ChunkStorageLocal,
+    blocker: PathBuf,
+}
+
+impl ChunkStorage for UnlockOnDelete {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        self.inner.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        self.inner.delete_chunk_content(chunk)?;
+        let _ = fs::remove_dir(&self.blocker);
+        Ok(())
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        self.inner.list_chunk_hashes()
+    }
+}
+
+#[test]
+fn a_delete_sharing_a_pending_name_frees_space_before_it_needs_any() {
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(UnlockOnDelete {
+            inner: ChunkStorageLocal(chunks.clone()),
+            blocker: chunks.join("index.tmp"),
+        }))
+    });
+    let shared = random(50_000);
+    fixture
+        .backup("a", &fixture.source("a", &[("shared", &shared)]))
+        .unwrap();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    let b = fixture.source("b", &[("shared", &shared), ("only-b", &seeded(3, 50_000))]);
+    fixture.backup("b", &b).unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join("archives/a.ddup"),
+    )
+    .unwrap();
+
+    // The pending `a` frees nothing, since the live one shares all its chunks. The index
+    // cannot be written until the live one's chunks go: a directory sits where it is staged.
+    let blocker = fixture.chunks_dir().join("index.tmp");
+    fs::create_dir(&blocker).unwrap();
+    let result = fixture.repository.delete_archive("a", None);
+    let _ = fs::remove_dir(&blocker);
+    result.unwrap();
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn rebuild_fails_rather_than_skip_an_archive_it_is_not_allowed_to_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores file permissions");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    fixture.backup("b", &source).unwrap();
+    let repo = fixture.root.join("repo");
+    let b = repo.join(".ddup-bak/archives/b.ddup");
+
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None);
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        result.err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+
+    let repository = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
+    repository.delete_archive("a", None).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn opening_an_older_repository_adds_the_deleting_directory() {
+    let fixture = Fixture::new();
+    let deleting = fixture.root.join("repo/.ddup-bak/deleting");
+    fs::remove_dir(&deleting).unwrap();
+
+    Repository::open(&fixture.root.join("repo"), None, None).unwrap();
+    assert!(deleting.is_dir());
+}
+
+#[test]
+fn a_chunk_lost_from_storage_is_written_back_by_the_next_backup_after_rebuild() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let lost = storage.list_chunk_hashes().unwrap()[0];
+    storage.delete_chunk_content(&lost).unwrap();
+
+    let repo = fixture.root.join("repo");
+    Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
+
+    // The written-back chunk is counted for both archives, so deleting one keeps it.
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_chunk_lost_from_storage_is_written_back_by_the_next_backup_after_recovery() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    fixture.backup("b", &source).unwrap();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let lost = storage.list_chunk_hashes().unwrap()[0];
+    storage.delete_chunk_content(&lost).unwrap();
+
+    fixture.repository.clean(None).unwrap();
+    fixture.backup("c", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+
+    fixture.repository.delete_archive("b", None).unwrap();
+    assert_same_files(&source, &fixture.restore("c").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_numbered_marker_is_reported_under_the_archive_name_and_settled_by_it() {
+    let fixture = Fixture::new();
+    fixture
+        .backup("a", &fixture.source("first", &[("f", &random(20_000))]))
+        .unwrap();
+    fixture
+        .backup("b", &fixture.source("second", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    // An older version, unaware of pending deletions, could leave `a` both pending and live.
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join("archives/a.ddup"),
+    )
+    .unwrap();
+
+    let blocker = fixture.chunks_dir().join("index.tmp");
+    fs::create_dir(&blocker).unwrap();
+    assert!(fixture.repository.delete_archive("a", None).is_err());
+    fs::remove_dir(&blocker).unwrap();
+    assert!(ddup_bak.join("deleting/a.ddup.1").is_file());
+    assert_eq!(fixture.repository.pending_deletions().unwrap(), ["a"]);
+
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn a_directory_where_a_chunk_should_be_fails_the_backup() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let hash = storage.list_chunk_hashes().unwrap()[0];
+    let path = fixture.chunks_dir().join(storage.path_from_chunk(&hash));
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    assert!(fixture.backup("b", &source).is_err());
+}
+
+#[test]
+fn a_backup_stands_when_the_file_cache_cannot_be_saved() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    let blocker = fixture.root.join("repo/.ddup-bak/filecache.tmp");
+    fs::create_dir(&blocker).unwrap();
+
+    fixture.backup("a", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
+
+    fs::remove_dir(&blocker).unwrap();
+    fixture.repository.delete_archive("a", None).unwrap();
+    fixture.repository.clean(None).unwrap();
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn rebuild_keeps_the_recorded_hash_algorithm_when_storage_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let repository =
+        Repository::new_with_hash(&repo, CHUNK_SIZE, 0, HashAlgorithm::Blake3, None).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/f"), random(20_000)).unwrap();
+    let walker = ignore::WalkBuilder::new(repo.join("src"))
+        .standard_filters(false)
+        .build();
+    let compression: CompressionFormatCallback = Some(Arc::new(|_, _| CompressionFormat::Deflate));
+    repository
+        .create_archive(
+            "a",
+            Some(walker),
+            Some(&repo.join("src")),
+            None,
+            compression,
+            4,
+        )
+        .unwrap();
+    let storage = ChunkStorageLocal(repo.join(".ddup-bak/chunks"));
+    for hash in storage.list_chunk_hashes().unwrap() {
+        storage.delete_chunk_content(&hash).unwrap();
+    }
+
+    let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
+    assert_eq!(rebuilt.hash_algorithm(), HashAlgorithm::Blake3);
+}
+
+#[test]
+fn a_live_archive_with_the_longest_name_sharing_a_pending_one_is_deleted_too() {
+    let fixture = Fixture::new();
+    let name = "n".repeat(250);
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup(&name, &source).unwrap();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join(format!("archives/{name}.ddup")),
+        ddup_bak.join(format!("deleting/{name}.ddup")),
+    )
+    .unwrap();
+    fixture
+        .backup("b", &fixture.source("other", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join(format!("archives/{name}.ddup")),
+    )
+    .unwrap();
+
+    fixture.repository.delete_archive(&name, None).unwrap();
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+/// Local storage whose first chunk read is interrupted, as a signal can do.
+struct InterruptOnce {
+    inner: ChunkStorageLocal,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl ChunkStorage for InterruptOnce {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        if !self.done.swap(true, Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.inner.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        self.inner.delete_chunk_content(chunk)
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        self.inner.list_chunk_hashes()
+    }
+}
+
+#[test]
+fn an_interrupted_chunk_read_is_retried_not_skipped() {
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(InterruptOnce {
+            inner: ChunkStorageLocal(chunks),
+            done: std::sync::atomic::AtomicBool::new(false),
+        }))
+    });
+    let content = random(3_000);
+    let source = fixture.source("src", &[("f", &content)]);
+    fixture.backup("a", &source).unwrap();
+
+    let entry = fixture
+        .repository
+        .get_archive("a")
+        .unwrap()
+        .into_entries()
+        .into_iter()
+        .find(|entry| matches!(entry, Entry::File(_)))
+        .unwrap();
+    let mut read = Vec::new();
+    fixture
+        .repository
+        .read_entry_content(entry, &mut read)
+        .unwrap();
+    assert_eq!(read, content);
+}
+
+#[test]
+fn a_storage_with_the_default_existence_check_rejects_a_directory_in_a_chunks_place() {
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(FailingDelete {
+            inner: ChunkStorageLocal(chunks),
+            deletes: AtomicUsize::new(0),
+            fail_at: usize::MAX,
+        }))
+    });
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let hash = storage.list_chunk_hashes().unwrap()[0];
+    let path = fixture.chunks_dir().join(storage.path_from_chunk(&hash));
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    assert!(fixture.backup("b", &source).is_err());
+    let leftovers = walk(&fixture.chunks_dir())
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            paths.extend(walk(&path));
+        } else {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+#[test]
+fn a_numbered_marker_for_the_longest_name_carries_no_name_and_is_still_settled() {
+    let fixture = Fixture::new();
+    let name = "n".repeat(250);
+    fixture
+        .backup(&name, &fixture.source("first", &[("f", &random(20_000))]))
+        .unwrap();
+    fixture
+        .backup("b", &fixture.source("second", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join(format!("archives/{name}.ddup")),
+        ddup_bak.join(format!("deleting/{name}.ddup")),
+    )
+    .unwrap();
+    fs::rename(
+        ddup_bak.join("archives/b.ddup"),
+        ddup_bak.join(format!("archives/{name}.ddup")),
+    )
+    .unwrap();
+
+    let blocker = fixture.chunks_dir().join("index.tmp");
+    fs::create_dir(&blocker).unwrap();
+    assert!(fixture.repository.delete_archive(&name, None).is_err());
+    fs::remove_dir(&blocker).unwrap();
+    assert!(ddup_bak.join("deleting/.ddup.1").is_file());
+    assert_eq!(
+        fixture.repository.pending_deletions().unwrap(),
+        [name.as_str()]
+    );
+
+    fixture.repository.clean(None).unwrap();
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert!(
+        fs::read_dir(ddup_bak.join("deleting"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn rebuild_fails_rather_than_replace_an_index_it_is_not_allowed_to_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores file permissions");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    let index = fixture.chunks_dir().join("index");
+    let before = fs::read(&index).unwrap();
+
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = Repository::rebuild(&fixture.root.join("repo"), CHUNK_SIZE, 0, None, None, None);
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        result.err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(fs::read(&index).unwrap(), before);
+}
+
+#[test]
+fn an_empty_chunk_file_is_written_over_by_the_next_backup() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let hash = storage.list_chunk_hashes().unwrap()[0];
+    fs::write(
+        fixture.chunks_dir().join(storage.path_from_chunk(&hash)),
+        b"",
+    )
+    .unwrap();
+
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_nameless_marker_is_settled_before_the_next_backup() {
+    let fixture = Fixture::new();
+    fixture
+        .backup("a", &fixture.source("first", &[("f", &random(20_000))]))
+        .unwrap();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/.ddup.1"),
+    )
+    .unwrap();
+
+    fixture
+        .backup("b", &fixture.source("second", &[("g", &seeded(3, 20_000))]))
+        .unwrap();
+    assert!(
+        fs::read_dir(ddup_bak.join("deleting"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_same_files(
+        &fixture.root.join("second"),
+        &fixture.restore("b").unwrap(),
+        &["g"],
+    );
+    fixture.repository.delete_archive("b", None).unwrap();
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn a_storage_with_the_default_existence_check_writes_over_an_empty_chunk() {
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(FailingDelete {
+            inner: ChunkStorageLocal(chunks),
+            deletes: AtomicUsize::new(0),
+            fail_at: usize::MAX,
+        }))
+    });
+    let source = fixture.source("src", &[("f", &random(30_000))]);
+    fixture.backup("a", &source).unwrap();
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let hash = storage.list_chunk_hashes().unwrap()[0];
+    fs::write(
+        fixture.chunks_dir().join(storage.path_from_chunk(&hash)),
+        b"",
+    )
+    .unwrap();
+
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn clean_removes_temporary_chunk_files_left_by_interrupted_writes() {
+    let fixture = Fixture::new();
+    let leftover = fixture
+        .chunks_dir()
+        .join(format!("ab/cd/{}.1234.5.tmp", "e".repeat(60)));
+    fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+    fs::write(&leftover, b"partial").unwrap();
+    // Neither a file of another naming nor anything behind a symbolic link is touched.
+    let other = fixture.chunks_dir().join("ab/cd/notes.tmp");
+    fs::write(&other, b"kept").unwrap();
+    let outside = fixture.root.join("outside/cd");
+    fs::create_dir_all(&outside).unwrap();
+    let document = outside.join(format!("{}.1.2.tmp", "f".repeat(60)));
+    fs::write(&document, b"kept").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        fixture.root.join("outside"),
+        fixture.chunks_dir().join("zz"),
+    )
+    .unwrap();
+
+    // Nor anything outside the two levels of hex-named directories chunks live in.
+    let elsewhere = fixture
+        .chunks_dir()
+        .join(format!("notes/saved/{}.123.4.tmp", "a".repeat(60)));
+    fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    fs::write(&elsewhere, b"kept").unwrap();
+
+    fixture.repository.clean(None).unwrap();
+    assert!(!leftover.exists());
+    assert!(other.exists());
+    assert!(document.exists());
+    assert!(elsewhere.exists());
+}
+
+#[test]
+fn a_cache_record_cut_short_of_its_chunks_does_not_make_the_file_empty() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", b"irreplaceable content")]);
+    fixture.backup("a", &source).unwrap();
+
+    // The one record, kept up to its chunk count, which now says zero.
+    let cache_path = fixture.root.join("repo/.ddup-bak/filecache");
+    let mut cache = fs::read(&cache_path).unwrap();
+    let mut reader = Cursor::new(&cache[8..]);
+    let path_length = ddup_bak::varint::decode(&mut reader).unwrap() as usize;
+    let count_at = 8 + reader.position() as usize + path_length + 44;
+    assert_eq!(cache[count_at], 1);
+    cache[count_at] = 0;
+    cache.truncate(count_at + 1);
+    fs::write(&cache_path, cache).unwrap();
+
+    fixture.backup("b", &source).unwrap();
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_cache_record_with_a_shortened_chunk_list_is_not_trusted() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(100_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    // The one record with its chunk count set to one and the rest of its list gone.
+    let cache_path = fixture.root.join("repo/.ddup-bak/filecache");
+    let mut cache = fs::read(&cache_path).unwrap();
+    let mut reader = Cursor::new(&cache[8..]);
+    let path_length = ddup_bak::varint::decode(&mut reader).unwrap() as usize;
+    let count_at = 8 + reader.position() as usize + path_length + 44;
+    assert!(cache[count_at] > 1);
+    cache[count_at] = 1;
+    cache.truncate(count_at + 1 + 32);
+    fs::write(&cache_path, cache).unwrap();
+
+    fixture.backup("b", &source).unwrap();
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_earlier_restore_with_read_only_directories_can_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("restored");
+    fs::create_dir_all(tree.join("d")).unwrap();
+    fs::write(tree.join("d/f"), b"x").unwrap();
+    fs::set_permissions(tree.join("d"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    ddup_bak::repository::remove_restored(&tree).unwrap();
+    assert!(!tree.exists());
+    ddup_bak::repository::remove_restored(&tree).unwrap();
+}
+
+#[test]
+fn a_footer_counting_fewer_entries_than_the_table_holds_is_damage() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000)), ("g", &seeded(3, 20_000))]);
+    fixture.backup("a", &source).unwrap();
+    let before = fixture.stored_chunks();
+
+    let path = fixture.repository.archive_path("a").unwrap();
+    let mut bytes = fs::read(&path).unwrap();
+    let footer = bytes.len() - 16;
+    assert_eq!(
+        u64::from_le_bytes(bytes[footer..footer + 8].try_into().unwrap()),
+        2
+    );
+    bytes[footer..footer + 8].copy_from_slice(&1u64.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+
+    assert_eq!(fixture.repository.unreadable_archives().unwrap(), ["a"]);
+    Repository::rebuild(&fixture.root.join("repo"), CHUNK_SIZE, 0, None, None, None).unwrap();
+    assert_eq!(
+        fixture.repository.clean(None).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+    assert_eq!(fixture.stored_chunks(), before);
+}
+
+#[test]
+fn an_index_with_an_impossible_reference_count_is_rejected() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(3_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let index_path = fixture.chunks_dir().join("index");
+    let index = ChunkIndex::load(&index_path).unwrap();
+    for (hash, _) in index.iter().collect::<Vec<_>>() {
+        index.set(&hash, u64::MAX);
+    }
+    index.save(&index_path).unwrap();
+
+    assert_eq!(
+        ChunkIndex::load(&index_path).err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::InvalidData)
+    );
+    assert!(fixture.backup("b", &source).is_err());
+    Repository::rebuild(&fixture.root.join("repo"), CHUNK_SIZE, 0, None, None, None).unwrap();
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn an_entry_with_content_but_no_chunks_is_damage() {
+    let fixture = Fixture::new();
+    let path = fixture.repository.archive_path("bad").unwrap();
+    let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
+    let entry = archive
+        .write_raw_file_entry(
+            &[],
+            Some(4),
+            "f",
+            EntryMode::new(0o600),
+            SystemTime::UNIX_EPOCH,
+            (0, 0),
+        )
+        .unwrap();
+    archive.entries.push(Entry::File(entry));
+    archive.write_end_header().unwrap();
+    drop(archive);
+
+    assert_eq!(fixture.repository.unreadable_archives().unwrap(), ["bad"]);
+    assert_eq!(
+        fixture.repository.clean(None).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}
+
+#[test]
+fn restore_recreates_the_directory_it_restores_into() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", b"back")]);
+    fixture.backup("a", &source).unwrap();
+    fs::remove_dir_all(fixture.root.join("repo/.ddup-bak/archives-restored")).unwrap();
+
+    let restored = fixture.repository.restore_archive("a", None, 2).unwrap();
+    assert_eq!(fs::read(restored.join("f")).unwrap(), b"back");
+}
+
+#[test]
+fn a_reference_count_at_the_accepted_limit_stays_loadable_after_a_backup() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(3_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let index_path = fixture.chunks_dir().join("index");
+    let index = ChunkIndex::load(&index_path).unwrap();
+    for (hash, _) in index.iter().collect::<Vec<_>>() {
+        index.set(&hash, 1 << 62);
+    }
+    index.save(&index_path).unwrap();
+
+    fixture.backup("b", &source).unwrap();
+    assert!(ChunkIndex::load(&index_path).is_ok());
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_damaged_reference_count_is_caught_before_it_deletes_a_shared_chunk() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(3_000))]);
+    fixture.backup("a", &source).unwrap();
+    fixture.backup("b", &source).unwrap();
+
+    // One entry: magic, 17 header bytes, the hash, then its count, which goes from 2 to 0.
+    let index_path = fixture.chunks_dir().join("index");
+    let mut bytes = fs::read(&index_path).unwrap();
+    assert_eq!(bytes[8 + 17 + 32], 2);
+    bytes[8 + 17 + 32] = 0;
+    fs::write(&index_path, bytes).unwrap();
+
+    assert_eq!(
+        ChunkIndex::load(&index_path).err().map(|err| err.kind()),
+        Some(std::io::ErrorKind::InvalidData)
+    );
+    assert!(fixture.repository.delete_archive("a", None).is_err());
+    Repository::rebuild(&fixture.root.join("repo"), CHUNK_SIZE, 0, None, None, None).unwrap();
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn an_index_written_without_a_checksum_still_loads() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(3_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let index_path = fixture.chunks_dir().join("index");
+    let mut bytes = fs::read(&index_path).unwrap();
+    bytes[..8].copy_from_slice(b"DDUPIDX3");
+    bytes.truncate(bytes.len() - 32);
+    fs::write(&index_path, bytes).unwrap();
+
+    assert_eq!(ChunkIndex::load(&index_path).unwrap().len(), 1);
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_compressed_chunk_list_cut_short_by_its_declared_size_is_damage() {
+    let fixture = Fixture::new();
+    let path = fixture.repository.archive_path("bad").unwrap();
+    let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
+    let mut entry = archive
+        .write_file_entry(
+            Cursor::new(vec![1; 64]),
+            Some(9),
+            "f",
+            EntryMode::new(0o600),
+            SystemTime::UNIX_EPOCH,
+            (0, 0),
+            CompressionFormat::Deflate,
+        )
+        .unwrap();
+    entry.size = 32;
+    archive.entries.push(Entry::File(entry));
+    archive.write_end_header().unwrap();
+    drop(archive);
+
+    assert_eq!(fixture.repository.unreadable_archives().unwrap(), ["bad"]);
+}
+
+#[test]
+fn a_file_whose_chunks_fall_short_of_its_recorded_size_does_not_restore_padded() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", b"12345678")]);
+    fixture.backup("a", &source).unwrap();
+    let Entry::File(mut file) = fixture
+        .repository
+        .get_archive("a")
+        .unwrap()
+        .into_entries()
+        .into_iter()
+        .find(|entry| matches!(entry, Entry::File(_)))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let hashes = ddup_bak::chunks::entry_hashes(&mut file).unwrap();
+
+    let path = fixture.repository.archive_path("bad").unwrap();
+    let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
+    let entry = archive
+        .write_raw_file_entry(
+            hashes.as_flattened(),
+            Some(12),
+            "f",
+            EntryMode::new(0o600),
+            SystemTime::UNIX_EPOCH,
+            (0, 0),
+        )
+        .unwrap();
+    archive.entries.push(Entry::File(entry));
+    archive.write_end_header().unwrap();
+    drop(archive);
+
+    assert!(fixture.restore("bad").is_err());
+    let entry = fixture
+        .repository
+        .get_archive("bad")
+        .unwrap()
+        .into_entries()
+        .into_iter()
+        .find(|entry| matches!(entry, Entry::File(_)))
+        .unwrap();
+    let mut read = Vec::new();
+    assert!(
+        fixture
+            .repository
+            .read_entry_content(entry, &mut read)
+            .is_err()
+    );
+}
+
+#[test]
+fn open_or_rebuild_rebuilds_an_index_cut_short_after_its_header() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    let index_path = fixture.chunks_dir().join("index");
+    let bytes = fs::read(&index_path).unwrap();
+    fs::write(&index_path, &bytes[..25]).unwrap();
+
+    let repo = fixture.root.join("repo");
+    let repository = Repository::open_or_rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
+    assert!(ChunkIndex::load(&index_path).is_ok());
+    let restored = repository.restore_archive("a", None, 2).unwrap();
+    assert_same_files(&source, &restored, &["f"]);
+}
+
+#[test]
+fn restores_of_one_archive_into_its_own_place_take_turns() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(200_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let restored = std::thread::scope(|scope| {
+        let first = scope.spawn(|| fixture.repository.restore_archive("a", None, 2));
+        let second = scope.spawn(|| fixture.repository.restore_archive("a", None, 2));
+        let first = first.join().unwrap().unwrap();
+        assert_eq!(second.join().unwrap().unwrap(), first);
+        first
+    });
+    assert_same_files(&source, &restored, &["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_archive_whose_compressed_hash_list_is_garbage_counts_as_damaged() {
+    use std::os::unix::fs::FileExt;
+
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", b"good")]);
+    fixture.backup("good", &source).unwrap();
+
+    let path = fixture.repository.archive_path("broken").unwrap();
+    let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
+    let entry = archive
+        .write_file_entry(
+            Cursor::new(vec![0; 32]),
+            Some(4),
+            "f",
+            EntryMode::new(0o600),
+            SystemTime::UNIX_EPOCH,
+            (0, 0),
+            CompressionFormat::Zstd,
+        )
+        .unwrap();
+    entry.file.write_all_at(&[255; 4], entry.offset).unwrap();
+    archive.entries.push(Entry::File(entry));
+    archive.write_end_header().unwrap();
+    drop(archive);
+
+    let repo = fixture.root.join("repo");
+    Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
+    assert_eq!(
+        fixture.repository.unreadable_archives().unwrap(),
+        ["broken"]
+    );
+    fixture.repository.delete_archive("broken", None).unwrap();
+    assert_same_files(&source, &fixture.restore("good").unwrap(), &["f"]);
+}
+
+#[test]
+fn a_tree_nested_deeper_than_an_archive_can_hold_is_refused_before_publication() {
+    let fixture = Fixture::new();
+    let mut deep = fixture.root.join("src");
+    for _ in 0..258 {
+        deep.push("d");
+    }
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("f"), b"deep").unwrap();
+
+    let err = fixture.backup("a", &fixture.root.join("src")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+}
+
+#[test]
+fn a_damaged_file_cache_is_discarded_rather_than_trusted_for_its_lengths() {
+    let fixture = Fixture::new();
+    let mut cache = b"DDUPFCH1".to_vec();
+    ddup_bak::varint::encode(&mut cache, u64::MAX).unwrap();
+    fs::write(fixture.root.join("repo/.ddup-bak/filecache"), cache).unwrap();
+
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_replaces_its_earlier_output_even_where_that_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("ro/f", b"kept")]);
+    fs::set_permissions(source.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+    fixture.backup("a", &source).unwrap();
+
+    let first = fixture.repository.restore_archive("a", None, 2).unwrap();
+    assert_eq!(fs::read(first.join("ro/f")).unwrap(), b"kept");
+    let second = fixture.repository.restore_archive("a", None, 2).unwrap();
+    assert_eq!(fs::read(second.join("ro/f")).unwrap(), b"kept");
+    fs::set_permissions(source.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(second.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Local storage that lists a chosen chunk ahead of the real ones; the all-zero hash stands
+/// for an empty chunk that is not there.
+struct ListFirst {
+    first: ddup_bak::chunks::ChunkHash,
+    inner: ChunkStorageLocal,
+}
+
+impl ChunkStorage for ListFirst {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        if *chunk == [0; 32] {
+            return Ok(Box::new(Cursor::new(Vec::new())));
+        }
+        self.inner.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        if *chunk == [0; 32] {
+            return Ok(());
+        }
+        self.inner.delete_chunk_content(chunk)
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        let mut hashes = vec![self.first];
+        hashes.extend(
+            self.inner
+                .list_chunk_hashes()?
+                .into_iter()
+                .filter(|hash| *hash != self.first),
+        );
+        Ok(hashes)
+    }
+}
+
+#[test]
+fn rebuild_tells_the_hash_algorithm_from_a_whole_chunk_not_the_first_listed() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    let repo = fixture.root.join("repo");
+    fs::remove_file(fixture.chunks_dir().join("index")).unwrap();
+
+    let storage = Arc::new(ListFirst {
+        first: [0; 32],
+        inner: ChunkStorageLocal(fixture.chunks_dir()),
+    });
+    let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, Some(storage), None).unwrap();
+    let restored = rebuilt.restore_archive("a", None, 2).unwrap();
+    assert_eq!(
+        fs::read(restored.join("f")).unwrap(),
+        fs::read(source.join("f")).unwrap()
+    );
+}
+
+#[test]
+fn rebuild_moves_past_a_truncated_zstd_chunk_when_telling_the_hash_algorithm() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(40_000))]);
+    let walker = ignore::WalkBuilder::new(&source)
+        .standard_filters(false)
+        .build();
+    let compression: CompressionFormatCallback = Some(Arc::new(|_, _| CompressionFormat::Zstd));
+    fixture
+        .repository
+        .create_archive("a", Some(walker), Some(&source), None, compression, 4)
+        .unwrap();
+
+    let local = ChunkStorageLocal(fixture.chunks_dir());
+    let first = local.list_chunk_hashes().unwrap()[0];
+    let path = fixture.chunks_dir().join(local.path_from_chunk(&first));
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+    fs::remove_file(fixture.chunks_dir().join("index")).unwrap();
+
+    let storage = Arc::new(ListFirst {
+        first,
+        inner: local,
+    });
+    let repo = fixture.root.join("repo");
+    let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, Some(storage), None).unwrap();
+    assert_eq!(rebuilt.hash_algorithm(), HashAlgorithm::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_without_read_permission_restores_with_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let entry = ddup_bak::archive::entries::DirectoryEntry {
+        name: "x".into(),
+        mode: EntryMode::new(0o100),
+        owner: (0, 0),
+        mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000),
+        entries: Vec::new(),
+    };
+    let restored = fixture.root.join("restored");
+    fixture
+        .repository
+        .restore_entries_to(vec![Entry::Directory(Box::new(entry))], &restored, None, 2)
+        .unwrap();
+
+    let metadata = fs::metadata(restored.join("x")).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o100);
+    assert_eq!(
+        metadata.modified().unwrap(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000)
+    );
+    fs::set_permissions(restored.join("x"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn backing_up_the_repository_directory_leaves_its_own_files_out_entirely() {
+    let fixture = Fixture::new();
+    let repo = fixture.root.join("repo");
+    fs::create_dir_all(repo.join("data")).unwrap();
+    fs::write(repo.join("data/f"), random(20_000)).unwrap();
+    // A directory of the repository's own the walker cannot read must not fail the backup.
+    let locked = repo.join(".ddup-bak/archives-restored/locked");
+    fs::create_dir(&locked).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let result = fixture.backup("a", &repo);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    result.unwrap();
+    let restored = fixture.restore("a").unwrap();
+    assert!(restored.join("data/f").is_file());
+    assert!(!restored.join(".ddup-bak").exists());
+
+    fixture.repository.delete_archive("a", None).unwrap();
+    fixture.repository.clean(None).unwrap();
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
 fn archives_with_the_longest_allowed_names_can_be_deleted() {
     let fixture = Fixture::new();
     let source = fixture.source("src", &[("f", &random(20_000))]);
@@ -968,7 +2161,7 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
         ChunkIndex::load_header(&repo.join(".ddup-bak/chunks/index"))
             .unwrap()
             .version,
-        3
+        4
     );
 
     for entry in Archive::open(repo.join(".ddup-bak/archives/old.ddup"))
@@ -1013,6 +2206,153 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
 /// A format 1 index is a Deflate stream of chunk records, so a truncated one still decodes up
 /// to the damage. `rebuild` keeps that much and recovers every archive it covers, rather than
 /// treating the whole repository as lost.
+#[test]
+fn a_format_1_index_ending_short_of_its_records_is_rejected_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let contents: Vec<Vec<u8>> = (0..8u32).map(|i| random(200 + i as usize)).collect();
+    let files: Vec<_> = contents
+        .iter()
+        .map(|c| ("f", std::slice::from_ref(c), CompressionFormat::Deflate))
+        .collect();
+    write_format_1_repository(&repo, &files);
+    let index = repo.join(".ddup-bak/chunks/index");
+
+    // The same stream, ended cleanly after the header and one 34-byte record.
+    let mut plain = Vec::new();
+    flate2::read::DeflateDecoder::new(File::open(&index).unwrap())
+        .read_to_end(&mut plain)
+        .unwrap();
+    let mut short = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut short, &plain[..32 + 34]).unwrap();
+    fs::write(&index, short.finish().unwrap()).unwrap();
+
+    assert!(ChunkIndex::load_v1(&index).is_err());
+    assert!(Repository::open(&repo, None, None).is_err());
+    assert_eq!(
+        Archive::open(repo.join(".ddup-bak/archives/old.ddup"))
+            .unwrap()
+            .version(),
+        1
+    );
+}
+
+#[test]
+fn a_format_1_archive_with_the_longest_name_migrates() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let content = random(5_000);
+    write_format_1_repository(
+        &repo,
+        &[(
+            "f",
+            std::slice::from_ref(&content),
+            CompressionFormat::Deflate,
+        )],
+    );
+    let name = "n".repeat(250);
+    let archives = repo.join(".ddup-bak/archives");
+    fs::rename(
+        archives.join("old.ddup"),
+        archives.join(format!("{name}.ddup")),
+    )
+    .unwrap();
+
+    let repository = Repository::open(&repo, None, None).unwrap();
+    assert_eq!(repository.get_archive(&name).unwrap().version(), 2);
+    let restored = repository.restore_archive(&name, None, 2).unwrap();
+    assert_eq!(fs::read(restored.join("f")).unwrap(), content);
+}
+
+#[test]
+fn migration_counts_references_from_the_archives_not_the_old_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let content = random(5_000);
+    write_format_1_repository(
+        &repo,
+        &[(
+            "f",
+            std::slice::from_ref(&content),
+            CompressionFormat::Deflate,
+        )],
+    );
+    // What an interrupted backup of an older version left: a second archive over the same
+    // chunk, published before the index counted it.
+    let archives = repo.join(".ddup-bak/archives");
+    fs::copy(archives.join("old.ddup"), archives.join("twin.ddup")).unwrap();
+
+    let repository = Repository::open(&repo, None, None).unwrap();
+    repository.delete_archive("old", None).unwrap();
+    let restored = repository.restore_archive("twin", None, 2).unwrap();
+    assert_eq!(fs::read(restored.join("f")).unwrap(), content);
+}
+
+#[test]
+fn an_archive_with_a_damaged_body_blocks_deletion_but_neither_migration_nor_its_own_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let content = random(5_000);
+    write_format_1_repository(
+        &repo,
+        &[(
+            "f",
+            std::slice::from_ref(&content),
+            CompressionFormat::Deflate,
+        )],
+    );
+    // A current-format archive whose entry table reads but whose hash list is one byte.
+    let bad = repo.join(".ddup-bak/archives/bad.ddup");
+    let mut archive = Archive::new(File::create(&bad).unwrap()).unwrap();
+    let entry = archive
+        .write_file_entry(
+            Cursor::new(vec![0u8]),
+            Some(1),
+            "f",
+            EntryMode::new(0o644),
+            SystemTime::UNIX_EPOCH,
+            (0, 0),
+            CompressionFormat::None,
+        )
+        .unwrap();
+    archive.entries.push(Entry::File(entry));
+    archive.write_end_header().unwrap();
+    drop(archive);
+
+    let repository = Repository::open(&repo, None, None).unwrap();
+    assert_eq!(repository.get_archive("old").unwrap().version(), 2);
+    assert_eq!(repository.unreadable_archives().unwrap(), ["bad"]);
+    assert_eq!(
+        repository.delete_archive("old", None).unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+
+    repository.delete_archive("bad", None).unwrap();
+    repository.delete_archive("old", None).unwrap();
+    repository.clean(None).unwrap();
+    assert!(
+        ChunkStorageLocal(repo.join(".ddup-bak/chunks"))
+            .list_chunk_hashes()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_legacy_chunk_larger_than_this_version_ever_writes_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let big = vec![7u8; 17 << 20];
+    write_format_1_repository(
+        &repo,
+        &[("f", std::slice::from_ref(&big), CompressionFormat::Deflate)],
+    );
+
+    let repository = Repository::open(&repo, None, None).unwrap();
+    let restored = repository.restore_archive("old", None, 2).unwrap();
+    assert_eq!(fs::read(restored.join("f")).unwrap(), big);
+}
+
 #[test]
 fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
     let dir = tempfile::tempdir().unwrap();

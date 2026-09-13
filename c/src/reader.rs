@@ -7,7 +7,7 @@ use ddup_bak::{
 use std::{ffi::*, fs::File, io::Read, sync::Arc, time::SystemTime};
 
 /// Opaque streaming reader over a repository file entry. Holds a shared repository lock until
-/// freed.
+/// freed: `repository_clean` and `repository_delete_archive` fail while one is open.
 #[repr(C)]
 pub struct CEntryReader {
     _private: [u8; 0],

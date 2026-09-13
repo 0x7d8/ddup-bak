@@ -1,20 +1,79 @@
-use std::{fs::File, path::Path};
+use parking_lot::Mutex;
+use same_file::Handle;
+use std::{
+    fs::TryLockError,
+    path::Path,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
-/// OS advisory file lock, released when dropped.
+const POLL: Duration = Duration::from_millis(10);
+
+static READERS: LazyLock<Mutex<Vec<Arc<Handle>>>> = LazyLock::new(Default::default);
+
 pub struct Lock {
-    _file: File,
+    handle: Arc<Handle>,
+    reader: bool,
 }
 
 impl Lock {
     pub fn shared(path: &Path) -> std::io::Result<Self> {
-        let file = crate::fs::open_or_create(path)?;
-        file.lock_shared()?;
-        Ok(Self { _file: file })
+        let handle = open(path)?;
+        handle.as_file().lock_shared()?;
+        Ok(Self {
+            handle: Arc::new(handle),
+            reader: false,
+        })
     }
 
-    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
-        let file = crate::fs::open_or_create(path)?;
-        file.lock()?;
-        Ok(Self { _file: file })
+    pub fn reader(path: &Path) -> std::io::Result<Self> {
+        let handle = open(path)?;
+        handle.as_file().lock_shared()?;
+        let handle = Arc::new(handle);
+        READERS.lock().push(Arc::clone(&handle));
+        Ok(Self {
+            handle,
+            reader: true,
+        })
     }
+
+    /// Polls rather than blocking in the OS, so a reader opened in this process while another
+    /// holder is waited for turns the wait into the `WouldBlock` error instead of a hang.
+    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
+        let handle = open(path)?;
+        loop {
+            if READERS.lock().iter().any(|reader| **reader == handle) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is held by an entry reader open in this process",
+                        path.display()
+                    ),
+                ));
+            }
+            match handle.as_file().try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => std::thread::sleep(POLL),
+                Err(TryLockError::Error(err)) => return Err(err),
+            }
+        }
+        Ok(Self {
+            handle: Arc::new(handle),
+            reader: false,
+        })
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        if self.reader {
+            READERS
+                .lock()
+                .retain(|reader| !Arc::ptr_eq(reader, &self.handle));
+        }
+    }
+}
+
+fn open(path: &Path) -> std::io::Result<Handle> {
+    Handle::from_file(crate::fs::open_or_create(path)?)
 }

@@ -128,6 +128,11 @@ and fixed for its lifetime, since chunk files are named by it.
 two older index formats are still read: `DDUPIDX2`, a deflate stream with the same fields minus the hash
 algorithm byte and always BLAKE3-256, and format 1, a deflate stream keyed by index-assigned chunk ids.
 
+deleting an archive moves it to `.ddup-bak/deleting/<name>.ddup`, removes the chunks only it referenced,
+saves the index and then removes it from there. an archive left in `deleting` means the index may still
+count it; the next backup, delete, clean or rebuild recounts those chunks from the archives that remain
+before going on, and a delete does so without saving the index until its own chunks are freed.
+
 ### changes from version 1
 
 version 1 repository archives referenced chunks by index-assigned ids. opening such a repository rewrites its

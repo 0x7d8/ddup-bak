@@ -358,6 +358,10 @@ impl ChunkIndex {
         self.chunks.remove(hash);
     }
 
+    pub fn set(&self, hash: &ChunkHash, count: u64) {
+        self.chunks.insert(*hash, count);
+    }
+
     pub fn unreferenced(&self) -> Vec<ChunkHash> {
         self.chunks
             .iter()

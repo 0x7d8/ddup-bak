@@ -7,13 +7,17 @@ use ddup_bak::{
         ChunkIndex, HashAlgorithm,
         storage::{ChunkStorage, ChunkStorageLocal},
     },
+    lock::Lock,
     repository::Repository,
 };
 use std::{
     fs::{self, File},
     io::{Cursor, Read},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tempfile::TempDir;
@@ -28,10 +32,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_storage(|_| None)
+    }
+
+    fn with_storage(storage: impl FnOnce(PathBuf) -> Option<Arc<dyn ChunkStorage>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let repository = Repository::new(&root.join("repo"), CHUNK_SIZE, 0, None).unwrap();
-        fs::create_dir_all(root.join("repo/.ddup-bak/chunks")).unwrap();
+        let chunks = root.join("repo/.ddup-bak/chunks");
+        let repository =
+            Repository::new(&root.join("repo"), CHUNK_SIZE, 0, storage(chunks.clone())).unwrap();
+        fs::create_dir_all(chunks).unwrap();
         Self {
             _dir: dir,
             root,
@@ -86,7 +96,10 @@ impl Fixture {
 }
 
 fn random(len: usize) -> Vec<u8> {
-    let mut state = 0x9E3779B97F4A7C15u64;
+    seeded(0x9E3779B97F4A7C15, len)
+}
+
+fn seeded(mut state: u64, len: usize) -> Vec<u8> {
     (0..len)
         .map(|_| {
             state ^= state << 13;
@@ -219,6 +232,284 @@ fn delete_keeps_chunks_shared_with_other_archives() {
         &fixture.restore("second").unwrap(),
         &["shared", "only-second"],
     );
+}
+
+/// Local storage whose `n`th delete fails, standing in for a disk error mid-deletion.
+struct FailingDelete {
+    inner: ChunkStorageLocal,
+    deletes: AtomicUsize,
+    fail_at: usize,
+}
+
+impl ChunkStorage for FailingDelete {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        self.inner.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        if self.deletes.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_at {
+            return Err(std::io::Error::other("disk gave up"));
+        }
+        self.inner.delete_chunk_content(chunk)
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        self.inner.list_chunk_hashes()
+    }
+}
+
+#[test]
+fn interrupted_delete_does_not_leave_the_index_pointing_at_missing_chunks() {
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(FailingDelete {
+            inner: ChunkStorageLocal(chunks),
+            deletes: AtomicUsize::new(0),
+            fail_at: 2,
+        }))
+    });
+    let source = fixture.source("src", &[("f", &random(50_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    assert!(fixture.repository.delete_archive("a", None).is_err());
+
+    // The same content backed up again must be written again, not taken as still stored.
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_delete_that_fails_midway_is_finished_by_the_next_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+    let chunks = fixture.chunks_dir();
+
+    // Chunk files cannot be removed and the index cannot be written.
+    fs::set_permissions(&chunks, fs::Permissions::from_mode(0o555)).unwrap();
+    let result = fixture.repository.delete_archive("a", None);
+    fs::set_permissions(&chunks, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(
+        fixture.repository.list_archives().unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(fixture.repository.pending_deletions().unwrap(), ["a"]);
+
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn a_crash_between_chunk_deletion_and_the_index_save_is_recovered() {
+    let fixture = Fixture::new();
+    let shared = random(50_000);
+    let a = fixture.source("a", &[("shared", &shared), ("only-a", &seeded(1, 50_000))]);
+    let b = fixture.source("b", &[("shared", &shared), ("only-b", &seeded(2, 50_000))]);
+    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    fixture.backup("b", &b).unwrap();
+    let of_b = storage.list_chunk_hashes().unwrap();
+    fixture.backup("a", &a).unwrap();
+    let all = fixture.stored_chunks();
+    let only_in_a = storage
+        .list_chunk_hashes()
+        .unwrap()
+        .into_iter()
+        .find(|hash| !of_b.contains(hash))
+        .unwrap();
+
+    // What a crash leaves after the archive was renamed and one of its chunks removed, with
+    // the index still counting every reference.
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/a.ddup"),
+        ddup_bak.join("deleting/a.ddup"),
+    )
+    .unwrap();
+    fs::remove_file(
+        fixture
+            .chunks_dir()
+            .join(storage.path_from_chunk(&only_in_a)),
+    )
+    .unwrap();
+
+    // Backing up the same content again must write its chunks again.
+    fixture.backup("c", &a).unwrap();
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_same_files(&a, &fixture.restore("c").unwrap(), &["shared", "only-a"]);
+
+    fixture.repository.delete_archive("c", None).unwrap();
+    fixture.repository.clean(None).unwrap();
+    assert!(fixture.stored_chunks() < all);
+    assert_same_files(&b, &fixture.restore("b").unwrap(), &["shared", "only-b"]);
+}
+
+#[test]
+fn a_pending_deletion_does_not_hold_up_the_next_one() {
+    let fixture = Fixture::new();
+    let shared = random(50_000);
+    let x = fixture.source("x", &[("shared", &shared), ("only-x", &seeded(1, 50_000))]);
+    let y = fixture.source("y", &[("shared", &shared), ("only-y", &seeded(2, 50_000))]);
+    let z = fixture.source("z", &[("shared", &shared)]);
+    for (name, source) in [("x", &x), ("y", &y), ("z", &z)] {
+        fixture.backup(name, source).unwrap();
+    }
+    let all = fixture.stored_chunks();
+
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/x.ddup"),
+        ddup_bak.join("deleting/x.ddup"),
+    )
+    .unwrap();
+
+    // Both are settled by the one index save that follows y's chunks being freed.
+    fixture.repository.delete_archive("y", None).unwrap();
+    assert!(fixture.repository.pending_deletions().unwrap().is_empty());
+    assert_eq!(fixture.repository.list_archives().unwrap(), ["z"]);
+    assert!(fixture.stored_chunks() < all);
+    assert_same_files(&z, &fixture.restore("z").unwrap(), &["shared"]);
+}
+
+#[test]
+fn archives_with_the_longest_allowed_names_can_be_deleted() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    let name = "n".repeat(250);
+    fixture.backup(&name, &source).unwrap();
+
+    fixture.repository.delete_archive(&name, None).unwrap();
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn concurrent_backups_wait_for_each_other() {
+    let fixture = Fixture::new();
+    let first = fixture.source("first", &[("f", &random(30_000))]);
+    let second = fixture.source("second", &[("g", &random(30_000))]);
+
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| fixture.backup("first", &first));
+        let b = scope.spawn(|| fixture.backup("second", &second));
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+    });
+
+    assert_same_files(&first, &fixture.restore("first").unwrap(), &["f"]);
+    assert_same_files(&second, &fixture.restore("second").unwrap(), &["g"]);
+}
+
+#[test]
+fn deletion_waits_for_a_backup_or_restore_in_another_thread() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    // What a backup or restore holds on the chunks while it runs.
+    let held = Lock::shared(&fixture.chunks_dir().join("chunks.lock")).unwrap();
+    std::thread::scope(|scope| {
+        let clean = scope.spawn(|| fixture.repository.clean(None));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!clean.is_finished());
+
+        drop(held);
+        clean.join().unwrap().unwrap();
+    });
+}
+
+#[test]
+fn a_reader_opened_while_deletion_waits_makes_it_fail_instead_of_hanging() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let held = Lock::shared(&fixture.chunks_dir().join("chunks.lock")).unwrap();
+    std::thread::scope(|scope| {
+        let clean = scope.spawn(|| fixture.repository.clean(None));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!clean.is_finished());
+
+        let entry = fixture
+            .repository
+            .get_archive("a")
+            .unwrap()
+            .into_entries()
+            .into_iter()
+            .find(|entry| matches!(entry, Entry::File(_)))
+            .unwrap();
+        let _reader = fixture.repository.entry_reader(entry).unwrap();
+        drop(held);
+
+        let err = clean.join().unwrap().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hard_link_to_the_lock_file_is_the_same_lock() {
+    let fixture = Fixture::new();
+    let lock = fixture.chunks_dir().join("chunks.lock");
+    let link = fixture.root.join("linked.lock");
+    let _reader = Lock::reader(&lock).unwrap();
+    fs::hard_link(&lock, &link).unwrap();
+
+    let err = Lock::exclusive(&link)
+        .err()
+        .expect("the link is the same locked file");
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn an_open_entry_reader_makes_deletion_fail_instead_of_hanging() {
+    let fixture = Fixture::new();
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+    fixture.backup("a", &source).unwrap();
+
+    let entry = fixture
+        .repository
+        .get_archive("a")
+        .unwrap()
+        .into_entries()
+        .into_iter()
+        .find(|entry| matches!(entry, Entry::File(_)))
+        .unwrap();
+    let reader = fixture.repository.entry_reader(entry).unwrap();
+
+    let err = fixture.repository.clean(None).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        fixture
+            .repository
+            .delete_archive("a", None)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    drop(reader);
+    fixture.repository.delete_archive("a", None).unwrap();
+    assert_eq!(fixture.stored_chunks(), 0);
 }
 
 #[test]

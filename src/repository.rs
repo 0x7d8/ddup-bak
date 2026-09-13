@@ -23,11 +23,8 @@ use std::{
     time::SystemTime,
 };
 
-/// Chunks of one file read and decompressed concurrently while restoring. Bounds memory to
-/// `threads * RESTORE_WINDOW` chunks.
 const RESTORE_WINDOW: usize = 4;
 
-/// Whether a damaged format 1 index should be read for whatever part of it still decodes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Salvage {
     No,
@@ -37,13 +34,6 @@ enum Salvage {
 pub type DeletionProgressCallback = Option<Arc<dyn Fn(&ChunkHash, bool) + Send + Sync + 'static>>;
 pub type RebuildProgressCallback = Option<Arc<dyn Fn(&ChunkHash, u64) + Send + Sync + 'static>>;
 
-/// Repository locking:
-/// - `chunks.lock` is held shared by anything reading or adding chunks (create, restore, readers)
-///   and exclusively by anything deleting chunks (delete, clean, rebuild).
-/// - `index.lock` is held exclusively while creating an archive, serialising index updates.
-///
-/// The index is loaded under the lock at the start of every mutating operation and saved before
-/// the archive footer is published, so no operation works from a stale snapshot.
 pub struct Repository {
     pub directory: PathBuf,
     chunks_directory: PathBuf,
@@ -54,7 +44,6 @@ pub struct Repository {
 }
 
 impl Repository {
-    /// Creates a repository with the default (BLAKE2b) chunk hash.
     pub fn new(
         directory: &Path,
         chunk_size: usize,
@@ -78,7 +67,7 @@ impl Repository {
         storage: Option<Arc<dyn ChunkStorage>>,
     ) -> std::io::Result<Self> {
         let base = directory.join(".ddup-bak");
-        for sub in ["archives", "archives-restored", "chunks"] {
+        for sub in ["archives", "archives-restored", "deleting", "chunks"] {
             crate::fs::create_dir_all(&base.join(sub))?;
         }
 
@@ -118,8 +107,6 @@ impl Repository {
         Ok(repository)
     }
 
-    /// Recreates the chunk index from the archives and chunk storage. The hash algorithm is
-    /// recovered from the chunks themselves.
     pub fn rebuild(
         directory: &Path,
         chunk_size: usize,
@@ -148,9 +135,6 @@ impl Repository {
         let _lock = Lock::exclusive(&repository.chunks_lock_path())?;
         repository.hash_algorithm = chunks::detect_hash_algorithm(&*repository.storage)?;
 
-        // An archive that cannot be read counts for nothing rather than failing the rebuild,
-        // so the rest of the repository comes back. Its chunks stay: `clean` and
-        // `delete_archive` refuse to remove anything while such an archive is present.
         let names = repository.list_archives()?;
         let index = ChunkIndex::rebuild(
             chunk_size,
@@ -167,6 +151,9 @@ impl Repository {
             },
         )?;
         index.save(&repository.index_path())?;
+        for name in repository.pending_deletions()? {
+            std::fs::remove_file(repository.deleting_path(&name))?;
+        }
 
         Ok(repository)
     }
@@ -241,10 +228,6 @@ impl Repository {
         index.save(&self.index_path())
     }
 
-    /// The pid of a process holding a write lock taken by a version older than archive format
-    /// 2, if one is running. Those versions used their own advisory scheme in `index.lock`,
-    /// which this version cannot take part in: the file is a mode byte, a presence byte and a
-    /// pid, each padded to eight bytes. A stale file is ignored, since the pid identifies it.
     fn legacy_writer(&self) -> Option<u32> {
         let state = std::fs::read(self.index_lock_path()).ok()?;
         if *state.get(8)? == 0 {
@@ -389,10 +372,6 @@ impl Repository {
         Ok(archive)
     }
 
-    /// Backs up `root` into a new archive. Without a `walker`, the default one is the one every
-    /// version has used: `ignore`'s standard filters, which skip dot entries and honour
-    /// `.gitignore` and `.ignore`, but not the user's global gitignore. Pass a walker built with
-    /// `standard_filters(false)` to back up everything instead.
     pub fn create_archive(
         &self,
         name: &str,
@@ -410,8 +389,18 @@ impl Repository {
             ));
         }
 
+        self.recover()?;
         let _chunks_lock = Lock::shared(&self.chunks_lock_path())?;
         let _index_lock = Lock::exclusive(&self.index_lock_path())?;
+        if let Some(pending) = self.pending_deletions()?.first() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "archive {pending} was not fully deleted, so the index cannot be trusted. \
+                     Run clean, then back up again"
+                ),
+            ));
+        }
         let index = ChunkIndex::load(&self.index_path())?;
 
         let root = root.unwrap_or(&self.directory);
@@ -650,7 +639,7 @@ impl Repository {
             return Err(invalid("entry is not a file"));
         };
 
-        let lock = Lock::shared(&self.chunks_lock_path())?;
+        let lock = Lock::reader(&self.chunks_lock_path())?;
         Ok(EntryReader::new(
             chunks::entry_hashes(&mut file)?,
             Arc::clone(&self.storage),
@@ -659,9 +648,6 @@ impl Repository {
         ))
     }
 
-    /// Archives this build cannot read, which is how a format 1 archive whose chunk ids the
-    /// index no longer resolves is left behind. Their chunks are unaccounted for, so nothing
-    /// may delete chunks while one is present.
     pub fn unreadable_archives(&self) -> std::io::Result<Vec<String>> {
         Ok(self
             .list_archives()?
@@ -686,33 +672,140 @@ impl Repository {
         ))
     }
 
+    /// Chunks are deleted before the index is saved, so pruning frees space even when the
+    /// disk is too full for the index. The archive is moved to `.ddup-bak/deleting` first,
+    /// which needs no space, and removed from there last; one left behind by a crash or error
+    /// is settled by `settle_pending` before anything trusts the index again.
     pub fn delete_archive(
         &self,
         name: &str,
         progress: DeletionProgressCallback,
     ) -> std::io::Result<()> {
         let archive_path = self.archive_path(name)?;
+        let marker = self.deleting_path(name);
         let _lock = Lock::exclusive(&self.chunks_lock_path())?;
         self.refuse_deletion_while_unreadable()?;
+        let archive = if marker.exists() {
+            None
+        } else {
+            Some(self.get_archive(name)?)
+        };
         let index = ChunkIndex::load(&self.index_path())?;
+        let mut markers = self.settle_pending(&index)?;
 
+        if let Some(archive) = archive {
+            let mut hashes = Vec::new();
+            collect_hashes(archive.into_entries(), &mut hashes)?;
+            crate::fs::create_dir_all(marker.parent().unwrap())?;
+            std::fs::rename(&archive_path, &marker)?;
+            markers.push(marker);
+
+            let deletions: Vec<_> = hashes
+                .into_iter()
+                .map(|hash| {
+                    let deleted = index.dereference(&hash) == 0;
+                    if deleted {
+                        index.remove(&hash);
+                    }
+                    (hash, deleted)
+                })
+                .collect();
+            deletions.into_par_iter().try_for_each(|(hash, deleted)| {
+                if deleted {
+                    self.delete_chunk(&hash)?;
+                }
+                if let Some(progress) = &progress {
+                    progress(&hash, deleted);
+                }
+                Ok::<(), std::io::Error>(())
+            })?;
+        }
+
+        self.save_settled(&index, markers)
+    }
+
+    fn deleting_path(&self, name: &str) -> PathBuf {
+        self.directory
+            .join(".ddup-bak/deleting")
+            .join(format!("{name}.ddup"))
+    }
+
+    /// Names of archives whose deletion did not finish. The index may or may not have been
+    /// saved without them, and some of their chunks may be gone.
+    pub fn pending_deletions(&self) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(self.directory.join(".ddup-bak/deleting")) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            entries => entries?,
+        };
+        let mut pending = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            if let Some(name) = name.to_str().and_then(|name| name.strip_suffix(".ddup")) {
+                pending.push(name.to_owned());
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Settles pending deletions in `index` and returns their markers, to be removed once the
+    /// index is saved. Whether their own save happened is unknown, so the references of their
+    /// chunks are recounted from the archives that remain rather than subtracted. The save is
+    /// left to the caller so that a delete which frees space comes before it. Needs the chunks
+    /// lock held exclusively.
+    fn settle_pending(&self, index: &ChunkIndex) -> std::io::Result<Vec<PathBuf>> {
+        let pending = self.pending_deletions()?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.refuse_deletion_while_unreadable()?;
+
+        let markers: Vec<_> = pending
+            .iter()
+            .map(|name| self.deleting_path(name))
+            .collect();
         let mut hashes = Vec::new();
-        collect_hashes(self.get_archive(name)?.into_entries(), &mut hashes)?;
-        std::fs::remove_file(&archive_path)?;
-
-        hashes.into_par_iter().try_for_each(|hash| {
-            let deleted = index.dereference(&hash) == 0;
-            if deleted {
+        for path in &markers {
+            collect_hashes(Archive::open(path)?.into_entries(), &mut hashes)?;
+        }
+        let mut counts: HashMap<ChunkHash, u64> = hashes.into_iter().map(|h| (h, 0)).collect();
+        for name in self.list_archives()? {
+            let mut referenced = Vec::new();
+            collect_hashes(self.get_archive(&name)?.into_entries(), &mut referenced)?;
+            for hash in referenced {
+                if let Some(count) = counts.get_mut(&hash) {
+                    *count += 1;
+                }
+            }
+        }
+        for (hash, count) in counts {
+            if count == 0 {
                 self.delete_chunk(&hash)?;
                 index.remove(&hash);
+            } else {
+                index.set(&hash, count);
             }
-            if let Some(progress) = &progress {
-                progress(&hash, deleted);
-            }
-            Ok::<(), std::io::Error>(())
-        })?;
+        }
+        Ok(markers)
+    }
 
-        index.save(&self.index_path())
+    fn save_settled(&self, index: &ChunkIndex, markers: Vec<PathBuf>) -> std::io::Result<()> {
+        index.save(&self.index_path())?;
+        for marker in markers {
+            std::fs::remove_file(marker)?;
+        }
+        Ok(())
+    }
+
+    /// Settles pending deletions under the lock they need, before an operation that takes the
+    /// chunks lock shared. Nothing to settle is the usual case and costs a directory read.
+    fn recover(&self) -> std::io::Result<()> {
+        if self.pending_deletions()?.is_empty() {
+            return Ok(());
+        }
+        let _lock = Lock::exclusive(&self.chunks_lock_path())?;
+        let index = ChunkIndex::load(&self.index_path())?;
+        let markers = self.settle_pending(&index)?;
+        self.save_settled(&index, markers)
     }
 
     /// Deletes unreferenced chunks, including ones left behind by interrupted backups.
@@ -720,6 +813,7 @@ impl Repository {
         let _lock = Lock::exclusive(&self.chunks_lock_path())?;
         self.refuse_deletion_while_unreadable()?;
         let index = ChunkIndex::load(&self.index_path())?;
+        let markers = self.settle_pending(&index)?;
 
         let orphans = self
             .storage
@@ -734,7 +828,7 @@ impl Repository {
             }
         }
 
-        index.save(&self.index_path())
+        self.save_settled(&index, markers)
     }
 
     fn delete_chunk(&self, hash: &ChunkHash) -> std::io::Result<()> {
@@ -892,10 +986,6 @@ fn assemble(dir: PathBuf, children: &mut HashMap<PathBuf, Vec<Entry>>) -> Vec<En
     entries
 }
 
-/// Shared state of one `create_archive` run. Files are chunked and hashed on worker threads;
-/// new chunks are compressed and stored by further tasks when a slot is free, inline otherwise,
-/// so no worker ever blocks waiting for another. Hash lists go into the archive with positioned
-/// writes, so workers never contend on it.
 struct Job<'a> {
     archive: Archive,
     index: &'a ChunkIndex,
@@ -981,9 +1071,6 @@ impl Job<'_> {
         Ok(())
     }
 
-    /// Chunks, hashes and stores `file`, returning its chunk hashes and byte count. Files no
-    /// larger than one maximum chunk are read whole and cut in place, which needs one exact-size
-    /// allocation and copies only chunks that are new; bigger files stream through FastCDC.
     fn chunk_file<'scope>(
         &'scope self,
         scope: &rayon::Scope<'scope>,

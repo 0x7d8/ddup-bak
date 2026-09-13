@@ -7,11 +7,8 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository();
     let name = matches.get_one::<String>("name").expect("required");
 
-    if !repository
-        .list_archives()?
-        .iter()
-        .any(|backup| backup == name)
-    {
+    let exists = |names: Vec<String>| names.iter().any(|backup| backup == name);
+    if !exists(repository.list_archives()?) && !exists(repository.pending_deletions()?) {
         println!(
             "{} {} {}",
             "backup".red(),

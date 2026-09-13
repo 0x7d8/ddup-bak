@@ -90,7 +90,7 @@ typedef struct CSymlinkEntry {
 
 /**
  * Opaque streaming reader over a repository file entry. Holds a shared repository lock until
- * freed.
+ * freed: `repository_clean` and `repository_delete_archive` fail while one is open.
  */
 typedef struct CEntryReader {
   uint8_t _private[0];

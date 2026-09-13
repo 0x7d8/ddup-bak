@@ -55,16 +55,19 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     // Restore into a fresh directory on the destination's filesystem, then swap it in, so a
     // failed restore never touches the existing destination contents. Without a destination
     // the repository restores into its own place, where restores of one archive take turns.
+    // Restores into one destination take turns, from staging through the swap below.
+    let mut turn = None;
     let staging = match &destination {
         Some(destination) => {
-            // Restores into one destination take turns, so none removes the staging another fills.
             std::fs::create_dir_all(destination)?;
             let locks = repository.directory.join(".ddup-bak/restore-locks");
             std::fs::create_dir_all(&locks)?;
             let key = ddup_bak::chunks::hex(
                 blake3::hash(destination.canonicalize()?.as_os_str().as_encoded_bytes()).as_bytes(),
             );
-            let _turn = Lock::exclusive(&locks.join(format!("destination-{}", &key[..16])))?;
+            turn = Some(Lock::exclusive(
+                &locks.join(format!("destination-{}", &key[..16])),
+            )?);
             let staging = destination.join(STAGING_DIR);
             remove_if_exists(&staging)?;
             repository.restore_entries_to(
@@ -108,6 +111,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
             std::fs::rename(entry.path(), destination.join(entry.file_name()))?;
         }
         std::fs::remove_dir(&staging)?;
+        drop(turn);
 
         println!(
             "{} {} {} {}",

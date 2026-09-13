@@ -126,6 +126,21 @@ impl ChunkIndex {
                 "index uses format 1; the repository has not been migrated",
             ));
         }
+        // Format 4 ends in its checksum, so the whole file is read here to check it; `open`
+        // itself streams, since reading the header must stay cheap.
+        if header.version == 4 {
+            let mut bytes = std::fs::read(path)?;
+            let Some(body) = bytes.len().checked_sub(32) else {
+                return Err(invalid("index is cut short"));
+            };
+            if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
+                return Err(invalid("index does not match its checksum"));
+            }
+            bytes.truncate(body);
+            let mut cursor = Cursor::new(bytes);
+            cursor.set_position(25);
+            reader = Box::new(cursor);
+        }
 
         let index = Self::new(
             header.chunk_size,
@@ -249,31 +264,11 @@ impl ChunkIndex {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; 8];
         let has_magic = file.read_exact(&mut magic).is_ok();
-        if has_magic && magic == *INDEX_MAGIC_V4 {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            let Some(body) = bytes.len().checked_sub(32) else {
-                return Err(invalid("index is cut short"));
-            };
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&magic);
-            hasher.update(&bytes[..body]);
-            if hasher.finalize().as_bytes() != &bytes[body..] {
-                return Err(invalid("index does not match its checksum"));
-            }
-            bytes.truncate(body);
-            let header = bytes
-                .get(..17)
-                .ok_or_else(|| invalid("index is cut short"))?;
-            let (header_out, count) = Self::parse_header(header, 4)?;
-            let mut cursor = Cursor::new(bytes);
-            cursor.set_position(17);
-            return Ok((header_out, Box::new(cursor), count));
-        }
-        if has_magic && magic == *INDEX_MAGIC_V3 {
+        if has_magic && (magic == *INDEX_MAGIC_V4 || magic == *INDEX_MAGIC_V3) {
             let mut header = [0; 17];
             file.read_exact(&mut header)?;
-            let (header_out, count) = Self::parse_header(&header, 3)?;
+            let version = if magic == *INDEX_MAGIC_V4 { 4 } else { 3 };
+            let (header_out, count) = Self::parse_header(&header, version)?;
             return Ok((header_out, Box::new(file), count));
         }
 
@@ -667,14 +662,19 @@ fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::i
     let format = CompressionFormat::try_decode(format)?;
     content.drain(..CHUNK_HEADER_LEN as usize);
 
+    // The frame's own size claim only sizes the buffer when it is one this version writes;
+    // anything else, legacy or damage, goes through the bounded streaming path.
+    let zstd_size = (format == CompressionFormat::Zstd)
+        .then(|| {
+            zstd::zstd_safe::get_frame_content_size(&content)
+                .ok()
+                .flatten()
+        })
+        .flatten()
+        .filter(|size| *size <= MAX_CHUNK_SIZE as u64);
     let data = match format {
         CompressionFormat::None => content,
-        CompressionFormat::Zstd
-            if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&content) =>
-        {
-            if size > MAX_STORED_CHUNK_SIZE as u64 {
-                return Err(corrupted());
-            }
+        CompressionFormat::Zstd if let Some(size) = zstd_size => {
             let mut data = Vec::with_capacity(size as usize);
             ZSTD_DECOMPRESSOR
                 .with_borrow_mut(|decompressor| {

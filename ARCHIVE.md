@@ -130,10 +130,12 @@ three older index formats are still read: `DDUPIDX3`, the same without the trail
 algorithm byte and always BLAKE3-256, and format 1, a deflate stream keyed by index-assigned chunk ids.
 
 deleting an archive moves it to `.ddup-bak/deleting/<name>.ddup` (`<name>.ddup.1` and so on while that
-is taken, the name cut to fit), removes the chunks only it referenced, saves the index and then removes it from there. an
-archive left in `deleting` means the index may still count it; the next backup, delete, clean or rebuild
-recounts those chunks from the archives that remain before going on, and a delete does so without saving
-the index until its own chunks are freed. restoring an archive into `.ddup-bak/archives-restored/<name>` takes
+is taken, with no name at all if that would not fit), removes the chunks only it referenced, saves the
+index and then removes it from there. an archive left in `deleting` means the index may still count it;
+the next delete, clean or rebuild recounts those chunks from the archives that remain before going on,
+and a delete does so without saving the index until its own chunks are freed. a backup meanwhile checks
+that every chunk it reuses is there, so it needs no recount. a backup writes `.partial-<hash>` in
+`archives` and moves it into place last; `clean` removes any left behind. restoring an archive into `.ddup-bak/archives-restored/<name>` takes
 `.ddup-bak/restore-locks/<name>` exclusively, so two such restores run in turn.
 
 ### changes from version 1

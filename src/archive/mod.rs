@@ -11,10 +11,7 @@ use std::{
     fs::{DirEntry, File, Metadata},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -196,7 +193,7 @@ pub(crate) fn validate_name(name: &str, max_len: usize) -> std::io::Result<()> {
 }
 
 #[inline]
-fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
+pub(crate) fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -206,12 +203,21 @@ fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
     (0, 0)
 }
 
-/// Limits enforced while decoding an archive, keeping crafted inputs from exhausting memory.
+/// Limits enforced while decoding an archive from disk.
+///
+/// All limits are intentionally generous for legitimate archives but tight
+/// enough to prevent trivial DoS via crafted inputs (huge declared lengths,
+/// deeply-nested directory trees, absurd entry counts).
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
+    /// Maximum byte length of any single entry name (file, directory, symlink).
+    /// Above 255 because macOS and Windows count 255 characters, up to 765 bytes of UTF-8.
     pub max_name_len: usize,
+    /// Maximum byte length of a symlink target path.
     pub max_target_len: usize,
+    /// Maximum directory nesting depth.
     pub max_depth: usize,
+    /// Maximum number of top-level entries (and per-directory children).
     pub max_entry_count: usize,
 }
 
@@ -239,7 +245,7 @@ pub struct Archive {
 
     pub entries: Vec<Entry>,
     /// Where the entry table starts; also the append position for new file content.
-    entries_offset: AtomicU64,
+    entries_offset: u64,
 }
 
 impl Debug for Archive {
@@ -252,7 +258,9 @@ impl Debug for Archive {
 }
 
 impl Archive {
-    /// Starts a new archive in `file`, truncating it.
+    /// Creates a new archive file.
+    /// The file signature is written to the beginning of the file.
+    /// The file is truncated to 0 bytes.
     pub fn new(mut file: File) -> std::io::Result<Self> {
         file.set_len(0)?;
         file.write_all(&FILE_SIGNATURE)?;
@@ -264,22 +272,28 @@ impl Archive {
             compression_callback: None,
             real_size_callback: None,
             entries: Vec::new(),
-            entries_offset: AtomicU64::new(HEADER_LEN),
+            entries_offset: HEADER_LEN,
         })
     }
 
+    /// Opens an existing archive file for reading and writing.
+    /// This will not overwrite the file, but append to it.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::open_with_limits(path, DecodeLimits::default())
     }
 
+    /// Opens an existing archive file with custom decode limits.
     pub fn open_with_limits(path: impl AsRef<Path>, limits: DecodeLimits) -> std::io::Result<Self> {
         Self::open_file_with_limits(File::open(path)?, limits)
     }
 
+    /// Opens an existing archive file for reading and writing.
+    /// This will not overwrite the file, but append to it.
     pub fn open_file(file: File) -> std::io::Result<Self> {
         Self::open_file_with_limits(file, DecodeLimits::default())
     }
 
+    /// Opens an existing archive file with custom decode limits.
     pub fn open_file_with_limits(mut file: File, limits: DecodeLimits) -> std::io::Result<Self> {
         let len = file.metadata()?.len();
         if len < HEADER_LEN + FOOTER_LEN {
@@ -336,28 +350,39 @@ impl Archive {
             compression_callback: None,
             real_size_callback: None,
             entries,
-            entries_offset: AtomicU64::new(entries_offset),
+            entries_offset,
         })
     }
 
+    /// Retrieves the format version of the archive.
+    /// This is the version of the archive format.
+    #[inline]
     pub const fn version(&self) -> u8 {
         self.version
     }
 
-    /// Callback deciding the compression of each file added through `add_directory`/`add_entries`.
+    /// Sets the compression callback for the archive.
+    /// This callback is called for each added file entry in the archive.
+    /// The callback should return the compression format to use for the file.
+    #[inline]
     pub fn set_compression_callback(&mut self, callback: CompressionFormatCallback) -> &mut Self {
         self.compression_callback = callback;
         self
     }
 
-    /// Callback overriding the recorded "real" (uncompressed) size of files added through
-    /// `add_directory`/`add_entries`.
+    /// Sets the "real" size callback for the archive.
+    /// This callback is called for each added file entry in the archive.
+    /// The callback should return the "real" size of the file.
+    #[inline]
     pub fn set_real_size_callback(&mut self, callback: RealSizeCallback) -> &mut Self {
         self.real_size_callback = callback;
         self
     }
 
-    /// Appends the contents of a directory to the archive and rewrites the entry table.
+    /// Adds all files in the given directory to the archive. (including subdirectories)
+    /// This will append the directory to the end of the archive, if this directory already exists, it will not be replaced.
+    ///
+    /// After this function is called, the existing header will be trimmed to the end of the archive, then readded upon completion.
     pub fn add_directory(
         &mut self,
         path: &str,
@@ -367,7 +392,10 @@ impl Archive {
         self.add_entries(entries, progress)
     }
 
-    /// Appends filesystem entries to the archive and rewrites the entry table.
+    /// Adds a single file entry to the archive. (including subdirectories)
+    /// This will append the entry to the end of the archive, if this entry already exists, it will not be replaced.
+    ///
+    /// After this function is called, the existing header will be trimmed to the end of the archive, then readded upon completion.
     pub fn add_entries(
         &mut self,
         entries: Vec<DirEntry>,
@@ -384,16 +412,25 @@ impl Archive {
         Ok(self)
     }
 
+    /// Returns the entries in the archive.
+    #[inline]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
+    /// Consumes the archive and returns the entries.
+    #[inline]
     pub fn into_entries(self) -> Vec<Entry> {
         self.entries
     }
 
-    /// Writes file content to the archive and returns its entry. The caller owns placing the
-    /// entry in the tree and calling `write_end_header` afterwards.
+    /// Writes a new file entry to the archive.
+    /// This will NOT append the entry to the archive, it will write the content of the file to the archive and
+    /// return the entry.
+    ///
+    /// # Important
+    /// This function does not trim the end header or readd the end header, you will need to do that manually
+    /// after calling this function.
     #[allow(clippy::too_many_arguments)]
     pub fn write_file_entry(
         &mut self,
@@ -408,7 +445,7 @@ impl Archive {
         let name = name.into();
         validate_name(&name, DecodeLimits::default().max_name_len)?;
 
-        let offset = self.entries_offset.load(Ordering::Acquire);
+        let offset = self.entries_offset;
         (&*self.file).seek(SeekFrom::Start(offset))?;
         let mut encoder = Compressor::new(compression, &*self.file)?;
         let mut buffer = [0; 65536];
@@ -424,11 +461,10 @@ impl Archive {
         }
         encoder.finish()?;
 
-        let end = (&*self.file).stream_position()?;
-        self.entries_offset.store(end, Ordering::Release);
+        self.entries_offset = (&*self.file).stream_position()?;
         let size_compressed = match compression {
             CompressionFormat::None => None,
-            _ => Some(end - offset),
+            _ => Some(self.entries_offset - offset),
         };
 
         Ok(Box::new(FileEntry {
@@ -447,66 +483,59 @@ impl Archive {
         }))
     }
 
-    /// Appends uncompressed file content with a positioned write, so any number of threads can
-    /// add entries at once. As with `write_file_entry`, the caller places the entry in the tree
-    /// and calls `write_end_header` afterwards.
-    pub fn write_raw_file_entry(
-        &self,
-        data: &[u8],
-        size_real: Option<u64>,
-        name: impl Into<String>,
-        mode: EntryMode,
-        mtime: SystemTime,
-        owner: (u32, u32),
-    ) -> std::io::Result<Box<FileEntry>> {
-        let name = name.into();
-        validate_name(&name, DecodeLimits::default().max_name_len)?;
-
-        let offset = self
-            .entries_offset
-            .fetch_add(data.len() as u64, Ordering::AcqRel);
-        crate::fs::write_all_at(&self.file, offset, data)?;
-
-        Ok(Box::new(FileEntry {
-            name,
-            mode,
-            owner,
-            mtime,
-            compression: CompressionFormat::None,
-            size_compressed: None,
-            size_real: size_real.unwrap_or(data.len() as u64),
-            size: data.len() as u64,
-            file: Arc::clone(&self.file),
-            offset,
-            decoder: None,
-            consumed: 0,
-        }))
-    }
-
-    /// Finds an entry by its path inside the archive, e.g. `world/level.dat`.
-    pub fn find_archive_entry(&self, path: &Path) -> Option<&Entry> {
-        let mut entries = self.entries.as_slice();
-        let mut found = None;
-
-        for part in path.components().map(|c| c.as_os_str()) {
-            let entry = entries.iter().find(|e| OsStr::new(e.name()) == part)?;
-            entries = match entry {
-                Entry::Directory(dir) => &dir.entries,
-                _ => &[],
+    /// Finds an entry in the archive by name.
+    /// Returns `None` if the entry is not found.
+    /// The entry name is the path inside the archive.
+    /// Example: "world/user/level.dat" would be a valid entry name.
+    #[inline]
+    pub fn find_archive_entry(&self, entry_name: &Path) -> Option<&Entry> {
+        let mut parts = entry_name.components().map(|c| c.as_os_str());
+        let first = parts.next()?;
+        let mut entry = self
+            .entries
+            .iter()
+            .find(|e| OsStr::new(e.name()) == first)?;
+        for part in parts {
+            let Entry::Directory(dir) = entry else {
+                return None;
             };
-            found = Some(entry);
+            entry = dir.entries.iter().find(|e| OsStr::new(e.name()) == part)?;
         }
 
-        found
+        Some(entry)
+    }
+
+    /// Finds an entry in the archive by name.
+    /// Returns `None` if the entry is not found.
+    /// The entry name is the path inside the archive.
+    /// Example: "world/user/level.dat" would be a valid entry name.
+    #[inline]
+    pub fn find_archive_entry_mut(&mut self, entry_name: &Path) -> Option<&mut Entry> {
+        let mut parts = entry_name.components().map(|c| c.as_os_str());
+        let first = parts.next()?;
+        let mut entry = self
+            .entries
+            .iter_mut()
+            .find(|e| OsStr::new(e.name()) == first)?;
+        for part in parts {
+            let Entry::Directory(dir) = entry else {
+                return None;
+            };
+            entry = dir
+                .entries
+                .iter_mut()
+                .find(|e| OsStr::new(e.name()) == part)?;
+        }
+
+        Some(entry)
     }
 
     pub fn trim_end_header(&mut self) -> std::io::Result<()> {
-        self.file
-            .set_len(self.entries_offset.load(Ordering::Acquire))
+        self.file.set_len(self.entries_offset)
     }
 
     pub fn write_end_header(&mut self) -> std::io::Result<()> {
-        let entries_offset = self.entries_offset.load(Ordering::Acquire);
+        let entries_offset = self.entries_offset;
         let mut file = &*self.file;
         file.seek(SeekFrom::Start(entries_offset))?;
 

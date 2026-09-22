@@ -1,11 +1,13 @@
 use super::ChunkHash;
 use std::{
+    fs::File,
     io::{Read, Write},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 pub trait ChunkStorage: Send + Sync {
+    #[inline]
     fn path_from_chunk(&self, chunk: &ChunkHash) -> PathBuf {
         let hex = super::hex(chunk);
         let mut path = String::with_capacity(hex.len() + 8);
@@ -42,11 +44,6 @@ pub trait ChunkStorage: Send + Sync {
     fn remove_leftovers(&self) -> std::io::Result<()> {
         Ok(())
     }
-
-    /// Makes every chunk written so far durable; called once before an archive is published.
-    fn sync(&self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 pub struct ChunkStorageLocal(pub PathBuf);
@@ -70,23 +67,20 @@ impl ChunkStorage for ChunkStorageLocal {
         }
 
         let parent = path.parent().unwrap();
-        crate::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)?;
 
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
-        let mut file = match crate::fs::create_new_file(&tmp_path) {
+        let mut file = match File::create_new(&tmp_path) {
             // A file here was left by a dead process with the same pid.
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::fs::remove_file(&tmp_path)?;
-                crate::fs::create_new_file(&tmp_path)?
+                File::create_new(&tmp_path)?
             }
             file => file?,
         };
 
-        if let Err(err) = file
-            .write_all(content)
-            .and_then(|()| crate::fs::flush_file(&file))
-        {
+        if let Err(err) = file.write_all(content).and_then(|()| file.sync_all()) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
@@ -95,7 +89,7 @@ impl ChunkStorage for ChunkStorageLocal {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
-        crate::fs::flush_dir(parent)
+        Ok(())
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
@@ -114,10 +108,6 @@ impl ChunkStorage for ChunkStorageLocal {
         }
 
         Ok(())
-    }
-
-    fn sync(&self) -> std::io::Result<()> {
-        crate::fs::sync_filesystem(&self.0)
     }
 
     fn remove_leftovers(&self) -> std::io::Result<()> {

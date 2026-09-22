@@ -22,7 +22,7 @@ pub type ChunkHash = [u8; 32];
 
 /// Largest chunk `cdc_parameters` can produce, and therefore the most memory a single
 /// verified chunk read will use.
-pub const MAX_CHUNK_SIZE: usize = 4 * fastcdc::v2020::AVERAGE_MAX;
+pub(crate) const MAX_CHUNK_SIZE: usize = 4 * fastcdc::v2020::AVERAGE_MAX;
 /// Read limit for stored chunks. Older versions cut fixed-size chunks of any configured size.
 const MAX_STORED_CHUNK_SIZE: usize = 1 << 30;
 /// The most references a chunk is accepted with when the index is loaded.
@@ -51,7 +51,7 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    pub const ALL: [Self; 2] = [Self::Blake2b256, Self::Blake3];
+    pub(crate) const ALL: [Self; 2] = [Self::Blake2b256, Self::Blake3];
 
     pub const fn encode(&self) -> u8 {
         *self as u8
@@ -320,7 +320,7 @@ impl ChunkIndex {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let tmp_path = path.with_extension("tmp");
         let mut writer = Hashing {
-            inner: BufWriter::new(crate::fs::create_file(&tmp_path)?),
+            inner: BufWriter::new(File::create(&tmp_path)?),
             hasher: blake3::Hasher::new(),
         };
 
@@ -338,7 +338,7 @@ impl ChunkIndex {
         inner.into_inner()?.sync_all()?;
 
         std::fs::rename(&tmp_path, path)?;
-        crate::fs::sync_dir(path.parent().unwrap_or(Path::new(".")))
+        sync_dir(path.parent().unwrap_or(Path::new(".")))
     }
 
     /// Recomputes reference counts from `archives`, one archive in memory at a time; chunks in
@@ -393,6 +393,7 @@ impl ChunkIndex {
         self.chunks.contains_key(hash)
     }
 
+    #[inline]
     pub fn references(&self, hash: &ChunkHash) -> u64 {
         self.chunks.get(hash).map_or(0, |count| *count)
     }
@@ -438,7 +439,9 @@ impl ChunkIndex {
 
 /// Works out which algorithm named the chunks in `storage` by hashing one of them. Empty
 /// storage tells nothing.
-pub fn detect_hash_algorithm(storage: &dyn ChunkStorage) -> std::io::Result<Option<HashAlgorithm>> {
+pub(crate) fn detect_hash_algorithm(
+    storage: &dyn ChunkStorage,
+) -> std::io::Result<Option<HashAlgorithm>> {
     // A damaged chunk tells nothing; the damage is the answer only when no chunk is whole.
     let mut damage = None;
     for hash in storage.list_chunk_hashes()? {
@@ -495,6 +498,16 @@ pub(crate) fn is_damage(err: &std::io::Error) -> bool {
     )
 }
 
+/// Makes renames into a directory durable. Does nothing off Unix, where a directory cannot be
+/// opened as a file.
+pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 pub fn hex(hash: &ChunkHash) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut hex = String::with_capacity(64);
@@ -507,7 +520,7 @@ pub fn hex(hash: &ChunkHash) -> String {
 
 /// FastCDC (min, average, max) sizes for a file of `len` bytes. The average doubles until the
 /// expected chunk count fits `max_chunk_count` (0 disables the cap).
-pub fn cdc_parameters(
+pub(crate) fn cdc_parameters(
     chunk_size: usize,
     max_chunk_count: usize,
     len: u64,
@@ -547,7 +560,7 @@ pub fn entry_hashes(entry: &mut FileEntry) -> std::io::Result<Vec<ChunkHash>> {
 
 /// Chunk hashes of a format 1 repository file entry, which lists chunk ids as varints and
 /// relies on the index of its era to resolve them.
-pub fn entry_hashes_v1(
+pub(crate) fn entry_hashes_v1(
     entry: &mut FileEntry,
     ids: &HashMap<u64, ChunkHash>,
 ) -> std::io::Result<Vec<ChunkHash>> {
@@ -585,7 +598,7 @@ thread_local! {
     static ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub fn write_chunk(
+pub(crate) fn write_chunk(
     storage: &dyn ChunkStorage,
     hash: &ChunkHash,
     data: &[u8],
@@ -634,7 +647,7 @@ fn encode_chunk(data: &[u8], compression: CompressionFormat) -> std::io::Result<
 }
 
 /// Reads and decompresses a chunk, failing if it does not hash to `hash`.
-pub fn read_chunk(
+pub(crate) fn read_chunk(
     storage: &dyn ChunkStorage,
     algorithm: HashAlgorithm,
     hash: &ChunkHash,

@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use same_file::Handle;
 use std::{
-    fs::TryLockError,
+    fs::{File, TryLockError},
     path::Path,
     sync::{Arc, LazyLock},
     time::Duration,
@@ -75,5 +75,12 @@ impl Drop for Lock {
 }
 
 fn open(path: &Path) -> std::io::Result<Handle> {
-    Handle::from_file(crate::fs::open_or_create(path)?)
+    Handle::from_file(
+        File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?,
+    )
 }

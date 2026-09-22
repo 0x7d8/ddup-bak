@@ -449,7 +449,7 @@ fn a_live_archive_whose_name_the_file_system_equates_with_a_pending_one_is_delet
 }
 
 #[test]
-fn the_file_cache_is_not_trusted_for_chunks_the_index_no_longer_references() {
+fn chunks_an_interrupted_clean_deleted_are_written_again() {
     let fixture = Fixture::new();
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
@@ -464,7 +464,7 @@ fn the_file_cache_is_not_trusted_for_chunks_the_index_no_longer_references() {
     }
     index.save(&index_path).unwrap();
 
-    // The file is unchanged, so its cached chunk list applies, but the chunks must be written.
+    // The index still lists the chunks, but their files are gone and must be written again.
     fixture.backup("b", &source).unwrap();
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
 }
@@ -670,22 +670,6 @@ fn a_directory_where_a_chunk_should_be_fails_the_backup() {
     fs::create_dir(&path).unwrap();
 
     assert!(fixture.backup("b", &source).is_err());
-}
-
-#[test]
-fn a_backup_stands_when_the_file_cache_cannot_be_saved() {
-    let fixture = Fixture::new();
-    let source = fixture.source("src", &[("f", &random(30_000))]);
-    let blocker = fixture.root.join("repo/.ddup-bak/filecache.tmp");
-    fs::create_dir(&blocker).unwrap();
-
-    fixture.backup("a", &source).unwrap();
-    assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
-
-    fs::remove_dir(&blocker).unwrap();
-    fixture.repository.delete_archive("a", None).unwrap();
-    fixture.repository.clean(None).unwrap();
-    assert_eq!(fixture.stored_chunks(), 0);
 }
 
 #[test]
@@ -1023,50 +1007,6 @@ fn clean_removes_temporary_chunk_files_left_by_interrupted_writes() {
     assert!(elsewhere.exists());
 }
 
-#[test]
-fn a_cache_record_cut_short_of_its_chunks_does_not_make_the_file_empty() {
-    let fixture = Fixture::new();
-    let source = fixture.source("src", &[("f", b"irreplaceable content")]);
-    fixture.backup("a", &source).unwrap();
-
-    // The one record, kept up to its chunk count, which now says zero.
-    let cache_path = fixture.root.join("repo/.ddup-bak/filecache");
-    let mut cache = fs::read(&cache_path).unwrap();
-    let mut reader = Cursor::new(&cache[8..]);
-    let path_length = ddup_bak::varint::decode(&mut reader).unwrap() as usize;
-    let count_at = 8 + reader.position() as usize + path_length + 44;
-    assert_eq!(cache[count_at], 1);
-    cache[count_at] = 0;
-    cache.truncate(count_at + 1);
-    fs::write(&cache_path, cache).unwrap();
-
-    fixture.backup("b", &source).unwrap();
-    fixture.repository.delete_archive("a", None).unwrap();
-    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
-}
-
-#[test]
-fn a_cache_record_with_a_shortened_chunk_list_is_not_trusted() {
-    let fixture = Fixture::new();
-    let source = fixture.source("src", &[("f", &random(100_000))]);
-    fixture.backup("a", &source).unwrap();
-
-    // The one record with its chunk count set to one and the rest of its list gone.
-    let cache_path = fixture.root.join("repo/.ddup-bak/filecache");
-    let mut cache = fs::read(&cache_path).unwrap();
-    let mut reader = Cursor::new(&cache[8..]);
-    let path_length = ddup_bak::varint::decode(&mut reader).unwrap() as usize;
-    let count_at = 8 + reader.position() as usize + path_length + 44;
-    assert!(cache[count_at] > 1);
-    cache[count_at] = 1;
-    cache.truncate(count_at + 1 + 32);
-    fs::write(&cache_path, cache).unwrap();
-
-    fixture.backup("b", &source).unwrap();
-    fixture.repository.delete_archive("a", None).unwrap();
-    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
-}
-
 #[cfg(unix)]
 #[test]
 fn an_earlier_restore_with_read_only_directories_can_be_removed() {
@@ -1143,13 +1083,14 @@ fn an_entry_with_content_but_no_chunks_is_damage() {
     let path = fixture.repository.archive_path("bad").unwrap();
     let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
     let entry = archive
-        .write_raw_file_entry(
-            &[],
+        .write_file_entry(
+            std::io::empty(),
             Some(4),
             "f",
             EntryMode::new(0o600),
             SystemTime::UNIX_EPOCH,
             (0, 0),
+            CompressionFormat::None,
         )
         .unwrap();
     archive.entries.push(Entry::File(entry));
@@ -1278,13 +1219,14 @@ fn a_file_whose_chunks_fall_short_of_its_recorded_size_does_not_restore_padded()
     let path = fixture.repository.archive_path("bad").unwrap();
     let mut archive = Archive::new(File::create(&path).unwrap()).unwrap();
     let entry = archive
-        .write_raw_file_entry(
+        .write_file_entry(
             hashes.as_flattened(),
             Some(12),
             "f",
             EntryMode::new(0o600),
             SystemTime::UNIX_EPOCH,
             (0, 0),
+            CompressionFormat::None,
         )
         .unwrap();
     archive.entries.push(Entry::File(entry));
@@ -1391,18 +1333,6 @@ fn a_tree_nested_deeper_than_an_archive_can_hold_is_refused_before_publication()
     let err = fixture.backup("a", &fixture.root.join("src")).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(fixture.repository.list_archives().unwrap().is_empty());
-}
-
-#[test]
-fn a_damaged_file_cache_is_discarded_rather_than_trusted_for_its_lengths() {
-    let fixture = Fixture::new();
-    let mut cache = b"DDUPFCH1".to_vec();
-    ddup_bak::varint::encode(&mut cache, u64::MAX).unwrap();
-    fs::write(fixture.root.join("repo/.ddup-bak/filecache"), cache).unwrap();
-
-    let source = fixture.source("src", &[("f", &random(20_000))]);
-    fixture.backup("a", &source).unwrap();
-    assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
 }
 
 #[cfg(unix)]
@@ -2099,53 +2029,6 @@ fn short_and_unsupported_archives_are_errors() {
     assert_eq!(
         fixture.repository.get_archive("v1").unwrap_err().kind(),
         std::io::ErrorKind::Unsupported
-    );
-}
-
-#[test]
-fn unchanged_files_are_not_chunked_again() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let fixture = Fixture::new();
-    let (big, small) = (random(20_000), random(100));
-    let source = fixture.source("src", &[("big", &big), ("small", &small)]);
-
-    // The compression callback runs once per file that is actually read and chunked.
-    let chunked = Arc::new(AtomicUsize::new(0));
-    let backup = |name: &str| {
-        let chunked = Arc::clone(&chunked);
-        let compression: CompressionFormatCallback = Some(Arc::new(move |_, _| {
-            chunked.fetch_add(1, Ordering::Relaxed);
-            CompressionFormat::Deflate
-        }));
-        let walker = ignore::WalkBuilder::new(&source)
-            .standard_filters(false)
-            .build();
-        fixture
-            .repository
-            .create_archive(name, Some(walker), Some(&source), None, compression, 4)
-            .unwrap();
-    };
-
-    backup("first");
-    assert_eq!(chunked.load(Ordering::Relaxed), 2);
-    backup("second");
-    assert_eq!(chunked.load(Ordering::Relaxed), 2);
-    assert_same_files(
-        &source,
-        &fixture.restore("second").unwrap(),
-        &["big", "small"],
-    );
-
-    // A rewrite of the same length is picked up: its ctime differs.
-    let changed = small.iter().map(|b| !b).collect::<Vec<_>>();
-    fs::write(source.join("small"), &changed).unwrap();
-    backup("third");
-    assert_eq!(chunked.load(Ordering::Relaxed), 3);
-    assert_same_files(
-        &source,
-        &fixture.restore("third").unwrap(),
-        &["big", "small"],
     );
 }
 

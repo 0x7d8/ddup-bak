@@ -27,7 +27,7 @@ impl StagedRestore {
         let root = loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
             let root = destination.join(format!("{PREFIX}{}-{id}", std::process::id()));
-            match crate::fs::create_dir(&root) {
+            match std::fs::create_dir(&root) {
                 Ok(()) => break root,
                 // Never reuse or remove a directory just because its name looks like ours.
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -38,8 +38,8 @@ impl StagedRestore {
             root,
             retain: false,
         };
-        crate::fs::create_dir(&staging.path())?;
-        crate::fs::create_dir(&staging.previous())?;
+        std::fs::create_dir(staging.path())?;
+        std::fs::create_dir(staging.previous())?;
         Ok(staging)
     }
 
@@ -96,7 +96,7 @@ impl StagedRestore {
                 )?;
                 installed.push(name);
             }
-            crate::fs::sync_dir(destination)
+            crate::chunks::sync_dir(destination)
         })();
 
         if let Err(original) = result {

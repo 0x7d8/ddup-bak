@@ -2,8 +2,8 @@ use crate::{
     archive::{
         Archive, CompressionFormat, CompressionFormatCallback, FILE_VERSION, ProgressCallback,
         entries::{DirectoryEntry, Entry, SymlinkEntry},
+        metadata_owner,
     },
-    cache::{CachedFile, FileCache, Fingerprint},
     chunks::{
         self, ChunkHash, ChunkIndex, HashAlgorithm,
         reader::EntryReader,
@@ -24,12 +24,6 @@ use std::{
 };
 
 const RESTORE_WINDOW: usize = 4;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Salvage {
-    No,
-    Yes,
-}
 
 pub type DeletionProgressCallback = Option<Arc<dyn Fn(&ChunkHash, bool) + Send + Sync + 'static>>;
 pub type RebuildProgressCallback = Option<Arc<dyn Fn(&ChunkHash, u64) + Send + Sync + 'static>>;
@@ -68,7 +62,7 @@ impl Repository {
     ) -> std::io::Result<Self> {
         let base = directory.join(".ddup-bak");
         for sub in ["archives", "archives-restored", "deleting", "chunks"] {
-            crate::fs::create_dir_all(&base.join(sub))?;
+            std::fs::create_dir_all(base.join(sub))?;
         }
 
         let repository = Self::with_storage(
@@ -84,8 +78,11 @@ impl Repository {
         Ok(repository)
     }
 
-    /// Opens a repository. One written by a version before archive format 2 is migrated in
-    /// place first (see `migrate_v1`).
+    /// Opens an existing repository.
+    /// The repository must be initialized with `new` before use.
+    /// The repository directory must contain a `.ddup-bak` directory.
+    /// One written by a version before archive format 2 is migrated in place first (see
+    /// `migrate_v1`).
     pub fn open(
         directory: &Path,
         chunks_directory: Option<&Path>,
@@ -102,15 +99,19 @@ impl Repository {
             header.hash_algorithm,
         );
         if header.version == 1 {
-            repository.migrate_v1(Salvage::No)?;
+            repository.migrate_v1(false)?;
         } else if repository.legacy_ids_path().exists() {
             repository.finish_migration()?;
         }
         // Created now so a delete on a full disk does not have to. Failing is fine here.
-        let _ = crate::fs::create_dir_all(&repository.directory.join(".ddup-bak/deleting"));
+        let _ = std::fs::create_dir_all(repository.directory.join(".ddup-bak/deleting"));
         Ok(repository)
     }
 
+    /// Rebuilds a corrupted repository by scanning archives and chunk storage.
+    ///
+    /// Use this when `open()` fails because the chunk index is corrupt or
+    /// missing (e.g. after a disk-full event).
     pub fn rebuild(
         directory: &Path,
         chunk_size: usize,
@@ -127,12 +128,12 @@ impl Repository {
             max_chunk_count,
             HashAlgorithm::default(),
         );
-        crate::fs::create_dir_all(&repository.chunks_directory)?;
+        std::fs::create_dir_all(&repository.chunks_directory)?;
 
         // Format 1 archives can only be resolved through the index of their era, so finish that
         // migration while it is still possible, keeping whatever a damaged index still decodes.
         match ChunkIndex::load_header(&repository.index_path()) {
-            Ok(header) if header.version == 1 => repository.migrate_v1(Salvage::Yes)?,
+            Ok(header) if header.version == 1 => repository.migrate_v1(true)?,
             Ok(_) => {}
             // No index, or one too damaged to say what it is, leaves nothing to migrate from.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound || chunks::is_damage(&err) => {}
@@ -181,7 +182,7 @@ impl Repository {
     /// the old index, and the next open picks up where it stopped. With `salvage`, a damaged
     /// index yields whatever part of it still decodes instead of failing, so the archives it
     /// covers are recovered; see `ChunkIndex::salvage_v1`.
-    fn migrate_v1(&self, salvage: Salvage) -> std::io::Result<()> {
+    fn migrate_v1(&self, salvage: bool) -> std::io::Result<()> {
         if let Some(pid) = self.legacy_writer() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -198,7 +199,7 @@ impl Repository {
         if header.version != 1 {
             return Ok(());
         }
-        let (_, ids) = if salvage == Salvage::Yes {
+        let (_, ids) = if salvage {
             ChunkIndex::salvage_v1(&self.index_path())
         } else {
             ChunkIndex::load_v1(&self.index_path())
@@ -207,7 +208,7 @@ impl Repository {
         let remaining = self.migrate_archives(&ids)?;
 
         // A salvage is followed by a rebuild, which must not find a partial index in the way.
-        if salvage == Salvage::Yes {
+        if salvage {
             return Ok(());
         }
         // A damaged archive keeps the id map it will need once it reads again.
@@ -252,8 +253,8 @@ impl Repository {
                 &chunks::hex(blake3::hash(name.as_bytes()).as_bytes())[..16]
             ));
             let _ = std::fs::remove_file(&tmp_path);
-            let mut migrated = Archive::new(crate::fs::create_new_file(&tmp_path)?)?;
-            let result = migrate_v1_entries(archive.into_entries(), &migrated, ids)
+            let mut migrated = Archive::new(create_new_file(&tmp_path)?)?;
+            let result = migrate_v1_entries(archive.into_entries(), &mut migrated, ids)
                 .and_then(|entries| {
                     migrated.entries = entries;
                     migrated.write_end_header()
@@ -267,7 +268,7 @@ impl Repository {
                 remaining = true;
             }
         }
-        crate::fs::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
+        chunks::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
         Ok(remaining)
     }
 
@@ -345,7 +346,8 @@ impl Repository {
     }
 
     /// See `save`.
-    pub fn set_save_on_drop(&mut self, _save_on_drop: bool) -> &mut Self {
+    #[inline]
+    pub const fn set_save_on_drop(&mut self, _save_on_drop: bool) -> &mut Self {
         self
     }
 
@@ -358,6 +360,11 @@ impl Repository {
             .join(name))
     }
 
+    /// Opens a repository, falling back to rebuild if the index is corrupt.
+    ///
+    /// Tries `open()` first. If that fails with an I/O error (corrupt or
+    /// missing index), automatically runs `rebuild()`. This is the
+    /// recommended entry point for applications that want resilience.
     pub fn open_or_rebuild(
         directory: &Path,
         chunk_size: usize,
@@ -410,6 +417,19 @@ impl Repository {
         self.chunks_directory.join("index")
     }
 
+    #[inline]
+    pub fn archive_path_parent<'a>(
+        archive: &'a mut Archive,
+        entry: &Path,
+    ) -> Option<&'a mut Box<DirectoryEntry>> {
+        archive
+            .find_archive_entry_mut(entry.parent()?)
+            .and_then(|e| match e {
+                Entry::Directory(dir) => Some(dir),
+                _ => None,
+            })
+    }
+
     /// Shared lock on the chunks, for holding an archive's entries across calls.
     pub fn shared_lock(&self) -> std::io::Result<Lock> {
         Lock::shared(&self.chunks_lock_path())
@@ -423,10 +443,7 @@ impl Repository {
         self.chunks_directory.join("index.lock")
     }
 
-    fn file_cache_path(&self) -> PathBuf {
-        self.directory.join(".ddup-bak/filecache")
-    }
-
+    #[inline]
     pub fn archive_path(&self, name: &str) -> std::io::Result<PathBuf> {
         crate::archive::validate_name(name, 255)?;
         Ok(self
@@ -435,7 +452,10 @@ impl Repository {
             .join(format!("{name}.ddup")))
     }
 
-    /// Archive names without the `.ddup` extension.
+    /// Lists all archives in the repository.
+    /// Returns a vector of archive names without the ".ddup" extension.
+    /// Example: "my_archive" instead of "my_archive.ddup".
+    /// The archives are stored in the ".ddup-bak/archives" directory.
     pub fn list_archives(&self) -> std::io::Result<Vec<String>> {
         let mut archives = Vec::new();
         for entry in std::fs::read_dir(self.directory.join(".ddup-bak/archives"))? {
@@ -447,8 +467,9 @@ impl Repository {
         Ok(archives)
     }
 
-    /// Opens an archive. File entries hold chunk hash lists, use `entry_reader` or
-    /// `restore_archive` to get at file content.
+    /// Gets an archive by name.
+    /// Do not use this method to extract data, the data is chunked and compressed.
+    /// Use `restore_archive` or `entry_reader` instead.
     pub fn get_archive(&self, name: &str) -> std::io::Result<Archive> {
         let archive = Archive::open(self.archive_path(name)?)?;
         if archive.version() != FILE_VERSION {
@@ -511,7 +532,6 @@ impl Repository {
                 .build()
         });
 
-        let cache = FileCache::load(&self.file_cache_path());
         // Written under a name `list_archives` does not show and moved into place once complete
         // and counted, so a backup cut short leaves no archive behind.
         let partial = archive_path.with_file_name(format!(
@@ -519,7 +539,7 @@ impl Repository {
             &chunks::hex(blake3::hash(name.as_bytes()).as_bytes())[..16]
         ));
         let _ = std::fs::remove_file(&partial);
-        let file = crate::fs::create_new_file(&partial)?;
+        let file = create_new_file(&partial)?;
         let handle = file.try_clone()?;
         let archive = match Archive::new(file) {
             Ok(archive) => archive,
@@ -532,22 +552,18 @@ impl Repository {
             .write_entries(
                 archive,
                 &index,
-                &cache,
                 walker,
                 root,
                 progress,
                 compression,
                 threads,
             )
-            .and_then(|(mut archive, seen)| {
-                self.storage.sync()?;
+            .and_then(|mut archive| {
                 index.save(&self.index_path())?;
                 archive.write_end_header()?;
                 handle.sync_all()?;
                 std::fs::rename(&partial, &archive_path)?;
-                crate::fs::sync_dir(archive_path.parent().unwrap())?;
-                // The cache only saves work next time; its failure must not undo the backup.
-                let _ = FileCache::save(&self.file_cache_path(), seen);
+                chunks::sync_dir(archive_path.parent().unwrap())?;
                 Ok(archive)
             });
 
@@ -557,27 +573,24 @@ impl Repository {
         result
     }
 
-    /// Returns the archive and the cache records of every file it contains.
     #[allow(clippy::too_many_arguments)]
     fn write_entries(
         &self,
         archive: Archive,
         index: &ChunkIndex,
-        cache: &FileCache,
         walker: ignore::Walk,
         root: &Path,
         progress: ProgressCallback,
         compression: CompressionFormatCallback,
         threads: usize,
-    ) -> std::io::Result<(Archive, Vec<(PathBuf, CachedFile)>)> {
+    ) -> std::io::Result<Archive> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .map_err(std::io::Error::other)?;
         let job = Job {
-            archive,
+            archive: Mutex::new(archive),
             index,
-            cache,
             storage: &self.storage,
             compression: &compression,
             progress: &progress,
@@ -587,7 +600,6 @@ impl Repository {
             chunks: Inflight::new(pool.current_num_threads() * 2),
             error: Mutex::new(None),
             children: Mutex::new(HashMap::new()),
-            seen: Mutex::new(Vec::new()),
         };
 
         pool.in_place_scope(|scope| {
@@ -641,7 +653,7 @@ impl Repository {
                     let (job, path, relative) = (&job, path.to_path_buf(), relative.to_path_buf());
                     scope.spawn(move |scope| {
                         record(
-                            job.write_file(scope, &path, &relative, name, parent, metadata),
+                            job.write_file(scope, &path, &relative, name, parent),
                             &job.error,
                         );
                         job.files.release();
@@ -653,7 +665,7 @@ impl Repository {
                     Entry::Directory(Box::new(DirectoryEntry {
                         name,
                         mode: metadata.permissions().into(),
-                        owner: owner(&metadata),
+                        owner: metadata_owner(&metadata),
                         mtime: modified(&metadata),
                         entries: Vec::new(),
                     }))
@@ -662,7 +674,7 @@ impl Repository {
                     Entry::Symlink(Box::new(SymlinkEntry {
                         name,
                         mode: metadata.permissions().into(),
-                        owner: owner(&metadata),
+                        owner: metadata_owner(&metadata),
                         mtime: modified(&metadata),
                         target: target
                             .to_str()
@@ -685,9 +697,9 @@ impl Repository {
             return Err(err);
         }
 
-        let mut archive = job.archive;
+        let mut archive = job.archive.into_inner();
         archive.entries = assemble(PathBuf::new(), &mut job.children.into_inner());
-        Ok((archive, job.seen.into_inner()))
+        Ok(archive)
     }
 
     /// Restores an archive into the repository's `.ddup-bak/archives-restored/<name>` directory,
@@ -743,10 +755,10 @@ impl Repository {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
-        crate::fs::create_dir_all(destination)?;
+        std::fs::create_dir_all(destination)?;
         let destination = destination.canonicalize()?;
         let locks = self.directory.join(".ddup-bak/restore-locks");
-        crate::fs::create_dir_all(&locks)?;
+        std::fs::create_dir_all(&locks)?;
         let key = chunks::hex(blake3::hash(destination.as_os_str().as_encoded_bytes()).as_bytes());
         let _turn = Lock::exclusive(&locks.join(format!("destination-{}", &key[..16])))?;
         let mut staging = crate::restore::StagedRestore::new(&destination)?;
@@ -776,7 +788,7 @@ impl Repository {
         threads: usize,
     ) -> std::io::Result<()> {
         let _lock = Lock::shared(&self.chunks_lock_path())?;
-        crate::fs::create_dir_all(destination)?;
+        std::fs::create_dir_all(destination)?;
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -916,7 +928,7 @@ impl Repository {
         if live {
             let mut hashes = Vec::new();
             collect_hashes(self.get_archive(name)?.into_entries(), &mut hashes)?;
-            crate::fs::create_dir_all(marker.parent().unwrap())?;
+            std::fs::create_dir_all(marker.parent().unwrap())?;
             let marker = self.free_marker(name, marker);
             std::fs::rename(&archive_path, &marker)?;
             self.sync_archive_dirs()?;
@@ -1004,10 +1016,10 @@ impl Repository {
 
     /// Makes moves between `archives` and `deleting` durable before chunks or the index change.
     fn sync_archive_dirs(&self) -> std::io::Result<()> {
-        crate::fs::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
+        chunks::sync_dir(&self.directory.join(".ddup-bak/archives"))?;
         let deleting = self.directory.join(".ddup-bak/deleting");
         if deleting.is_dir() {
-            crate::fs::sync_dir(&deleting)?;
+            chunks::sync_dir(&deleting)?;
         }
         Ok(())
     }
@@ -1154,7 +1166,7 @@ fn restore_entry(
 
     match entry {
         Entry::File(mut file_entry) => {
-            let mut file = crate::fs::create_new_file(&path)?;
+            let mut file = File::create_new(&path)?;
             let hashes = chunks::entry_hashes(&mut file_entry)?;
             if hashes.len() > 1 {
                 file.set_len(file_entry.size_real)?;
@@ -1185,7 +1197,7 @@ fn restore_entry(
             // chown can clear setuid/setgid, so permissions must be applied last.
             chown(&path, file_entry.owner)?;
             file.set_times(FileTimes::new().set_modified(file_entry.mtime))?;
-            file_entry.mode.apply(&path)
+            std::fs::set_permissions(&path, file_entry.mode.into())
         }
         Entry::Directory(dir_entry) => {
             let DirectoryEntry {
@@ -1195,7 +1207,7 @@ fn restore_entry(
                 owner,
                 ..
             } = *dir_entry;
-            crate::fs::create_dir(&path)?;
+            std::fs::create_dir(&path)?;
 
             rayon::scope(|scope| {
                 for child in entries {
@@ -1216,7 +1228,7 @@ fn restore_entry(
             let directory = File::open(&path)?;
             chown(&path, owner)?;
             directory.set_times(FileTimes::new().set_modified(mtime))?;
-            mode.apply(&path)
+            std::fs::set_permissions(&path, mode.into())
         }
         Entry::Symlink(link_entry) => {
             symlink(&link_entry, &path)?;
@@ -1248,7 +1260,7 @@ fn process_is_running(_pid: u32) -> bool {
 /// Copies a format 1 entry tree into `archive`, replacing chunk id lists with hash lists.
 fn migrate_v1_entries(
     entries: Vec<Entry>,
-    archive: &Archive,
+    archive: &mut Archive,
     ids: &HashMap<u64, ChunkHash>,
 ) -> std::io::Result<Vec<Entry>> {
     entries
@@ -1257,13 +1269,14 @@ fn migrate_v1_entries(
             Ok(match entry {
                 Entry::File(mut file) => {
                     let hashes = chunks::entry_hashes_v1(&mut file, ids)?;
-                    Entry::File(archive.write_raw_file_entry(
+                    Entry::File(archive.write_file_entry(
                         hashes.as_flattened(),
                         Some(file.size_real),
                         file.name,
                         file.mode,
                         file.mtime,
                         file.owner,
+                        CompressionFormat::None,
                     )?)
                 }
                 Entry::Directory(mut dir) => {
@@ -1371,9 +1384,8 @@ fn assemble(dir: PathBuf, children: &mut HashMap<PathBuf, Vec<Entry>>) -> Vec<En
 }
 
 struct Job<'a> {
-    archive: Archive,
+    archive: Mutex<Archive>,
     index: &'a ChunkIndex,
-    cache: &'a FileCache,
     storage: &'a Arc<dyn ChunkStorage>,
     compression: &'a CompressionFormatCallback,
     progress: &'a ProgressCallback,
@@ -1383,7 +1395,6 @@ struct Job<'a> {
     chunks: Inflight,
     error: Mutex<Option<std::io::Error>>,
     children: Mutex<HashMap<PathBuf, Vec<Entry>>>,
-    seen: Mutex<Vec<(PathBuf, CachedFile)>>,
 }
 
 impl Job<'_> {
@@ -1394,8 +1405,6 @@ impl Job<'_> {
         self.children.lock().entry(parent).or_default().push(entry);
     }
 
-    /// `metadata` is the walker's lstat of `path`; it decides whether the cached chunk list can
-    /// be reused without opening the file.
     fn write_file<'scope>(
         &'scope self,
         scope: &rayon::Scope<'scope>,
@@ -1403,59 +1412,31 @@ impl Job<'_> {
         relative: &Path,
         name: String,
         parent: PathBuf,
-        metadata: Metadata,
     ) -> std::io::Result<()> {
         if self.error.lock().is_some() {
             return Ok(());
         }
 
-        let fingerprint = Fingerprint::of(&metadata);
-        // Used only when every chunk is counted and present and the list fits the file; else the
-        // file is read and `store` writes what is missing.
-        let cached = self.cache.get(relative, fingerprint).filter(|hashes| {
-            hashes.is_empty() == (metadata.len() == 0)
-                && hashes.iter().all(|hash| {
-                    self.index.references(hash) > 0 && self.storage.has_chunk(hash).unwrap_or(false)
-                })
-        });
+        let file = open_nofollow(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other(format!(
+                "{} changed while being read",
+                path.display()
+            )));
+        }
+        let (hashes, size) = self.chunk_file(scope, file, &metadata, relative)?;
 
-        let (hashes, size, metadata) = match cached {
-            Some(hashes) => {
-                for hash in hashes {
-                    self.index.reference(hash);
-                }
-                (hashes.to_vec(), metadata.len(), metadata)
-            }
-            None => {
-                let file = open_nofollow(path)?;
-                let metadata = file.metadata()?;
-                if !metadata.is_file() {
-                    return Err(std::io::Error::other(format!(
-                        "{} changed while being read",
-                        path.display()
-                    )));
-                }
-                let (hashes, size) = self.chunk_file(scope, file, &metadata, relative)?;
-                (hashes, size, metadata)
-            }
-        };
-
-        let entry = self.archive.write_raw_file_entry(
+        let entry = self.archive.lock().write_file_entry(
             hashes.as_flattened(),
             Some(size),
             name,
             metadata.permissions().into(),
             modified(&metadata),
-            owner(&metadata),
+            metadata_owner(&metadata),
+            CompressionFormat::None,
         )?;
         self.add(path, parent, Entry::File(entry));
-        self.seen.lock().push((
-            relative.to_path_buf(),
-            CachedFile {
-                fingerprint: Fingerprint::of(&metadata),
-                hashes,
-            },
-        ));
         Ok(())
     }
 
@@ -1567,6 +1548,15 @@ impl Inflight {
     }
 }
 
+/// Read-write, so an archive just written can be read back through the same handle.
+fn create_new_file(path: &Path) -> std::io::Result<File> {
+    File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 fn open_nofollow(path: &Path) -> std::io::Result<File> {
     let mut options = File::options();
     options.read(true);
@@ -1577,16 +1567,6 @@ fn open_nofollow(path: &Path) -> std::io::Result<File> {
 
 fn modified(metadata: &Metadata) -> SystemTime {
     metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
-fn owner(_metadata: &Metadata) -> (u32, u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (_metadata.uid(), _metadata.gid())
-    }
-    #[cfg(not(unix))]
-    (0, 0)
 }
 
 /// Restores ownership when the process is allowed to; unprivileged restores keep the restoring

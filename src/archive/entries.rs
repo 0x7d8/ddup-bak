@@ -262,7 +262,7 @@ impl Read for FileEntry {
         }
 
         self.consumed += bytes_read as u64;
-        // A declared size shorter than the data would hide the rest, and the chunks it names.
+        // Data past the declared size would hide chunks from reference counting.
         if self.consumed == self.size
             && self.compression != CompressionFormat::None
             && self.decoder()?.read(&mut [0])? != 0

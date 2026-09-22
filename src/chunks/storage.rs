@@ -32,7 +32,7 @@ pub trait ChunkStorage: Send + Sync {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(err),
         };
-        // A directory opens but does not read; a chunk has at least its format byte.
+        // A directory opens but can't be read; a chunk has at least its format byte.
         match content.read_exact(&mut [0u8; 1]) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
@@ -40,7 +40,7 @@ pub trait ChunkStorage: Send + Sync {
         }
     }
 
-    /// Removes leftovers of interrupted writes. Called by `clean` while nothing writes chunks.
+    /// Removes leftovers of interrupted writes. `clean` calls it while nothing writes chunks.
     fn remove_leftovers(&self) -> std::io::Result<()> {
         Ok(())
     }
@@ -72,7 +72,7 @@ impl ChunkStorage for ChunkStorageLocal {
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
         let mut file = match File::create_new(&tmp_path) {
-            // A file here was left by a dead process with the same pid.
+            // Left by a dead process with the same pid.
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::fs::remove_file(&tmp_path)?;
                 File::create_new(&tmp_path)?
@@ -111,7 +111,7 @@ impl ChunkStorage for ChunkStorageLocal {
     }
 
     fn remove_leftovers(&self) -> std::io::Result<()> {
-        // Only this storage's own names, in its own hex-named directories, never through symlinks.
+        // Only our own names in hex-named shard directories, never through symlinks.
         let is_shard = |entry: &std::fs::DirEntry| -> std::io::Result<bool> {
             Ok(entry.file_type()?.is_dir()
                 && entry.file_name().to_str().is_some_and(|name| {
@@ -191,13 +191,13 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
     Some(hash)
 }
 
-/// A regular file with at least the format byte; an empty one, as a crash leaves, is written over.
+/// A regular file with at least the format byte. Empty ones, left by a crash, get rewritten.
 fn is_chunk_file(path: &std::path::Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }
 
-/// `<rest of the hex hash>.<pid>.<counter>.tmp`, as `write_chunk_content` names its work.
+/// Matches `write_chunk_content` temp names: `<hex>.<pid>.<counter>.tmp`.
 fn is_chunk_temporary(name: &str) -> bool {
     let parts: Vec<&str> = name.split('.').collect();
     parts.len() == 4

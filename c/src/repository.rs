@@ -35,7 +35,6 @@ impl From<CHashAlgorithm> for HashAlgorithm {
     }
 }
 
-/// Opaque repository handle.
 #[repr(C)]
 pub struct CRepository {
     _private: [u8; 0],
@@ -211,7 +210,7 @@ pub unsafe extern "C" fn repository_clean(
     status(repo.clean(deletion_callback(progress_callback, UserData(user_data))))
 }
 
-/// Backs up `directory` (or the repository directory when null) into a new archive.
+/// Backs up `directory` into a new archive. A null `directory` backs up the repository directory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_create_archive(
     repo: *mut CRepository,
@@ -320,8 +319,8 @@ pub unsafe extern "C" fn repository_get_archive(
     }
 }
 
-/// Restores an archive into the repository's `archives-restored` directory and returns that
-/// path, free with `free_string`. Null on error.
+/// Restores an archive into `.ddup-bak/archives-restored/<name>`, replacing a previous restore,
+/// and returns that path. Free it with `free_string`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_restore_archive(
     repo: *mut CRepository,

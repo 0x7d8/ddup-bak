@@ -14,7 +14,7 @@ import (
 
 var errArchiveClosed = errors.New("ddupbak: archive is closed")
 
-// Archive is a ddupbak archive, standalone or inside a repository.
+// Archive represents a ddupbak archive
 type Archive struct {
 	archive *C.struct_CArchive
 
@@ -33,7 +33,7 @@ func wrapArchive(archive *C.struct_CArchive, fallback string) (*Archive, error) 
 	return result, nil
 }
 
-// NewArchive creates a standalone archive file (not part of a repository).
+// NewArchive creates a new empty archive
 func NewArchive(path string) (*Archive, error) {
 	if path == "" {
 		return nil, errors.New("ddupbak: path cannot be empty")
@@ -45,7 +45,7 @@ func NewArchive(path string) (*Archive, error) {
 	return wrapArchive(C.new_archive(cPath), "ddupbak: failed to create archive")
 }
 
-// OpenArchive opens a standalone archive file.
+// OpenArchive opens an existing archive
 func OpenArchive(path string) (*Archive, error) {
 	if path == "" {
 		return nil, errors.New("ddupbak: path cannot be empty")
@@ -57,7 +57,7 @@ func OpenArchive(path string) (*Archive, error) {
 	return wrapArchive(C.open_archive(cPath), "ddupbak: failed to open archive")
 }
 
-// Free releases the archive and every entry returned by Entries.
+// Free releases resources associated with the archive
 func (a *Archive) Free() {
 	if a.archive == nil {
 		return
@@ -76,10 +76,10 @@ func (a *Archive) Free() {
 	a.releases = nil
 }
 
-// Close is Free.
+// Close calls Free.
 func (a *Archive) Close() { a.Free() }
 
-// AddDirectory appends the contents of a directory to a standalone archive.
+// AddDirectory adds the contents of path to the archive.
 func (a *Archive) AddDirectory(path string, progress ProgressCallback) error {
 	if a.archive == nil {
 		return errArchiveClosed
@@ -97,7 +97,7 @@ func (a *Archive) AddDirectory(path string, progress ProgressCallback) error {
 	return nil
 }
 
-// SetCompressionCallback decides the compression of files added with AddDirectory.
+// SetCompressionCallback sets a callback to determine compression format for files
 func (a *Archive) SetCompressionCallback(callback CompressionCallback) error {
 	if a.archive == nil {
 		return errArchiveClosed
@@ -112,7 +112,7 @@ func (a *Archive) SetCompressionCallback(callback CompressionCallback) error {
 	return nil
 }
 
-// SetRealSizeCallback overrides the recorded uncompressed size of files added with AddDirectory.
+// SetRealSizeCallback sets a callback to determine the real size of files
 func (a *Archive) SetRealSizeCallback(callback RealSizeCallback) error {
 	if a.archive == nil {
 		return errArchiveClosed
@@ -127,7 +127,7 @@ func (a *Archive) SetRealSizeCallback(callback RealSizeCallback) error {
 	return nil
 }
 
-// EntriesCount returns the number of top-level entries.
+// EntriesCount returns the number of entries in the archive
 func (a *Archive) EntriesCount() (uint, error) {
 	if a.archive == nil {
 		return 0, errArchiveClosed
@@ -135,7 +135,7 @@ func (a *Archive) EntriesCount() (uint, error) {
 	return uint(C.archive_entries_count(a.archive)), nil
 }
 
-// Entries returns the top-level entries. They stay valid until the archive is freed.
+// Entries returns all entries in the archive
 func (a *Archive) Entries() ([]*Entry, error) {
 	if a.archive == nil {
 		return nil, errArchiveClosed
@@ -156,7 +156,7 @@ func (a *Archive) Entries() ([]*Entry, error) {
 	return entries, nil
 }
 
-// FindEntry looks up an entry by its path inside the archive. Free it when done.
+// FindEntry finds an entry by path
 func (a *Archive) FindEntry(path string) (*Entry, error) {
 	if a.archive == nil {
 		return nil, errArchiveClosed

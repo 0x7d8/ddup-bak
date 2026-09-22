@@ -17,7 +17,7 @@ fn reserved(name: &OsStr) -> bool {
 
 pub(crate) struct StagedRestore {
     root: PathBuf,
-    // Once original entries start moving, even a panic must leave them recoverable.
+    // Set once originals start moving, so even a panic leaves them recoverable.
     retain: bool,
 }
 
@@ -29,7 +29,7 @@ impl StagedRestore {
             let root = destination.join(format!("{PREFIX}{}-{id}", std::process::id()));
             match std::fs::create_dir(&root) {
                 Ok(()) => break root,
-                // Never reuse or remove a directory just because its name looks like ours.
+                // Never reuse a directory just because its name looks like ours.
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err),
             }
@@ -60,7 +60,7 @@ impl StagedRestore {
         destination: &Path,
         mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        // Finish enumeration and validation before modifying a single destination entry.
+        // Validate everything before touching the destination.
         let old = names(destination)?
             .into_iter()
             .filter(|name| !reserved(name))
@@ -120,7 +120,7 @@ impl StagedRestore {
                 }
             }
             if let Some(rollback) = rollback_error {
-                // Do not let Drop destroy the only remaining copies of original data.
+                // Keep Drop from deleting the only copy of the originals.
                 return Err(io::Error::new(
                     original.kind(),
                     format!(
@@ -135,8 +135,8 @@ impl StagedRestore {
             return Err(original);
         }
 
-        // Only now may cleanup remove the originals. A cleanup error cannot turn an already
-        // committed replacement into a reported restore failure; Drop reports any leftovers.
+        // Originals may go now. A cleanup error doesn't fail a committed restore; Drop reports
+        // leftovers.
         self.retain = false;
         Ok(())
     }
@@ -155,7 +155,7 @@ fn move_entry(
     to: &Path,
     rename: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    // In particular, never overwrite an entry if a rollback finds an unexpected occupant.
+    // Never overwrite, even when a rollback finds something unexpected.
     match to.symlink_metadata() {
         Ok(_) => {
             return Err(io::Error::new(
@@ -214,8 +214,7 @@ mod tests {
 
     #[test]
     fn every_forward_rename_failure_rolls_back_original_contents() {
-        // Fail both old-entry moves and both publication moves, including after a new
-        // entry has already become visible. Rollback uses the actual filesystem.
+        // Fail each of the four moves in turn, including after a new entry is visible.
         for fail_at in 0..4 {
             let destination = destination();
             let mut staging = staged(destination.path());
@@ -257,7 +256,7 @@ mod tests {
         drop(staging);
         assert_eq!(fs::read(old.join("a")).unwrap(), b"original a");
         assert_eq!(fs::read(old.join("b/file")).unwrap(), b"original b");
-        // A later successful restore also leaves the recovery directory intact.
+        // A later successful restore keeps the recovery directory too.
         let mut next = staged(destination.path());
         next.publish(destination.path()).unwrap();
         drop(next);

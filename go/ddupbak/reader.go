@@ -12,13 +12,13 @@ import (
 	"unsafe"
 )
 
-// EntryReader streams the content of a repository file entry. It holds a shared repository lock
-// until closed, so close it promptly.
+// EntryReader provides an io.Reader interface for reading file entry content from a repository.
+// Until closed it holds a shared repository lock, so Clean and DeleteArchive in this process fail.
 type EntryReader struct {
 	reader *C.struct_CEntryReader
 }
 
-// NewEntryReader creates a reader for a file entry of one of the repository's archives.
+// NewEntryReader creates a new reader for the specified file entry
 func (r *Repository) NewEntryReader(entry *Entry) (*EntryReader, error) {
 	if r.repo == nil {
 		return nil, errClosed
@@ -45,7 +45,7 @@ func (r *Repository) NewEntryReader(entry *Entry) (*EntryReader, error) {
 	return result, nil
 }
 
-// Read implements io.Reader.
+// Read implements the io.Reader interface for reading from the entry
 func (er *EntryReader) Read(p []byte) (int, error) {
 	if er.reader == nil {
 		return 0, errors.New("ddupbak: reader is closed")
@@ -64,7 +64,7 @@ func (er *EntryReader) Read(p []byte) (int, error) {
 	return int(n), nil
 }
 
-// ReadAll reads the rest of the entry.
+// ReadAll reads the entire file entry content into a byte slice
 func (er *EntryReader) ReadAll() ([]byte, error) {
 	if er.reader == nil {
 		return nil, errors.New("ddupbak: reader is closed")
@@ -72,7 +72,7 @@ func (er *EntryReader) ReadAll() ([]byte, error) {
 	return io.ReadAll(er)
 }
 
-// Close releases the reader and its repository lock.
+// Close releases resources associated with the reader
 func (er *EntryReader) Close() error {
 	if er.reader != nil {
 		C.free_entry_reader(er.reader)

@@ -25,13 +25,12 @@ const FOOTER_LEN: u64 = 16;
 /// Entry header word: 2 bits type, 4 bits compression, 26 bits mode.
 const MODE_MASK: u32 = (1 << 26) - 1;
 pub(crate) const ZSTD_LEVEL: i32 = 3;
-/// Brotli quality/window used by every version so far.
+/// Brotli (buffer, quality, window) used by every version so far.
 #[cfg(feature = "brotli")]
 const BROTLI_PARAMS: (usize, u32, u32) = (4096, 11, 22);
 
-/// Format ids are part of the on-disk format: archive entries and chunk files store them.
-/// Brotli is a Cargo feature; data using it fails to read with `ErrorKind::Unsupported` when
-/// the feature is off.
+/// Ids are stored on disk in archive entries and chunk files. Reading Brotli data without the
+/// `brotli` feature fails with `ErrorKind::Unsupported`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompressionFormat {
@@ -174,10 +173,8 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
-/// Rejects names that could escape their directory when restored. A backslash only separates
-/// path components on Windows; on Unix it is an ordinary filename byte that real trees use
-/// (systemd escapes device names with it), so rejecting it there would refuse to back up or
-/// migrate perfectly valid directories.
+/// Rejects names that could escape their directory on restore. Backslash is only a separator on
+/// Windows; on Unix it is a normal filename byte (systemd uses it).
 pub(crate) fn validate_name(name: &str, max_len: usize) -> std::io::Result<()> {
     let separator = |b: u8| b == b'/' || b == 0 || (cfg!(windows) && b == b'\\');
     if name.is_empty() || name == "." || name == ".." || name.bytes().any(separator) {
@@ -337,7 +334,7 @@ impl Archive {
         for _ in 0..entries_count {
             entries.push(Self::decode_entry(&mut decoder, &file, &limits, 0)?);
         }
-        // Entries the footer leaves out would go uncounted and have their chunks cleaned away.
+        // Entries beyond the footer's count would be ignored and their chunks cleaned away.
         if decoder.read(&mut [0])? != 0 {
             return Err(invalid(
                 "entry table holds more entries than the footer counts",

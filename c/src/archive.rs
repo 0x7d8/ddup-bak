@@ -7,7 +7,6 @@ use crate::{
 use ddup_bak::archive::{Archive, CompressionFormat};
 use std::{ffi::*, path::Path, sync::Arc};
 
-/// Opaque archive handle.
 #[repr(C)]
 pub struct CArchive {
     _private: [u8; 0],
@@ -170,7 +169,7 @@ pub unsafe extern "C" fn archive_entries_count(archive: *mut CArchive) -> c_uint
     unsafe { self::archive(archive) }.map_or(0, |archive| archive.entries().len() as c_uint)
 }
 
-/// Top-level entries of the archive, free with `free_entry_array`.
+/// Top-level entries, `archive_entries_count` long. Free with `free_entry_array`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn archive_entries(archive: *mut CArchive) -> *mut *mut CEntry {
     let Some(archive) = (unsafe { self::archive(archive) }) else {
@@ -181,7 +180,7 @@ pub unsafe extern "C" fn archive_entries(archive: *mut CArchive) -> *mut *mut CE
     Box::into_raw(entries.into_boxed_slice()) as *mut *mut CEntry
 }
 
-/// Looks up an entry by path inside the archive, free with `free_entry`.
+/// Free the returned entry with `free_entry`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn archive_find_entry(
     archive: *mut CArchive,

@@ -37,8 +37,8 @@ impl Lock {
         })
     }
 
-    /// Polls rather than blocking in the OS, so a reader opened in this process while another
-    /// holder is waited for turns the wait into the `WouldBlock` error instead of a hang.
+    /// Polls instead of blocking, so a reader opened in this process meanwhile makes it fail
+    /// with `WouldBlock` instead of hanging.
     pub fn exclusive(path: &Path) -> std::io::Result<Self> {
         let handle = open(path)?;
         loop {

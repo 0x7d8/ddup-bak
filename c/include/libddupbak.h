@@ -28,9 +28,6 @@ typedef enum CHashAlgorithm {
   Blake3 = 1,
 } CHashAlgorithm;
 
-/**
- * Opaque archive handle.
- */
 typedef struct CArchive {
   uint8_t _private[0];
 } CArchive;
@@ -89,16 +86,13 @@ typedef struct CSymlinkEntry {
 } CSymlinkEntry;
 
 /**
- * Opaque streaming reader over a repository file entry. Holds a shared repository lock until
- * freed: `repository_clean` and `repository_delete_archive` fail while one is open.
+ * Holds a shared repository lock until freed. While one is open, `repository_clean` and
+ * `repository_delete_archive` fail in this process and wait in others.
  */
 typedef struct CEntryReader {
   uint8_t _private[0];
 } CEntryReader;
 
-/**
- * Opaque repository handle.
- */
 typedef struct CRepository {
   uint8_t _private[0];
 } CRepository;
@@ -148,12 +142,12 @@ void archive_set_real_size_callback(struct CArchive *archive,
 unsigned int archive_entries_count(struct CArchive *archive);
 
 /**
- * Top-level entries of the archive, free with `free_entry_array`.
+ * Top-level entries, `archive_entries_count` long. Free with `free_entry_array`.
  */
 struct CEntry **archive_entries(struct CArchive *archive);
 
 /**
- * Looks up an entry by path inside the archive, free with `free_entry`.
+ * Free the returned entry with `free_entry`.
  */
 struct CEntry *archive_find_entry(struct CArchive *archive, const char *path);
 
@@ -224,7 +218,7 @@ int repository_clean(struct CRepository *repo,
                      CUserData user_data);
 
 /**
- * Backs up `directory` (or the repository directory when null) into a new archive.
+ * Backs up `directory` into a new archive. A null `directory` backs up the repository directory.
  */
 struct CArchive *repository_create_archive(struct CRepository *repo,
                                            const char *name,
@@ -242,8 +236,8 @@ char **repository_list_archives(struct CRepository *repo, unsigned int *count);
 struct CArchive *repository_get_archive(struct CRepository *repo, const char *archive_name);
 
 /**
- * Restores an archive into the repository's `archives-restored` directory and returns that
- * path, free with `free_string`. Null on error.
+ * Restores an archive into `.ddup-bak/archives-restored/<name>`, replacing a previous restore,
+ * and returns that path. Free it with `free_string`.
  */
 char *repository_restore_archive(struct CRepository *repo,
                                  const char *archive_name,

@@ -20,28 +20,24 @@ pub mod storage;
 
 pub type ChunkHash = [u8; 32];
 
-/// Largest chunk `cdc_parameters` can produce, and therefore the most memory a single
-/// verified chunk read will use.
+/// Largest chunk `cdc_parameters` can produce, which bounds a chunk read's memory.
 pub(crate) const MAX_CHUNK_SIZE: usize = 4 * fastcdc::v2020::AVERAGE_MAX;
-/// Read limit for stored chunks. Older versions cut fixed-size chunks of any configured size.
+/// Read limit for stored chunks; older versions allowed any configured chunk size.
 const MAX_STORED_CHUNK_SIZE: usize = 1 << 30;
-/// The most references a chunk is accepted with when the index is loaded.
+/// Highest reference count `load` accepts.
 const MAX_REFERENCES: u64 = 1 << 62;
 
 /// Chunk file: a format byte followed by the data.
 const CHUNK_HEADER_LEN: u64 = 1;
 
-/// Index format 3: raw, header carries the hash algorithm. Format 2 was Deflate-compressed
-/// and always BLAKE3. Format 1 (before `DDUPIDX` magics) was Deflate-compressed, BLAKE2b and
-/// keyed by chunk id; see `ChunkIndex::load_v1`.
-/// Format 4 is format 3 plus the BLAKE3 hash of everything before it, checked on load.
+/// Index formats: 1 is Deflate, BLAKE2b and keyed by chunk id (see `load_v1`). 2 is Deflate and
+/// BLAKE3. 3 is raw with the hash algorithm in the header. 4 is 3 plus a trailing BLAKE3 checksum.
 const INDEX_MAGIC_V4: &[u8; 8] = b"DDUPIDX4";
 const INDEX_MAGIC_V3: &[u8; 8] = b"DDUPIDX3";
 const INDEX_MAGIC_V2: &[u8; 8] = b"DDUPIDX2";
 
-/// Function identifying chunks by content. Fixed for the lifetime of a chunk store since chunk
-/// files are named by their hash; recorded in the index header. BLAKE2b is the default so
-/// repositories created by any version look the same; BLAKE3 is faster and opt-in.
+/// Hash that names chunk files, fixed per chunk store and recorded in the index header.
+/// BLAKE2b is the default for compatibility; BLAKE3 is faster and opt-in.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HashAlgorithm {
@@ -97,8 +93,7 @@ pub struct IndexHeader {
     pub hash_algorithm: HashAlgorithm,
 }
 
-/// Reference counts of every chunk in a repository. A cache: `rebuild` recreates it from the
-/// archives and chunk storage.
+/// Reference counts of every chunk. `rebuild` can always recreate it from the archives.
 pub struct ChunkIndex {
     pub chunk_size: usize,
     pub max_chunk_count: usize,
@@ -116,8 +111,7 @@ impl ChunkIndex {
         }
     }
 
-    /// Loads an index in the current or the BLAKE3-only format. A format 1 index is an error;
-    /// the repository migrates it first (`load_v1`).
+    /// Loads a format 2 to 4 index. Format 1 is an error; the repository migrates it first.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let (header, mut reader, count) = Self::open(path)?;
         if header.version == 1 {
@@ -126,8 +120,8 @@ impl ChunkIndex {
                 "index uses format 1; the repository has not been migrated",
             ));
         }
-        // Format 4 ends in its checksum, so the whole file is read here to check it; `open`
-        // itself streams, since reading the header must stay cheap.
+        // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
+        // reads cheap.
         if header.version == 4 {
             let mut bytes = std::fs::read(path)?;
             let Some(body) = bytes.len().checked_sub(32) else {
@@ -151,7 +145,7 @@ impl ChunkIndex {
         for _ in 0..count {
             reader.read_exact(&mut hash)?;
             let references = varint::decode(&mut reader)?;
-            // No repository has this many archives; one more reference would wrap the count.
+            // Rejected so incrementing can't overflow.
             if references > MAX_REFERENCES {
                 return Err(invalid(format!(
                     "chunk {} has an impossible reference count",
@@ -167,8 +161,7 @@ impl ChunkIndex {
         Ok(index)
     }
 
-    /// Loads a format 1 index: reference counts plus the chunk id map that archives of that
-    /// era reference chunks by.
+    /// Loads a format 1 index and the chunk id map its archives reference.
     pub fn load_v1(path: &Path) -> std::io::Result<(Self, HashMap<u64, ChunkHash>)> {
         let (header, mut reader, count) = Self::open(path)?;
         if header.version != 1 {
@@ -192,7 +185,7 @@ impl ChunkIndex {
             index.chunks.insert(hash, references);
             ids.insert(id, hash);
         }
-        // The stream can end cleanly short of the records the header promises.
+        // The stream can end cleanly before the promised record count.
         if (ids.len() as u64) < count {
             return Err(invalid(format!(
                 "format 1 index holds {} of the {count} chunks it was written with",
@@ -203,13 +196,8 @@ impl ChunkIndex {
         Ok((index, ids))
     }
 
-    /// `load_v1` for a damaged index, keeping every record that decodes and stopping at the
-    /// first one that does not. The records are a Deflate stream, so a truncated or corrupt
-    /// index still yields everything written before the damage, and an archive whose chunk ids
-    /// are all in that part migrates normally. Records are in hash order rather than id order,
-    /// so what survives is an arbitrary subset of the ids: small archives come back far more
-    /// often than large ones. Only for `rebuild`, since taking a partial map is a decision to
-    /// give up on whatever it does not cover, and that is the caller's to make.
+    /// `load_v1` for a damaged index: keeps every record up to the first broken one. Archives whose
+    /// ids all survive migrate normally. Only `rebuild` uses this, since it gives up on the rest.
     pub fn salvage_v1(path: &Path) -> std::io::Result<(Self, HashMap<u64, ChunkHash>)> {
         let (header, mut reader, count) = Self::open(path)?;
         if header.version != 1 {
@@ -223,7 +211,7 @@ impl ChunkIndex {
         );
         let mut ids = HashMap::with_capacity(count.min(1 << 20) as usize);
         let mut hash = [0; 32];
-        // Damage ends the records; any other error is passed on, since a retry may read them.
+        // Damage ends the records; other errors are returned, since a retry may succeed.
         let damaged = |result: std::io::Result<()>| match result {
             Ok(()) => Ok(false),
             Err(err) if is_damage(&err) => Ok(true),
@@ -258,8 +246,8 @@ impl ChunkIndex {
         Ok(Self::open(path)?.0)
     }
 
-    /// Identifies the index format, returning its header and a reader positioned at the first
-    /// chunk record, plus the record count (unknown for format 1, which is read to EOF).
+    /// Detects the index format. Returns the header, a reader at the first record, and the record
+    /// count (unknown for format 1, which is read to EOF).
     fn open(path: &Path) -> std::io::Result<(IndexHeader, Box<dyn Read>, u64)> {
         let mut file = BufReader::new(File::open(path)?);
         let mut magic = [0; 8];
@@ -288,8 +276,8 @@ impl ChunkIndex {
             return Ok((header_out, Box::new(decoder), count));
         }
 
-        // Format 1: deleted-id count, chunk size, max chunk count, chunk count, next id, then
-        // the deleted ids as varints, then (hash, id, references) records to EOF.
+        // Format 1: deleted-id count, chunk size, max chunk count, chunk count, next id, deleted ids
+        // as varints, then (hash, id, references) records to EOF.
         decoder.read_exact(&mut header[8..])?;
         let deleted = u64::from_le_bytes(header[..8].try_into().unwrap());
         let header_out = IndexHeader {
@@ -305,7 +293,7 @@ impl ChunkIndex {
         Ok((header_out, Box::new(decoder), count))
     }
 
-    /// The 17 bytes after the magic of formats 3 and 4.
+    /// Parses the 17 header bytes after the magic in formats 3 and 4.
     fn parse_header(header: &[u8], version: u8) -> std::io::Result<(IndexHeader, u64)> {
         let header_out = IndexHeader {
             version,
@@ -341,9 +329,8 @@ impl ChunkIndex {
         sync_dir(path.parent().unwrap_or(Path::new(".")))
     }
 
-    /// Recomputes reference counts from `archives`, one archive in memory at a time; chunks in
-    /// storage that no archive references are kept with a count of zero so `clean` can delete
-    /// them. `progress` receives every reference as it is counted.
+    /// Recounts references from `archives`, one archive in memory at a time. Unreferenced chunks in
+    /// storage get a count of zero so `clean` deletes them.
     pub fn rebuild(
         chunk_size: usize,
         max_chunk_count: usize,
@@ -404,10 +391,9 @@ impl ChunkIndex {
             .map(|entry| (*entry.key(), *entry.value()))
     }
 
-    /// Increments the reference count and returns the new count (1 means the chunk is new).
+    /// Increments the reference count and returns it; 1 means the chunk is new.
     pub fn reference(&self, hash: &ChunkHash) -> u64 {
         let mut count = self.chunks.entry(*hash).or_insert(0);
-        // Held to what `load` accepts.
         *count = count.saturating_add(1).min(MAX_REFERENCES);
         *count
     }
@@ -437,12 +423,11 @@ impl ChunkIndex {
     }
 }
 
-/// Works out which algorithm named the chunks in `storage` by hashing one of them. Empty
-/// storage tells nothing.
+/// Detects the hash algorithm by hashing a stored chunk. `None` when storage is empty.
 pub(crate) fn detect_hash_algorithm(
     storage: &dyn ChunkStorage,
 ) -> std::io::Result<Option<HashAlgorithm>> {
-    // A damaged chunk tells nothing; the damage is the answer only when no chunk is whole.
+    // Damage is only returned if no chunk is intact.
     let mut damage = None;
     for hash in storage.list_chunk_hashes()? {
         let data = match read_chunk_unverified(storage, &hash) {
@@ -469,7 +454,7 @@ pub(crate) fn detect_hash_algorithm(
     damage.map_or(Ok(None), Err)
 }
 
-/// Hashes what passes through it on the way to `inner`.
+/// Hashes everything written through to `inner`.
 struct Hashing<W> {
     inner: W,
     hasher: blake3::Hasher,
@@ -487,8 +472,8 @@ impl<W: Write> Write for Hashing<W> {
     }
 }
 
-/// Whether an error means the data is broken rather than the environment (permissions, a
-/// vanished mount). Deflate reports a corrupt stream as invalid input.
+/// Whether an error means corrupt data rather than an environment problem. Deflate reports
+/// corrupt streams as `InvalidInput`.
 pub(crate) fn is_damage(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -498,8 +483,7 @@ pub(crate) fn is_damage(err: &std::io::Error) -> bool {
     )
 }
 
-/// Makes renames into a directory durable. Does nothing off Unix, where a directory cannot be
-/// opened as a file.
+/// Makes renames into a directory durable. No-op off Unix.
 pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
@@ -518,8 +502,8 @@ pub fn hex(hash: &ChunkHash) -> String {
     hex
 }
 
-/// FastCDC (min, average, max) sizes for a file of `len` bytes. The average doubles until the
-/// expected chunk count fits `max_chunk_count` (0 disables the cap).
+/// FastCDC (min, avg, max) sizes for a file of `len` bytes. The average doubles until the
+/// chunk count fits `max_chunk_count`; 0 means no cap.
 pub(crate) fn cdc_parameters(
     chunk_size: usize,
     max_chunk_count: usize,
@@ -544,10 +528,10 @@ pub(crate) fn cdc_parameters(
     )
 }
 
-/// Chunk hashes referenced by a repository file entry (archive format 2 and later).
+/// Chunk hashes of a repository file entry, archive format 2 and later.
 pub fn entry_hashes(entry: &mut FileEntry) -> std::io::Result<Vec<ChunkHash>> {
     let body = entry_body(entry)?;
-    // Content without chunks would count for nothing and come back empty.
+    // A non-empty file with no chunks would restore as empty.
     if body.len() % 32 != 0 || body.is_empty() != (entry.size_real == 0) {
         return Err(invalid(format!(
             "entry {} has a malformed chunk list",
@@ -558,8 +542,7 @@ pub fn entry_hashes(entry: &mut FileEntry) -> std::io::Result<Vec<ChunkHash>> {
     Ok(body.as_chunks::<32>().0.to_vec())
 }
 
-/// Chunk hashes of a format 1 repository file entry, which lists chunk ids as varints and
-/// relies on the index of its era to resolve them.
+/// Chunk hashes of a format 1 entry, which lists chunk ids resolved through `ids`.
 pub(crate) fn entry_hashes_v1(
     entry: &mut FileEntry,
     ids: &HashMap<u64, ChunkHash>,
@@ -580,9 +563,9 @@ pub(crate) fn entry_hashes_v1(
 }
 
 fn entry_body(entry: &mut FileEntry) -> std::io::Result<Vec<u8>> {
-    // A damaged entry may declare any size; the read below ends short for it.
+    // Capped, since a damaged entry may declare any size.
     let mut body = Vec::with_capacity(usize::try_from(entry.size).unwrap_or(0).min(1 << 20));
-    // Decoder errors are damage; an unsupported compression or the environment keep their kinds.
+    // Decoder errors are damage; unsupported compression and I/O errors keep their kinds.
     entry.read_to_end(&mut body).map_err(|err| {
         if err.kind() == std::io::ErrorKind::Other {
             invalid(format!("hash list of {} is corrupted: {err}", entry.name))
@@ -607,9 +590,8 @@ pub(crate) fn write_chunk(
     storage.write_chunk_content(hash, &encode_chunk(data, compression)?)
 }
 
-/// Chunk file body: a format byte followed by the data. Chunks that do not shrink are stored raw
-/// so reads never decompress for nothing. Zstd reuses a per-thread context and records the
-/// content size in the frame, which lets `read_chunk` allocate exactly once.
+/// A format byte followed by the data. Chunks that don't shrink are stored raw. Zstd frames
+/// record the content size so `read_chunk` allocates once.
 fn encode_chunk(data: &[u8], compression: CompressionFormat) -> std::io::Result<Vec<u8>> {
     let mut content = Vec::with_capacity(1 + data.len());
     content.push(compression.encode());
@@ -666,7 +648,7 @@ fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::i
         .take(MAX_STORED_CHUNK_SIZE as u64 + CHUNK_HEADER_LEN + 1)
         .read_to_end(&mut content)?;
     let corrupted = || invalid(format!("chunk {} is corrupted", hex(hash)));
-    // Decoders report broken input under kinds of their own; here it is all damage.
+    // Every decoder error means a corrupt chunk.
     let broken = |err: std::io::Error| invalid(format!("chunk {} is corrupted: {err}", hex(hash)));
 
     let Some(&format) = content.first() else {
@@ -675,8 +657,8 @@ fn read_chunk_unverified(storage: &dyn ChunkStorage, hash: &ChunkHash) -> std::i
     let format = CompressionFormat::try_decode(format)?;
     content.drain(..CHUNK_HEADER_LEN as usize);
 
-    // The frame's own size claim only sizes the buffer when it is one this version writes;
-    // anything else, legacy or damage, goes through the bounded streaming path.
+    // Trust the frame's size only up to what this version writes; anything else streams with a
+    // bound.
     let zstd_size = (format == CompressionFormat::Zstd)
         .then(|| {
             zstd::zstd_safe::get_frame_content_size(&content)

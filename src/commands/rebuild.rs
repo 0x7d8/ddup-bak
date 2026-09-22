@@ -59,8 +59,7 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         "DONE".green().bold()
     );
 
-    // Anything left unreadable is what the rebuild could not account for, and it is why
-    // cleaning is now refused, so say so rather than leaving it to be discovered.
+    // Unreadable archives block `clean`, so report them now.
     let unreadable = repository.unreadable_archives()?;
     if !unreadable.is_empty() {
         println!();

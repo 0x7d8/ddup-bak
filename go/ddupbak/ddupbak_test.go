@@ -1,7 +1,6 @@
 package ddupbak
 
-// Exercises the package exactly as code written against the pre-BLAKE3 versions does: same
-// function names, signatures and defaults. Needs libddupbak on the linker and loader paths.
+// Uses the API as callers of pre-BLAKE3 versions do. Needs libddupbak on the linker and loader paths.
 
 import (
 	"bytes"

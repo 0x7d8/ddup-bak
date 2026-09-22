@@ -234,7 +234,6 @@ fn delete_keeps_chunks_shared_with_other_archives() {
     );
 }
 
-/// Local storage whose `n`th delete fails, standing in for a disk error mid-deletion.
 struct FailingDelete {
     inner: ChunkStorageLocal,
     deletes: AtomicUsize,
@@ -283,7 +282,6 @@ fn interrupted_delete_does_not_leave_the_index_pointing_at_missing_chunks() {
 
     assert!(fixture.repository.delete_archive("a", None).is_err());
 
-    // The same content backed up again must be written again, not taken as still stored.
     fixture.backup("b", &source).unwrap();
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
 }
@@ -303,7 +301,7 @@ fn a_delete_that_fails_midway_is_finished_by_the_next_deletion() {
     fixture.backup("a", &source).unwrap();
     let chunks = fixture.chunks_dir();
 
-    // Chunk files cannot be removed and the index cannot be written.
+    // Read-only, so no chunk can be removed and the index cannot be written.
     fs::set_permissions(&chunks, fs::Permissions::from_mode(0o555)).unwrap();
     let result = fixture.repository.delete_archive("a", None);
     fs::set_permissions(&chunks, fs::Permissions::from_mode(0o700)).unwrap();
@@ -337,8 +335,7 @@ fn a_crash_between_chunk_deletion_and_the_index_save_is_recovered() {
         .find(|hash| !of_b.contains(hash))
         .unwrap();
 
-    // What a crash leaves after the archive was renamed and one of its chunks removed, with
-    // the index still counting every reference.
+    // A crash after moving the archive and removing one chunk, before the index was saved.
     let ddup_bak = fixture.root.join("repo/.ddup-bak");
     fs::rename(
         ddup_bak.join("archives/a.ddup"),
@@ -352,7 +349,6 @@ fn a_crash_between_chunk_deletion_and_the_index_save_is_recovered() {
     )
     .unwrap();
 
-    // Backing up the same content again must write its chunks again, marker or not.
     fixture.backup("c", &a).unwrap();
     assert_eq!(fixture.repository.pending_deletions().unwrap(), ["a"]);
     assert_same_files(&a, &fixture.restore("c").unwrap(), &["shared", "only-a"]);
@@ -384,7 +380,6 @@ fn a_pending_deletion_does_not_hold_up_the_next_one() {
     )
     .unwrap();
 
-    // Both are settled by the one index save that follows y's chunks being freed.
     fixture.repository.delete_archive("y", None).unwrap();
     assert!(fixture.repository.pending_deletions().unwrap().is_empty());
     assert_eq!(fixture.repository.list_archives().unwrap(), ["z"]);
@@ -398,7 +393,7 @@ fn a_live_archive_named_like_a_pending_deletion_is_deleted_too() {
     let source = fixture.source("src", &[("f", &random(20_000))]);
     fixture.backup("a", &source).unwrap();
 
-    // An older version, unaware of pending deletions, could create this state.
+    // An older version unaware of pending deletions could leave this state.
     let ddup_bak = fixture.root.join("repo/.ddup-bak");
     fs::rename(
         ddup_bak.join("archives/a.ddup"),
@@ -454,7 +449,7 @@ fn chunks_an_interrupted_clean_deleted_are_written_again() {
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
 
-    // What an interrupted clean leaves: entries at zero whose files are already gone.
+    // An interrupted clean: counts at zero, files already gone.
     let index_path = fixture.chunks_dir().join("index");
     let index = ChunkIndex::load(&index_path).unwrap();
     let storage = ChunkStorageLocal(fixture.chunks_dir());
@@ -464,13 +459,11 @@ fn chunks_an_interrupted_clean_deleted_are_written_again() {
     }
     index.save(&index_path).unwrap();
 
-    // The index still lists the chunks, but their files are gone and must be written again.
     fixture.backup("b", &source).unwrap();
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
 }
 
-/// Local storage that removes the directory `blocker` once a chunk has been deleted, standing
-/// in for a full disk that a delete makes room on.
+/// Removes `blocker` after a chunk delete, like a full disk that a delete frees space on.
 struct UnlockOnDelete {
     inner: ChunkStorageLocal,
     blocker: PathBuf,
@@ -529,8 +522,8 @@ fn a_delete_sharing_a_pending_name_frees_space_before_it_needs_any() {
     )
     .unwrap();
 
-    // The pending `a` frees nothing, since the live one shares all its chunks. The index
-    // cannot be written until the live one's chunks go: a directory sits where it is staged.
+    // The index cannot be saved while `index.tmp` is a directory. The pending `a` shares every
+    // chunk with the live one, so only deleting the live one's chunks clears it.
     let blocker = fixture.chunks_dir().join("index.tmp");
     fs::create_dir(&blocker).unwrap();
     let result = fixture.repository.delete_archive("a", None);
@@ -595,7 +588,6 @@ fn a_chunk_lost_from_storage_is_written_back_by_the_next_backup_after_rebuild() 
     fixture.backup("b", &source).unwrap();
     assert_same_files(&source, &fixture.restore("a").unwrap(), &["f"]);
 
-    // The written-back chunk is counted for both archives, so deleting one keeps it.
     fixture.repository.delete_archive("a", None).unwrap();
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["f"]);
 }
@@ -633,7 +625,7 @@ fn a_numbered_marker_is_reported_under_the_archive_name_and_settled_by_it() {
     fixture
         .backup("b", &fixture.source("second", &[("g", &seeded(3, 20_000))]))
         .unwrap();
-    // An older version, unaware of pending deletions, could leave `a` both pending and live.
+    // An older version unaware of pending deletions could leave `a` both pending and live.
     let ddup_bak = fixture.root.join("repo/.ddup-bak");
     fs::rename(
         ddup_bak.join("archives/a.ddup"),
@@ -730,7 +722,6 @@ fn a_live_archive_with_the_longest_name_sharing_a_pending_one_is_deleted_too() {
     assert_eq!(fixture.stored_chunks(), 0);
 }
 
-/// Local storage whose first chunk read is interrupted, as a signal can do.
 struct InterruptOnce {
     inner: ChunkStorageLocal,
     done: std::sync::atomic::AtomicBool,
@@ -979,7 +970,7 @@ fn clean_removes_temporary_chunk_files_left_by_interrupted_writes() {
         .join(format!("ab/cd/{}.1234.5.tmp", "e".repeat(60)));
     fs::create_dir_all(leftover.parent().unwrap()).unwrap();
     fs::write(&leftover, b"partial").unwrap();
-    // Neither a file of another naming nor anything behind a symbolic link is touched.
+    // Kept: a `.tmp` named unlike a chunk, and one reached through a symlink.
     let other = fixture.chunks_dir().join("ab/cd/notes.tmp");
     fs::write(&other, b"kept").unwrap();
     let outside = fixture.root.join("outside/cd");
@@ -993,7 +984,7 @@ fn clean_removes_temporary_chunk_files_left_by_interrupted_writes() {
     )
     .unwrap();
 
-    // Nor anything outside the two levels of hex-named directories chunks live in.
+    // Kept: a chunk-like `.tmp` outside the two levels of hex directories.
     let elsewhere = fixture
         .chunks_dir()
         .join(format!("notes/saved/{}.123.4.tmp", "a".repeat(60)));
@@ -1140,7 +1131,7 @@ fn a_damaged_reference_count_is_caught_before_it_deletes_a_shared_chunk() {
     fixture.backup("a", &source).unwrap();
     fixture.backup("b", &source).unwrap();
 
-    // One entry: magic, 17 header bytes, the hash, then its count, which goes from 2 to 0.
+    // The only entry's count sits after the 8-byte magic, 17 header bytes and 32-byte hash.
     let index_path = fixture.chunks_dir().join("index");
     let mut bytes = fs::read(&index_path).unwrap();
     assert_eq!(bytes[8 + 17 + 32], 2);
@@ -1358,8 +1349,7 @@ fn restore_replaces_its_earlier_output_even_where_that_is_read_only() {
     fs::set_permissions(second.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-/// Local storage that lists a chosen chunk ahead of the real ones; the all-zero hash stands
-/// for an empty chunk that is not there.
+/// Lists `first` ahead of the stored chunks. The all-zero hash reads as an empty, unstored chunk.
 struct ListFirst {
     first: ddup_bak::chunks::ChunkHash,
     inner: ChunkStorageLocal,
@@ -1491,7 +1481,7 @@ fn backing_up_the_repository_directory_leaves_its_own_files_out_entirely() {
     let repo = fixture.root.join("repo");
     fs::create_dir_all(repo.join("data")).unwrap();
     fs::write(repo.join("data/f"), random(20_000)).unwrap();
-    // A directory of the repository's own the walker cannot read must not fail the backup.
+    // An unreadable directory inside `.ddup-bak` must not fail the backup.
     let locked = repo.join(".ddup-bak/archives-restored/locked");
     fs::create_dir(&locked).unwrap();
     #[cfg(unix)]
@@ -1529,7 +1519,7 @@ fn deleting_an_unreadable_archive_frees_its_chunks_through_a_recount() {
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
 
-    // The readable one is refused until the unreadable one is given up on.
+    // Deleting `a` is refused while `b` cannot be read.
     assert!(fixture.repository.delete_archive("a", None).is_err());
     fixture.repository.delete_archive("b", None).unwrap();
     fixture.repository.delete_archive("a", None).unwrap();
@@ -1634,7 +1624,6 @@ fn clean_reports_each_unreferenced_chunk_once() {
     assert_eq!(fixture.stored_chunks(), 0);
 }
 
-/// Local storage whose reads take a while, to keep a read in flight.
 struct SlowRead(ChunkStorageLocal);
 
 impl ChunkStorage for SlowRead {
@@ -1728,7 +1717,7 @@ fn deletion_waits_for_a_backup_or_restore_in_another_thread() {
     let source = fixture.source("src", &[("f", &random(20_000))]);
     fixture.backup("a", &source).unwrap();
 
-    // What a backup or restore holds on the chunks while it runs.
+    // The lock a running backup or restore holds.
     let held = Lock::shared(&fixture.chunks_dir().join("chunks.lock")).unwrap();
     std::thread::scope(|scope| {
         let clean = scope.spawn(|| fixture.repository.clean(None));
@@ -1896,9 +1885,6 @@ fn names_that_escape_their_directory_are_rejected() {
     }
 }
 
-/// The walk every version has used skips dot entries and obeys `.ignore` (and `.gitignore`
-/// inside a git repository), so upgrading must not quietly start storing files that were never
-/// in anyone's backups.
 #[test]
 fn the_default_walk_skips_what_it_always_skipped() {
     let fixture = Fixture::new();
@@ -1922,7 +1908,6 @@ fn the_default_walk_skips_what_it_always_skipped() {
     names.sort();
     assert_eq!(names, ["kept"]);
 
-    // And a walker without the filters stores all of it.
     let walker = ignore::WalkBuilder::new(&source)
         .standard_filters(false)
         .build();
@@ -1938,8 +1923,7 @@ fn the_default_walk_skips_what_it_always_skipped() {
     );
 }
 
-/// A backslash is an ordinary filename byte on Unix, and directories that use it (systemd's
-/// escaped device units, for one) have to back up and migrate like any other.
+/// Backslashes are ordinary filename bytes on Unix, e.g. in systemd's escaped unit names.
 #[cfg(unix)]
 #[test]
 fn backslashes_in_names_roundtrip() {
@@ -2079,7 +2063,7 @@ fn leb128(mut value: u64) -> Vec<u8> {
     out
 }
 
-/// Writes a repository exactly as versions before archive format 2 did: BLAKE2b chunk names,
+/// Writes a repository as versions before archive format 2 did: BLAKE2b chunk names,
 /// a Deflate-compressed index keyed by chunk id, and archives listing chunk ids as varints.
 fn write_format_1_repository(repo: &Path, files: &[(&str, &[Vec<u8>], CompressionFormat)]) {
     use std::io::Write;
@@ -2131,8 +2115,7 @@ fn write_format_1_repository(repo: &Path, files: &[(&str, &[Vec<u8>], Compressio
             fs::write(path, body).unwrap();
         }
 
-        // Older versions stored the id list with the file's own compression, so the entry
-        // header carries a compression id next to the mode bits.
+        // Format 1 compressed the id list with the file's own format, recorded in the entry header.
         let size_real = chunks.iter().map(|c| c.len() as u64).sum();
         let entry = archive
             .write_file_entry(
@@ -2155,7 +2138,7 @@ fn write_format_1_repository(repo: &Path, files: &[(&str, &[Vec<u8>], Compressio
     archive.write_end_header().unwrap();
     drop(archive);
 
-    // Archive format 1 differs from 2 only in what file bodies hold.
+    // Byte 7 is the format version. Format 1 differs from 2 only in what file bodies hold.
     let path = repo.join(".ddup-bak/archives/old.ddup");
     let mut bytes = fs::read(&path).unwrap();
     bytes[7] = 1;
@@ -2187,7 +2170,7 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let (a, b, mut c) = (random(1000), vec![b'B'; 900], random(2000));
-    c.reverse(); // `random` is deterministic; keep c's halves distinct from a
+    c.reverse(); // `random` is deterministic, so this keeps c distinct from a
     #[cfg(feature = "brotli")]
     let b_format = CompressionFormat::Brotli;
     #[cfg(not(feature = "brotli"))]
@@ -2240,7 +2223,7 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
     assert_eq!(fs::read(restored.join("sub/in-sub-b")).unwrap(), b);
     assert_eq!(fs::read(restored.join("c")).unwrap(), c);
 
-    // Opening again is a no-op, and new backups dedup against the BLAKE2b-named chunks.
+    // New backups must dedup against the migrated BLAKE2b chunks.
     let repository = Repository::open(&repo, None, None).unwrap();
     let source = dir.path().join("src");
     fs::create_dir_all(source.join("sub")).unwrap();
@@ -2254,7 +2237,6 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
         .unwrap();
     assert_eq!(stored(), 4);
 
-    // Rebuild recovers the algorithm from the chunks themselves.
     fs::remove_file(repo.join(".ddup-bak/chunks/index")).unwrap();
     let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
     assert_eq!(rebuilt.hash_algorithm(), HashAlgorithm::Blake2b256);
@@ -2266,9 +2248,6 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
     );
 }
 
-/// A format 1 index is a Deflate stream of chunk records, so a truncated one still decodes up
-/// to the damage. `rebuild` keeps that much and recovers every archive it covers, rather than
-/// treating the whole repository as lost.
 #[test]
 fn a_format_1_index_ending_short_of_its_records_is_rejected_on_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -2281,7 +2260,7 @@ fn a_format_1_index_ending_short_of_its_records_is_rejected_on_open() {
     write_format_1_repository(&repo, &files);
     let index = repo.join(".ddup-bak/chunks/index");
 
-    // The same stream, ended cleanly after the header and one 34-byte record.
+    // Re-encode just the 32-byte header and one 34-byte record, so the stream ends cleanly.
     let mut plain = Vec::new();
     flate2::read::DeflateDecoder::new(File::open(&index).unwrap())
         .read_to_end(&mut plain)
@@ -2340,8 +2319,7 @@ fn migration_counts_references_from_the_archives_not_the_old_index() {
             CompressionFormat::Deflate,
         )],
     );
-    // What an interrupted backup of an older version left: a second archive over the same
-    // chunk, published before the index counted it.
+    // An older version's interrupted backup: a second archive the index never counted.
     let archives = repo.join(".ddup-bak/archives");
     fs::copy(archives.join("old.ddup"), archives.join("twin.ddup")).unwrap();
 
@@ -2364,7 +2342,7 @@ fn an_archive_with_a_damaged_body_blocks_deletion_but_neither_migration_nor_its_
             CompressionFormat::Deflate,
         )],
     );
-    // A current-format archive whose entry table reads but whose hash list is one byte.
+    // A format 2 archive whose entry table reads but whose hash list is one byte.
     let bad = repo.join(".ddup-bak/archives/bad.ddup");
     let mut archive = Archive::new(File::create(&bad).unwrap()).unwrap();
     let entry = archive
@@ -2469,7 +2447,6 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
     let storage = ChunkStorageLocal(repo.join(".ddup-bak/chunks"));
     assert_eq!(storage.list_chunk_hashes().unwrap().len(), contents.len());
 
-    // Opening will not guess at a damaged index: it says so and changes nothing.
     fs::write(&index, &intact[..intact.len() * 2 / 3]).unwrap();
     assert!(Repository::open(&repo, None, None).is_err());
     assert!(ChunkIndex::load_v1(&index).is_err());
@@ -2480,8 +2457,7 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
         1
     );
 
-    // Asked to recover, it keeps every record the Deflate stream still yields: most of them
-    // here, and never all, so the one archive stays unaccounted for.
+    // The truncated Deflate stream still yields most records, but never all.
     let (_, salvaged) = ChunkIndex::salvage_v1(&index).unwrap();
     assert!(
         salvaged.len() > contents.len() / 2 && salvaged.len() < contents.len(),
@@ -2490,7 +2466,6 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
         contents.len()
     );
 
-    // While an archive is unaccounted for, nothing may delete the chunks it might still need.
     let repository = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
     assert_eq!(repository.unreadable_archives().unwrap(), ["old"]);
     assert_eq!(
@@ -2499,7 +2474,6 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
     );
     assert_eq!(storage.list_chunk_hashes().unwrap().len(), contents.len());
 
-    // With the index back, the migration completes and everything returns.
     fs::write(&index, &intact).unwrap();
     let repository = Repository::open(&repo, None, None).unwrap();
     let restored = repository.restore_archive("old", None, 2).unwrap();
@@ -2511,9 +2485,6 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
     assert_eq!(storage.list_chunk_hashes().unwrap().len(), contents.len());
 }
 
-/// Versions before archive format 2 lock the repository with their own scheme, which this one
-/// cannot take part in. Migrating underneath such a process would let it write its own index
-/// over the migrated one, so the migration has to wait for it instead.
 #[cfg(unix)]
 #[test]
 fn a_running_old_version_holds_off_the_migration() {
@@ -2529,7 +2500,7 @@ fn a_running_old_version_holds_off_the_migration() {
         )],
     );
 
-    // The old lock file: a mode byte, a presence byte and a pid, each padded to eight bytes.
+    // Old lock file layout: mode, presence flag and pid, each padded to eight bytes.
     let mut state = vec![0u8; 48];
     state[0] = 2;
     state[8] = 1;
@@ -2541,7 +2512,7 @@ fn a_running_old_version_holds_off_the_migration() {
         .expect("migration went ahead");
     assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
 
-    // A pid that is not running is a leftover from a crash and must not block anything.
+    // A dead pid is a crash leftover and must not block.
     state[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
     fs::write(&lock, &state).unwrap();
     let repository = Repository::open(&repo, None, None).unwrap();
@@ -2557,8 +2528,6 @@ fn a_running_old_version_holds_off_the_migration() {
     );
 }
 
-/// One unreadable archive used to fail the whole migration, which locked the reader out of
-/// every healthy archive next to it.
 #[test]
 fn a_damaged_archive_does_not_block_the_migration_of_the_others() {
     let dir = tempfile::tempdir().unwrap();

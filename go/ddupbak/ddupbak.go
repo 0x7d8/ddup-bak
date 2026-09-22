@@ -3,6 +3,8 @@
 // Build the C library with `cargo build --release` in the `c` directory and point cgo at it:
 //
 //	CGO_CFLAGS="-I/path/to/ddup-bak/c/include" CGO_LDFLAGS="-L/path/to/ddup-bak/target/release"
+//
+// Callbacks may run concurrently on library worker threads.
 package ddupbak
 
 /*
@@ -20,26 +22,26 @@ import (
 	"unsafe"
 )
 
-// CompressionFormat defines the compression algorithm used for files and chunks.
+// CompressionFormat defines the compression algorithm used for files
 type CompressionFormat uint8
 
 const (
 	CompressionNone    CompressionFormat = 0
 	CompressionGzip    CompressionFormat = 1
 	CompressionDeflate CompressionFormat = 2
-	CompressionBrotli  CompressionFormat = 3 // needs the library built with the brotli feature (default)
+	CompressionBrotli  CompressionFormat = 3
 	CompressionZstd    CompressionFormat = 4
 )
 
-// HashAlgorithm identifies chunks by content; fixed when a repository is created.
+// HashAlgorithm is the chunk hash of a repository, fixed at creation.
 type HashAlgorithm uint8
 
 const (
-	HashBlake2b256 HashAlgorithm = 0 // the default, used by every version
+	HashBlake2b256 HashAlgorithm = 0 // default
 	HashBlake3     HashAlgorithm = 1
 )
 
-// EntryType defines the type of a filesystem entry.
+// EntryType defines the type of a filesystem entry
 type EntryType uint8
 
 const (
@@ -48,42 +50,46 @@ const (
 	EntryTypeSymlink   EntryType = 2
 )
 
-// ChunkHash is the 256-bit hash identifying a chunk (see HashAlgorithm).
+// ChunkHash is the 256-bit hash identifying a chunk.
 type ChunkHash [32]byte
 
-// ID is the chunk id passed to DeletionProgressCallback: the first 8 bytes of the hash.
+// ID is the first 8 bytes of the hash, passed to DeletionProgressCallback as chunkID.
 func (h ChunkHash) ID() uint64 {
 	return binary.LittleEndian.Uint64(h[:8])
 }
 
-// ProgressCallback is called once per file with its path.
+// ProgressCallback is a callback for tracking progress operations (chunking, archiving, restoring)
 type ProgressCallback func(path string)
 
 type (
-	ChunkingProgressCallback  = ProgressCallback
+	// ChunkingProgressCallback is a callback for tracking chunking progress
+	ChunkingProgressCallback = ProgressCallback
+
+	// ArchivingProgressCallback is a callback for tracking archiving progress
 	ArchivingProgressCallback = ProgressCallback
+
+	// RestoringProgressCallback is a callback for tracking restoring progress
 	RestoringProgressCallback = ProgressCallback
 )
 
-// DeletionProgressCallback is called for every chunk dereferenced by a delete or clean.
-// chunkID is ChunkHash.ID of the chunk.
+// DeletionProgressCallback is a callback for tracking deletion progress
 type DeletionProgressCallback func(chunkID uint64, deleted bool)
 
+// CleaningProgressCallback is a callback for tracking cleaning progress
 type CleaningProgressCallback = DeletionProgressCallback
 
-// RebuildProgressCallback is called for every chunk reference counted during a rebuild.
+// RebuildProgressCallback is called for every chunk with its reference count during a rebuild.
 type RebuildProgressCallback func(hash ChunkHash, references uint64)
 
-// CompressionFormatCallback picks the compression of each file backed up into a repository.
+// CompressionFormatCallback is a callback for determining the compression format
 type CompressionFormatCallback func(path string) CompressionFormat
 
-// CompressionCallback picks the compression of each file added to a standalone archive.
+// CompressionCallback determines the compression format for a file
 type CompressionCallback func(path string, size uint64) CompressionFormat
 
-// RealSizeCallback overrides the recorded uncompressed size of a file added to a standalone archive.
+// RealSizeCallback determines the real size of a file before compression
 type RealSizeCallback func(path string) uint64
 
-// Callbacks may be invoked concurrently from library worker threads.
 type callbacks struct {
 	progress    ProgressCallback
 	archiving   ProgressCallback
@@ -94,8 +100,7 @@ type callbacks struct {
 	realSize    RealSizeCallback
 }
 
-// userData stores a cgo.Handle to cb in C memory and returns the pointer handed to the
-// library as user_data together with a release function.
+// userData stores a cgo.Handle to cb in C memory for use as user_data. The returned func frees both.
 func userData(cb *callbacks) (C.CUserData, func()) {
 	handle := cgo.NewHandle(cb)
 	cell := (*C.uintptr_t)(C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))

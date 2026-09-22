@@ -1,4 +1,3 @@
-//! Regression coverage for archive reservation and replacement restore safety.
 use ddup_bak::{
     chunks::{ChunkIndex, HashAlgorithm},
     lock::Lock,

@@ -14,7 +14,7 @@ import (
 
 var errClosed = errors.New("ddupbak: repository is closed")
 
-// Nil Go callbacks become null C callbacks so the library skips the cgo transition per file or chunk.
+// Nil callbacks map to null so the library skips a cgo call per file or chunk.
 func cProgressCallback(cb ...ProgressCallback) C.CProgressCallback {
 	for _, cb := range cb {
 		if cb != nil {
@@ -31,7 +31,7 @@ func cDeletionCallback(cb DeletionProgressCallback) C.CDeletionProgressCallback 
 	return C.deletionCallback()
 }
 
-// Repository is a deduplicating backup repository.
+// Repository represents a ddupbak repository
 type Repository struct {
 	repo *C.struct_CRepository
 }
@@ -46,12 +46,12 @@ func wrapRepository(repo *C.struct_CRepository, fallback string) (*Repository, e
 	return repository, nil
 }
 
-// NewRepository creates a repository with the default (BLAKE2b) chunk hash.
+// NewRepository creates a new repository with the specified parameters
 func NewRepository(directory string, chunkSize, maxChunkCount uint) (*Repository, error) {
 	return NewRepositoryWithHash(directory, chunkSize, maxChunkCount, HashBlake2b256)
 }
 
-// NewRepositoryWithHash creates a repository whose chunks are named by hash.
+// NewRepositoryWithHash is NewRepository with a chosen chunk hash algorithm.
 func NewRepositoryWithHash(directory string, chunkSize, maxChunkCount uint, hash HashAlgorithm) (*Repository, error) {
 	cDirectory := cString(directory)
 	defer freeCString(cDirectory)
@@ -62,8 +62,8 @@ func NewRepositoryWithHash(directory string, chunkSize, maxChunkCount uint, hash
 	)
 }
 
-// OpenRepository opens a repository; chunksDirectory may be nil to use the default. Repositories
-// written by older versions are migrated in place.
+// OpenRepository opens an existing repository.
+// Repositories written by older versions are migrated in place.
 func OpenRepository(directory string, chunksDirectory *string) (*Repository, error) {
 	cDirectory, cChunks := cString(directory), optionalCString(chunksDirectory)
 	defer freeCString(cDirectory)
@@ -72,7 +72,7 @@ func OpenRepository(directory string, chunksDirectory *string) (*Repository, err
 	return wrapRepository(C.open_repository(cDirectory, cChunks), "ddupbak: failed to open repository")
 }
 
-// RebuildRepository recreates the chunk index from the archives and chunk storage.
+// RebuildRepository rebuilds the chunk index from the archives and stored chunks.
 func RebuildRepository(
 	directory string,
 	chunkSize, maxChunkCount uint,
@@ -97,7 +97,7 @@ func RebuildRepository(
 	)
 }
 
-// Free releases the repository.
+// Free releases resources associated with the repository
 func (r *Repository) Free() {
 	if r.repo != nil {
 		C.free_repository(r.repo)
@@ -105,10 +105,10 @@ func (r *Repository) Free() {
 	}
 }
 
-// Close is Free.
+// Close calls Free.
 func (r *Repository) Close() { r.Free() }
 
-// Save is kept for older callers; every operation persists the index itself.
+// Save is a no-op kept for older callers; every operation persists the index itself.
 func (r *Repository) Save() error {
 	if r.repo == nil {
 		return errClosed
@@ -128,7 +128,7 @@ func (r *Repository) SetSaveOnDrop(saveOnDrop bool) error {
 	return nil
 }
 
-// Clean deletes unreferenced chunks.
+// Clean removes unused chunks from the repository
 func (r *Repository) Clean(progressCallback CleaningProgressCallback) error {
 	if r.repo == nil {
 		return errClosed
@@ -143,8 +143,8 @@ func (r *Repository) Clean(progressCallback CleaningProgressCallback) error {
 	return nil
 }
 
-// CreateArchive backs up directory (or the repository directory when empty) into a new archive.
-// Both progress callbacks are called once per file; a nil compression callback means deflate.
+// CreateArchive creates a new archive in the repository.
+// An empty directory backs up the repository directory.
 func (r *Repository) CreateArchive(
 	name string,
 	directory string,
@@ -181,7 +181,7 @@ func (r *Repository) CreateArchive(
 	return wrapArchive(archive, "ddupbak: failed to create archive")
 }
 
-// ListArchives returns the archive names in the repository.
+// ListArchives returns the list of archive names in the repository
 func (r *Repository) ListArchives() ([]string, error) {
 	if r.repo == nil {
 		return nil, errClosed
@@ -201,7 +201,7 @@ func (r *Repository) ListArchives() ([]string, error) {
 	return result, nil
 }
 
-// GetArchive opens an archive of the repository.
+// GetArchive opens an existing archive
 func (r *Repository) GetArchive(archiveName string) (*Archive, error) {
 	if r.repo == nil {
 		return nil, errClosed
@@ -213,8 +213,8 @@ func (r *Repository) GetArchive(archiveName string) (*Archive, error) {
 	return wrapArchive(C.repository_get_archive(r.repo, cName), "ddupbak: archive not found")
 }
 
-// RestoreArchive restores an archive into the repository's `.ddup-bak/archives-restored/<name>`
-// directory, replacing a previous restore of the same archive, and returns that path.
+// RestoreArchive restores an archive into .ddup-bak/archives-restored/<name> in the repository,
+// replacing a previous restore, and returns that path.
 func (r *Repository) RestoreArchive(
 	archiveName string,
 	progressCallback RestoringProgressCallback,
@@ -263,7 +263,7 @@ func (r *Repository) RestoreArchiveTo(
 	return nil
 }
 
-// DeleteArchive deletes an archive and the chunks only it referenced.
+// DeleteArchive deletes an archive from the repository
 func (r *Repository) DeleteArchive(
 	archiveName string,
 	progressCallback CleaningProgressCallback,

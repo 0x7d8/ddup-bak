@@ -2,18 +2,17 @@ use super::{ChunkHash, HashAlgorithm, storage::ChunkStorage};
 use crate::lock::Lock;
 use std::{io::Read, sync::Arc};
 
-/// Streams a repository file entry chunk by chunk. Holds a shared repository lock so chunks
-/// cannot be deleted while it is alive.
+/// Streams a repository file entry chunk by chunk, holding a lock so its chunks can't be deleted.
 pub struct EntryReader {
     hashes: std::vec::IntoIter<ChunkHash>,
     storage: Arc<dyn ChunkStorage>,
     algorithm: HashAlgorithm,
     _lock: Lock,
-    /// The chunk being fetched, kept so that a failed read retries it rather than skipping it.
+    /// Chunk being fetched, so a failed read retries it instead of skipping it.
     pending: Option<ChunkHash>,
     buffer: Vec<u8>,
     position: usize,
-    /// The recorded file size, checked against the chunks once all are read.
+    /// Recorded file size, checked once all chunks are read.
     size: u64,
     total: u64,
 }

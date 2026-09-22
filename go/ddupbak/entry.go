@@ -13,15 +13,15 @@ import (
 
 var errEntryClosed = errors.New("ddupbak: entry is closed")
 
-// Entry is a file, directory or symlink inside an archive. Entries from Archive.Entries or
-// DirectoryEntry.Entries are owned by their archive and freed with it; Free on them is a no-op.
-// Entries from Archive.FindEntry are owned by the caller.
+// Entry represents a filesystem entry in an archive.
+// Entries from Archive.Entries and DirectoryEntry.Entries are freed with their archive.
+// Entries from Archive.FindEntry must be freed by the caller.
 type Entry struct {
 	entry *C.struct_CEntry
 	owned bool
 }
 
-// EntryCommon is the metadata every entry type has.
+// EntryCommon contains common metadata for all entry types
 type EntryCommon struct {
 	Name  string
 	Mode  uint16
@@ -31,6 +31,7 @@ type EntryCommon struct {
 	Type  EntryType
 }
 
+// FileEntry represents a file in an archive
 type FileEntry struct {
 	Common         EntryCommon
 	Compression    CompressionFormat
@@ -39,18 +40,20 @@ type FileEntry struct {
 	SizeCompressed uint64
 }
 
+// DirectoryEntry represents a directory in an archive
 type DirectoryEntry struct {
 	Common  EntryCommon
 	Entries []*Entry
 }
 
+// SymlinkEntry represents a symbolic link in an archive
 type SymlinkEntry struct {
 	Common    EntryCommon
 	Target    string
 	TargetDir bool
 }
 
-// Free releases an entry obtained from Archive.FindEntry; a no-op for archive-owned entries.
+// Free releases resources associated with the entry
 func (e *Entry) Free() {
 	if e.entry != nil && e.owned {
 		C.free_entry(e.entry)
@@ -58,9 +61,10 @@ func (e *Entry) Free() {
 	e.entry = nil
 }
 
-// Close is Free.
+// Close calls Free.
 func (e *Entry) Close() { e.Free() }
 
+// Type returns the type of this entry
 func (e *Entry) Type() EntryType {
 	if e.entry == nil {
 		return EntryTypeFile
@@ -68,6 +72,7 @@ func (e *Entry) Type() EntryType {
 	return EntryType(C.get_entry_type(e.entry))
 }
 
+// Name returns the name of this entry
 func (e *Entry) Name() string {
 	if e.entry == nil {
 		return ""
@@ -75,7 +80,7 @@ func (e *Entry) Name() string {
 	return C.GoString(C.entry_name(e.entry))
 }
 
-// GetCommon returns the metadata shared by all entry types.
+// GetCommon returns common metadata for this entry
 func (e *Entry) GetCommon() (EntryCommon, error) {
 	if e.entry == nil {
 		return EntryCommon{}, errEntryClosed
@@ -96,9 +101,10 @@ func (e *Entry) GetCommon() (EntryCommon, error) {
 	}, nil
 }
 
-// Common is GetCommon.
+// Common calls GetCommon.
 func (e *Entry) Common() (EntryCommon, error) { return e.GetCommon() }
 
+// AsFile converts this entry to a FileEntry
 func (e *Entry) AsFile() (*FileEntry, error) {
 	common, err := e.GetCommon()
 	if err != nil {
@@ -119,6 +125,7 @@ func (e *Entry) AsFile() (*FileEntry, error) {
 	}, nil
 }
 
+// AsDirectory converts this entry to a DirectoryEntry
 func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
 	common, err := e.GetCommon()
 	if err != nil {
@@ -138,6 +145,7 @@ func (e *Entry) AsDirectory() (*DirectoryEntry, error) {
 	return &DirectoryEntry{Common: common, Entries: entries}, nil
 }
 
+// AsSymlink converts this entry to a SymlinkEntry
 func (e *Entry) AsSymlink() (*SymlinkEntry, error) {
 	common, err := e.GetCommon()
 	if err != nil {
@@ -156,8 +164,7 @@ func (e *Entry) AsSymlink() (*SymlinkEntry, error) {
 	}, nil
 }
 
-// RecursiveFree frees an entry and, for directories, its children. Archive-owned entries are
-// left to the archive.
+// RecursiveFree frees an entry and all its children if it's a directory
 func RecursiveFree(e *Entry) {
 	if e == nil || e.entry == nil {
 		return
@@ -173,7 +180,8 @@ func RecursiveFree(e *Entry) {
 	e.Free()
 }
 
-// ProcessDirectoryEntries calls processFn for every entry below dirEntry, depth first.
+// ProcessDirectoryEntries processes all entries in a directory recursively
+// This is a helper function that can be used to traverse directories
 func ProcessDirectoryEntries(dirEntry *DirectoryEntry, processFn func(*Entry) error) error {
 	if dirEntry == nil {
 		return errors.New("ddupbak: directory entry is nil")
@@ -197,5 +205,5 @@ func ProcessDirectoryEntries(dirEntry *DirectoryEntry, processFn func(*Entry) er
 	return nil
 }
 
-// Walk is ProcessDirectoryEntries.
+// Walk calls ProcessDirectoryEntries.
 func Walk(dir *DirectoryEntry, fn func(*Entry) error) error { return ProcessDirectoryEntries(dir, fn) }

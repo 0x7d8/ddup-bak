@@ -29,7 +29,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
 
     println!("{}", "restoring backup...".bright_black());
 
-    // Held until the restore is done, so no delete takes the chunks between here and there.
+    // Held through the restore so no delete removes the chunks.
     let _lock = repository.shared_lock()?;
     let archive = repository.get_archive(name)?;
     let total = archive.entries().iter().map(count_entries).sum();

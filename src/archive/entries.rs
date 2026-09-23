@@ -1,5 +1,4 @@
 use super::CompressionFormat;
-use flate2::read::{DeflateDecoder, GzDecoder};
 use positioned_io::ReadAt;
 use std::{
     fmt::{Debug, Formatter},
@@ -10,7 +9,7 @@ use std::{
     time::SystemTime,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct EntryMode(u32);
 
 impl EntryMode {
@@ -45,7 +44,7 @@ impl EntryMode {
     #[inline]
     pub const fn set_user(&mut self, read: bool, write: bool, execute: bool) {
         self.0 &= !0o700;
-        self.0 |= (read as u32) << 6 | (write as u32) << 5 | (execute as u32) << 4;
+        self.0 |= (read as u32) << 8 | (write as u32) << 7 | (execute as u32) << 6;
     }
 
     /// Returns the group permissions (read, write, execute).
@@ -62,7 +61,7 @@ impl EntryMode {
     #[inline]
     pub const fn set_group(&mut self, read: bool, write: bool, execute: bool) {
         self.0 &= !0o070;
-        self.0 |= (read as u32) << 3 | (write as u32) << 2 | (execute as u32) << 1;
+        self.0 |= (read as u32) << 5 | (write as u32) << 4 | (execute as u32) << 3;
     }
 
     /// Returns the other permissions (read, write, execute).
@@ -79,7 +78,7 @@ impl EntryMode {
     #[inline]
     pub const fn set_other(&mut self, read: bool, write: bool, execute: bool) {
         self.0 &= !0o007;
-        self.0 |= (read as u32) | (write as u32) << 1 | (execute as u32) << 2;
+        self.0 |= (read as u32) << 2 | (write as u32) << 1 | execute as u32;
     }
 }
 
@@ -150,7 +149,7 @@ impl From<EntryMode> for std::fs::Permissions {
         #[cfg(not(unix))]
         {
             let mut fs_permissions: std::fs::Permissions = unsafe { std::mem::zeroed() };
-            fs_permissions.set_readonly(permissions.0 & 0o444 != 0);
+            fs_permissions.set_readonly(permissions.0 & 0o222 == 0);
 
             fs_permissions
         }
@@ -181,6 +180,29 @@ pub struct FileEntry {
     pub offset: u64,
     pub decoder: Option<Box<dyn Read + Sync + Send>>,
     pub consumed: u64,
+}
+
+impl FileEntry {
+    fn decoder(&mut self) -> std::io::Result<&mut (dyn Read + Send + Sync)> {
+        if self.decoder.is_none() {
+            let size = self.size_compressed.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "compressed entry without compressed size",
+                )
+            })?;
+
+            let reader = BoundedReader {
+                file: Arc::clone(&self.file),
+                offset: self.offset,
+                size,
+                position: 0,
+            };
+            self.decoder = Some(super::decompressor(self.compression, reader)?);
+        }
+
+        Ok(self.decoder.as_mut().unwrap().as_mut())
+    }
 }
 
 impl Clone for FileEntry {
@@ -220,108 +242,37 @@ impl Debug for FileEntry {
 
 impl Read for FileEntry {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.consumed >= self.size {
+        let remaining = usize::try_from(self.size - self.consumed).unwrap_or(usize::MAX);
+        let len = buf.len().min(remaining);
+        let buf = &mut buf[..len];
+        if buf.is_empty() {
             return Ok(0);
         }
 
-        let remaining = self.size - self.consumed;
+        let bytes_read = match self.compression {
+            CompressionFormat::None => self.file.read_at(self.offset + self.consumed, buf)?,
+            _ => self.decoder()?.read(buf)?,
+        };
 
-        match self.compression {
-            CompressionFormat::None => {
-                let bytes_read = self.file.read_at(self.offset + self.consumed, buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            CompressionFormat::Gzip if let Some(size_compressed) = self.size_compressed => {
-                let decoder = self.decoder.get_or_insert_with(|| {
-                    let reader = BoundedReader {
-                        file: Arc::clone(&self.file),
-                        offset: self.offset,
-                        position: 0,
-                        size: size_compressed,
-                    };
-
-                    Box::new(GzDecoder::new(reader))
-                });
-
-                let bytes_read = decoder.read(buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.decoder = None;
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            CompressionFormat::Deflate if let Some(size_compressed) = self.size_compressed => {
-                let decoder = self.decoder.get_or_insert_with(|| {
-                    let reader = BoundedReader {
-                        file: Arc::clone(&self.file),
-                        offset: self.offset,
-                        position: 0,
-                        size: size_compressed,
-                    };
-
-                    Box::new(DeflateDecoder::new(reader))
-                });
-
-                let bytes_read = decoder.read(buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.decoder = None;
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli if let Some(size_compressed) = self.size_compressed => {
-                let decoder = self.decoder.get_or_insert_with(|| {
-                    let reader = BoundedReader {
-                        file: Arc::clone(&self.file),
-                        offset: self.offset,
-                        position: 0,
-                        size: size_compressed,
-                    };
-
-                    Box::new(brotli::Decompressor::new(reader, 4096))
-                });
-
-                let bytes_read = decoder.read(buf)?;
-
-                if bytes_read > remaining as usize {
-                    self.decoder = None;
-                    self.consumed += remaining;
-                    return Ok(remaining as usize);
-                }
-
-                self.consumed += bytes_read as u64;
-                Ok(bytes_read)
-            }
-            #[cfg(not(feature = "brotli"))]
-            CompressionFormat::Brotli => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Brotli support is not enabled. Please enable the 'brotli' feature.",
-            )),
-
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Unsupported compression format or broken entry: {:?}",
-                    self.compression
-                ),
-            )),
+        if bytes_read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "entry data ends before its declared size",
+            ));
         }
+
+        self.consumed += bytes_read as u64;
+        // Data past the declared size would hide chunks from reference counting.
+        if self.consumed == self.size
+            && self.compression != CompressionFormat::None
+            && self.decoder()?.read(&mut [0])? != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "entry data continues past its declared size",
+            ));
+        }
+        Ok(bytes_read)
     }
 }
 

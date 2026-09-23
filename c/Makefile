@@ -1,7 +1,7 @@
 # Makefile for building and installing libddupbak
 
 # Variables
-TARGET_DIR = target/release
+TARGET_DIR = ../target/release
 LIB_NAME = libddupbak.so
 GLOBAL_DIR = /usr/local/lib
 INCLUDE_DIR = /usr/local/include

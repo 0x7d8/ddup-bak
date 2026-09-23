@@ -4,7 +4,7 @@ use colored::Colorize;
 use std::sync::Arc;
 
 pub fn clean(_matches: &ArgMatches) -> std::io::Result<i32> {
-    let repository = open_repository(true);
+    let repository = open_repository();
 
     println!("{}", "cleaning repository...".bright_black());
 
@@ -21,15 +21,11 @@ pub fn clean(_matches: &ArgMatches) -> std::io::Result<i32> {
     repository.clean(Some({
         let progress = progress.clone();
 
-        Arc::new(move |chunk, deleted| {
+        Arc::new(move |hash, _| {
             progress.set_text(format!(
                 "{} {}",
-                format!("chunk #{chunk}").cyan(),
-                if deleted {
-                    "(deleted)".green()
-                } else {
-                    "(not deleted)".red()
-                }
+                ddup_bak::chunks::hex(hash)[..12].cyan(),
+                "(deleted)".green()
             ));
         })
     }))?;

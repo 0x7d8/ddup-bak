@@ -1,39 +1,50 @@
 [package]
 name = "ddup-bak"
 description = "An archive format that supports multiple compression algorithms at once."
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 homepage = "https://github.com/0x7d8/ddup-bak"
 repository = "https://github.com/0x7d8/ddup-bak.git"
 categories = ["command-line-utilities", "compression"]
 
+[workspace]
+members = ["c"]
+
+[features]
+default = ["cli", "brotli"]
+# The binary and its dependencies; the C library builds the crate without them.
+cli = ["dep:clap", "dep:colored", "dep:chrono", "dep:tar"]
+# Brotli is optional because it is slow enough that not every build wants it. Archives and
+# chunks written with it fail to read when it is off; zstd is always available.
+brotli = ["dep:brotli"]
+
 [[bin]]
 name = "ddup-bak"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 blake2 = "0.10.6"
+blake3 = "1.8.7"
 flate2 = "1.1.1"
 positioned-io = "0.3.4"
 rayon = "1.10.0"
 dashmap = { version = "6.1.0", features = ["inline"] }
-atomicwrites = "0.4.4"
 ignore = "0.4.23"
 parking_lot = "0.12.5"
+same-file = "1.0.6"
+zstd = "0.13.3"
 brotli = { version = "8.0.0", optional = true }
 fastcdc = "4.0.1"
 
-# CLI
-clap = "4.5.37"
-colored = "3.0.0"
-chrono = "0.4.40"
 libc = "0.2.172"
-tar = "0.4.44"
+
+# CLI
+clap = { version = "4.5.37", optional = true }
+colored = { version = "3.0.0", optional = true }
+chrono = { version = "0.4.40", optional = true }
+tar = { version = "0.4.44", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"
-
-[features]
-default = ["brotli"]
-brotli = ["dep:brotli"]

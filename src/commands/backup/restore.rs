@@ -2,19 +2,22 @@ use crate::commands::{Progress, open_repository};
 use clap::ArgMatches;
 use colored::Colorize;
 use ddup_bak::archive::entries::Entry;
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
-    let repository = open_repository(false);
+    let repository = open_repository();
 
     let name = matches.get_one::<String>("name").expect("required");
-    let destination = matches.get_one::<String>("destination");
-    let threads = matches.get_one::<usize>("threads").expect("required");
+    let destination = matches.get_one::<String>("destination").map(PathBuf::from);
+    let threads = *matches.get_one::<usize>("threads").expect("required");
 
     if !repository
         .list_archives()?
-        .into_iter()
-        .any(|name| name == *name)
+        .iter()
+        .any(|backup| backup == name)
     {
         println!(
             "{} {} {}",
@@ -28,27 +31,11 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
 
     println!("{}", "restoring backup...".bright_black());
 
+    // Held through the restore so no delete removes the chunks.
+    let _lock = repository.shared_lock()?;
     let archive = repository.get_archive(name)?;
 
-    fn recursive_count_entries(entry: &Entry) -> usize {
-        match entry {
-            Entry::Directory(entries) => {
-                let mut count = 1;
-
-                for entry in entries.entries.iter() {
-                    count += recursive_count_entries(entry);
-                }
-
-                count
-            }
-            _ => 1,
-        }
-    }
-
-    let mut total = 0;
-    for entry in archive.entries().iter() {
-        total += recursive_count_entries(entry);
-    }
+    let total = archive.entries().iter().map(count_entries).sum();
 
     let mut progress = Progress::new(total);
     progress.spinner(|progress, spinner| {
@@ -62,18 +49,24 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
         )
     });
 
-    repository.restore_entries(
-        name,
-        archive.into_entries(),
-        Some({
-            let progress = progress.clone();
+    let progress_callback = Some({
+        let progress = progress.clone();
 
-            Arc::new(move |_| {
-                progress.incr(1usize);
-            })
-        }),
-        *threads,
-    )?;
+        Arc::new(move |_: &Path| progress.incr(1usize)) as Arc<_>
+    });
+    match &destination {
+        Some(destination) => {
+            repository.restore_entries_replacing(
+                archive.into_entries(),
+                destination,
+                progress_callback,
+                threads,
+            )?;
+        }
+        None => {
+            repository.restore_entries(name, archive.into_entries(), progress_callback, threads)?;
+        }
+    }
 
     progress.finish();
 
@@ -83,61 +76,12 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
         "DONE".green().bold()
     );
 
-    if let Some(destination) = destination {
-        println!(
-            "{} {}{}",
-            "restoring to".bright_black(),
-            destination.cyan(),
-            "...".bright_black()
-        );
-
-        if std::path::Path::new(destination).exists() {
-            for entry in std::fs::read_dir(destination)? {
-                let entry = entry?;
-
-                let path = entry.path();
-                let Some(file_name) = path.file_name() else {
-                    continue;
-                };
-
-                if file_name == ".ddup-bak" {
-                    continue;
-                }
-
-                if path.is_file() {
-                    std::fs::remove_file(path)?;
-                } else if path.is_dir() {
-                    std::fs::remove_dir_all(path)?;
-                }
-            }
-        }
-
-        let source = std::path::Path::new(".ddup-bak/archives-restored/").join(name);
-        let destination = std::path::Path::new(destination);
-
-        std::fs::create_dir_all(destination)?;
-
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-
-            let path = entry.path();
-            let Some(file_name) = path.file_name() else {
-                continue;
-            };
-
-            let destination_path = destination.join(file_name);
-
-            std::fs::rename(path, destination_path)?;
-        }
-
-        println!(
-            "{} {} {} {}",
-            "restoring to".bright_black(),
-            destination.to_string_lossy().cyan(),
-            "...".bright_black(),
-            "DONE".green().bold()
-        );
-    }
-
     Ok(0)
+}
+
+fn count_entries(entry: &Entry) -> usize {
+    match entry {
+        Entry::Directory(dir) => 1 + dir.entries.iter().map(count_entries).sum::<usize>(),
+        _ => 1,
+    }
 }

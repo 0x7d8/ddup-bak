@@ -14,27 +14,30 @@ pub mod clean;
 pub mod init;
 pub mod rebuild;
 
-pub fn open_repository(save: bool) -> Repository {
-    if let Ok(mut repository) = Repository::open(Path::new("."), None, None) {
-        repository.set_save_on_drop(save);
+pub fn open_repository() -> Repository {
+    match Repository::open(Path::new("."), None, None) {
+        Ok(repository) => repository,
+        Err(err) => {
+            println!(
+                "{} {}",
+                "repository is not initialized or is corrupted:".red(),
+                err
+            );
+            println!(
+                "{} {} {}",
+                "Run".red(),
+                "ddup-bak init .".cyan(),
+                "to initialize a new repository.".red()
+            );
+            println!(
+                "{} {} {}",
+                "Run".red(),
+                "ddup-bak rebuild .".cyan(),
+                "to attempt to rebuild the repository.".red()
+            );
 
-        repository
-    } else {
-        println!("{}", "repository is not initialized or is corrupted!".red());
-        println!(
-            "{} {} {}",
-            "Run".red(),
-            "ddup-bak init .".cyan(),
-            "to initialize a new repository.".red()
-        );
-        println!(
-            "{} {} {}",
-            "Run".red(),
-            "ddup-bak rebuild .".cyan(),
-            "to attempt to rebuild the repository.".red()
-        );
-
-        std::process::exit(1);
+            std::process::exit(1);
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::varint;
-use entries::EntryMode;
+use entries::{DirectoryEntry, Entry, EntryMode, FileEntry, SymlinkEntry};
 use flate2::{
-    read::DeflateDecoder,
+    read::{DeflateDecoder, GzDecoder},
     write::{DeflateEncoder, GzEncoder},
 };
 use positioned_io::ReadAt;
@@ -18,60 +18,186 @@ use std::{
 pub mod entries;
 
 pub const FILE_SIGNATURE: [u8; 7] = *b"DDUPBAK";
-pub const FILE_VERSION: u8 = 1;
+pub const FILE_VERSION: u8 = 2;
 
+const HEADER_LEN: u64 = 8;
+const FOOTER_LEN: u64 = 16;
+/// Entry header word: 2 bits type, 4 bits compression, 26 bits mode.
+const MODE_MASK: u32 = (1 << 26) - 1;
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+/// Brotli (buffer, quality, window) used by every version so far.
+#[cfg(feature = "brotli")]
+const BROTLI_PARAMS: (usize, u32, u32) = (4096, 11, 22);
+
+/// Compression of an archive entry or chunk. The ids are stored on disk in archive entries and
+/// chunk files. Reading Brotli data without the `brotli` feature fails with
+/// `ErrorKind::Unsupported`.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompressionFormat {
-    None,
-    Gzip,
-    Deflate,
-    Brotli,
+    #[default]
+    None = 0,
+    Gzip = 1,
+    Deflate = 2,
+    Brotli = 3,
+    Zstd = 4,
 }
 
 impl CompressionFormat {
     pub const fn encode(&self) -> u8 {
-        match self {
-            CompressionFormat::None => 0,
-            CompressionFormat::Gzip => 1,
-            CompressionFormat::Deflate => 2,
-            CompressionFormat::Brotli => 3,
-        }
+        *self as u8
     }
 
     pub fn try_decode(value: u8) -> std::io::Result<Self> {
         match value {
-            0 => Ok(CompressionFormat::None),
-            1 => Ok(CompressionFormat::Gzip),
-            2 => Ok(CompressionFormat::Deflate),
-            3 => Ok(CompressionFormat::Brotli),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid compression format",
-            )),
+            0 => Ok(Self::None),
+            1 => Ok(Self::Gzip),
+            2 => Ok(Self::Deflate),
+            3 => Ok(Self::Brotli),
+            4 => Ok(Self::Zstd),
+            _ => Err(invalid("invalid compression format")),
+        }
+    }
+
+    /// Whether this build can compress and decompress the format.
+    pub const fn is_supported(&self) -> bool {
+        match self {
+            Self::None | Self::Gzip | Self::Deflate | Self::Zstd => true,
+            Self::Brotli => cfg!(feature = "brotli"),
+        }
+    }
+
+    pub fn unsupported_message(&self) -> String {
+        format!(
+            "{self:?} support is not enabled; build with the '{}' feature",
+            format!("{self:?}").to_lowercase()
+        )
+    }
+
+    pub(crate) fn unsupported(&self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, self.unsupported_message())
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Compressor<W: Write> {
+    None(W),
+    Gzip(GzEncoder<W>),
+    Deflate(DeflateEncoder<W>),
+    #[cfg(feature = "brotli")]
+    Brotli(brotli::CompressorWriter<W>),
+    Zstd(zstd::stream::write::Encoder<'static, W>),
+}
+
+impl<W: Write> Compressor<W> {
+    pub fn new(format: CompressionFormat, writer: W) -> std::io::Result<Self> {
+        Ok(match format {
+            CompressionFormat::None => Self::None(writer),
+            CompressionFormat::Gzip => {
+                Self::Gzip(GzEncoder::new(writer, flate2::Compression::default()))
+            }
+            CompressionFormat::Deflate => {
+                Self::Deflate(DeflateEncoder::new(writer, flate2::Compression::default()))
+            }
+            #[cfg(feature = "brotli")]
+            CompressionFormat::Brotli => {
+                let (buffer, quality, window) = BROTLI_PARAMS;
+                Self::Brotli(brotli::CompressorWriter::new(
+                    writer, buffer, quality, window,
+                ))
+            }
+            CompressionFormat::Zstd => {
+                Self::Zstd(zstd::stream::write::Encoder::new(writer, ZSTD_LEVEL)?)
+            }
+            #[allow(unreachable_patterns)]
+            other => return Err(other.unsupported()),
+        })
+    }
+
+    pub fn finish(self) -> std::io::Result<W> {
+        match self {
+            Self::None(writer) => Ok(writer),
+            Self::Gzip(encoder) => encoder.finish(),
+            Self::Deflate(encoder) => encoder.finish(),
+            #[cfg(feature = "brotli")]
+            Self::Brotli(mut encoder) => {
+                encoder.flush()?;
+                Ok(encoder.into_inner())
+            }
+            Self::Zstd(encoder) => encoder.finish(),
         }
     }
 }
 
-impl Default for CompressionFormat {
-    #[inline]
-    fn default() -> Self {
-        CompressionFormat::None
+impl<W: Write> Write for Compressor<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::None(writer) => writer.write(buf),
+            Self::Gzip(encoder) => encoder.write(buf),
+            Self::Deflate(encoder) => encoder.write(buf),
+            #[cfg(feature = "brotli")]
+            Self::Brotli(encoder) => encoder.write(buf),
+            Self::Zstd(encoder) => encoder.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::None(writer) => writer.flush(),
+            Self::Gzip(encoder) => encoder.flush(),
+            Self::Deflate(encoder) => encoder.flush(),
+            #[cfg(feature = "brotli")]
+            Self::Brotli(encoder) => encoder.flush(),
+            Self::Zstd(encoder) => encoder.flush(),
+        }
     }
 }
 
+pub(crate) fn decompressor<R: Read + Send + Sync + 'static>(
+    format: CompressionFormat,
+    reader: R,
+) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+    Ok(match format {
+        CompressionFormat::None => Box::new(reader),
+        CompressionFormat::Gzip => Box::new(GzDecoder::new(reader)),
+        CompressionFormat::Deflate => Box::new(DeflateDecoder::new(reader)),
+        #[cfg(feature = "brotli")]
+        CompressionFormat::Brotli => Box::new(brotli::Decompressor::new(reader, BROTLI_PARAMS.0)),
+        CompressionFormat::Zstd => Box::new(zstd::stream::read::Decoder::new(reader)?),
+        #[allow(unreachable_patterns)]
+        other => return Err(other.unsupported()),
+    })
+}
+
+fn invalid(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+/// Rejects names that could escape their directory on restore. Backslash is only a separator on
+/// Windows; on Unix it is a normal filename byte (systemd uses it).
+pub(crate) fn validate_name(name: &str, max_len: usize) -> std::io::Result<()> {
+    let separator = |b: u8| b == b'/' || b == 0 || (cfg!(windows) && b == b'\\');
+    if name.is_empty() || name == "." || name == ".." || name.bytes().any(separator) {
+        return Err(invalid(format!("invalid entry name {name:?}")));
+    }
+    if name.len() > max_len {
+        return Err(invalid(format!(
+            "entry name is {} bytes, limit is {max_len}",
+            name.len()
+        )));
+    }
+    Ok(())
+}
+
 #[inline]
-fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
+pub(crate) fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-
         (_metadata.uid(), _metadata.gid())
     }
     #[cfg(not(unix))]
-    {
-        (0, 0)
-    }
+    (0, 0)
 }
 
 /// Limits enforced while decoding an archive from disk.
@@ -82,6 +208,7 @@ fn metadata_owner(_metadata: &Metadata) -> (u32, u32) {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeLimits {
     /// Maximum byte length of any single entry name (file, directory, symlink).
+    /// Above 255 because macOS and Windows count 255 characters, up to 765 bytes of UTF-8.
     pub max_name_len: usize,
     /// Maximum byte length of a symlink target path.
     pub max_target_len: usize,
@@ -94,7 +221,7 @@ pub struct DecodeLimits {
 impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
-            max_name_len: 255,
+            max_name_len: 1024,
             max_target_len: 4096,
             max_depth: 256,
             max_entry_count: 10_000_000,
@@ -113,7 +240,8 @@ pub struct Archive {
     compression_callback: CompressionFormatCallback,
     real_size_callback: RealSizeCallback,
 
-    pub entries: Vec<entries::Entry>,
+    pub entries: Vec<Entry>,
+    /// Where the entry table starts; also the append position for new file content.
     entries_offset: u64,
 }
 
@@ -134,7 +262,6 @@ impl Archive {
         file.set_len(0)?;
         file.write_all(&FILE_SIGNATURE)?;
         file.write_all(&[FILE_VERSION])?;
-        file.sync_all()?;
 
         Ok(Self {
             file: Arc::new(file),
@@ -142,7 +269,7 @@ impl Archive {
             compression_callback: None,
             real_size_callback: None,
             entries: Vec::new(),
-            entries_offset: 8,
+            entries_offset: HEADER_LEN,
         })
     }
 
@@ -154,8 +281,7 @@ impl Archive {
 
     /// Opens an existing archive file with custom decode limits.
     pub fn open_with_limits(path: impl AsRef<Path>, limits: DecodeLimits) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        Self::open_file_with_limits(file, limits)
+        Self::open_file_with_limits(File::open(path)?, limits)
     }
 
     /// Opens an existing archive file for reading and writing.
@@ -167,40 +293,52 @@ impl Archive {
     /// Opens an existing archive file with custom decode limits.
     pub fn open_file_with_limits(mut file: File, limits: DecodeLimits) -> std::io::Result<Self> {
         let len = file.metadata()?.len();
-
-        let mut buffer = [0; 8];
-        file.read_exact(&mut buffer)?;
-        if !buffer.starts_with(&FILE_SIGNATURE) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid file signature",
-            ));
+        if len < HEADER_LEN + FOOTER_LEN {
+            return Err(invalid("archive is too short"));
         }
-        let version = buffer[7];
 
-        file.read_exact_at(len - 16, &mut buffer)?;
-        let entries_count = u64::from_le_bytes(buffer);
-        file.read_exact_at(len - 8, &mut buffer)?;
-        let entries_offset = u64::from_le_bytes(buffer);
-
-        if entries_count as usize > limits.max_entry_count {
+        let mut header = [0; 8];
+        file.read_exact(&mut header)?;
+        if !header.starts_with(&FILE_SIGNATURE) {
+            return Err(invalid("invalid file signature"));
+        }
+        let version = header[7];
+        if version == 0 || version > FILE_VERSION {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "archive entry count {} exceeds limit {}",
-                    entries_count, limits.max_entry_count
-                ),
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported archive version {version}"),
             ));
         }
 
-        let mut entries = Vec::with_capacity(entries_count as usize);
+        let mut footer = [0; 16];
+        file.read_exact_at(len - FOOTER_LEN, &mut footer)?;
+        let entries_count = u64::from_le_bytes(footer[..8].try_into().unwrap());
+        let entries_offset = u64::from_le_bytes(footer[8..].try_into().unwrap());
+
+        if entries_count > limits.max_entry_count as u64 {
+            return Err(invalid(format!(
+                "archive entry count {entries_count} exceeds limit {}",
+                limits.max_entry_count
+            )));
+        }
+        if entries_offset < HEADER_LEN || entries_offset > len - FOOTER_LEN {
+            return Err(invalid("entry table offset is outside the archive"));
+        }
+
         file.seek(SeekFrom::Start(entries_offset))?;
-
-        let mut decoder = DeflateDecoder::new(file.try_clone()?);
+        let table = file.try_clone()?.take(len - FOOTER_LEN - entries_offset);
+        let mut decoder = DeflateDecoder::new(table);
         let file = Arc::new(file);
+
+        let mut entries = Vec::with_capacity(entries_count.min(4096) as usize);
         for _ in 0..entries_count {
-            let entry = Self::decode_entry(&mut decoder, file.clone(), &limits, 0)?;
-            entries.push(entry);
+            entries.push(Self::decode_entry(&mut decoder, &file, &limits, 0)?);
+        }
+        // Entries beyond the footer's count would be ignored and their chunks cleaned away.
+        if decoder.read(&mut [0])? != 0 {
+            return Err(invalid(
+                "entry table holds more entries than the footer counts",
+            ));
         }
 
         Ok(Self {
@@ -226,7 +364,6 @@ impl Archive {
     #[inline]
     pub fn set_compression_callback(&mut self, callback: CompressionFormatCallback) -> &mut Self {
         self.compression_callback = callback;
-
         self
     }
 
@@ -236,7 +373,6 @@ impl Archive {
     #[inline]
     pub fn set_real_size_callback(&mut self, callback: RealSizeCallback) -> &mut Self {
         self.real_size_callback = callback;
-
         self
     }
 
@@ -244,34 +380,44 @@ impl Archive {
     /// This will append the directory to the end of the archive, if this directory already exists, it will not be replaced.
     ///
     /// After this function is called, the existing header will be trimmed to the end of the archive, then readded upon completion.
-    ///
-    /// # Panics
-    /// This function will panic if any filename is not valid UTF-8 or longer than 255 bytes.
     pub fn add_directory(
         &mut self,
         path: &str,
         progress: ProgressCallback,
     ) -> std::io::Result<&mut Self> {
+        let entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        self.add_entries(entries, progress)
+    }
+
+    /// Adds a single file entry to the archive. (including subdirectories)
+    /// This will append the entry to the end of the archive, if this entry already exists, it will not be replaced.
+    ///
+    /// After this function is called, the existing header will be trimmed to the end of the archive, then readded upon completion.
+    pub fn add_entries(
+        &mut self,
+        entries: Vec<DirEntry>,
+        progress: ProgressCallback,
+    ) -> std::io::Result<&mut Self> {
         self.trim_end_header()?;
 
-        for entry in std::fs::read_dir(path)?.flatten() {
-            self.encode_entry(None, entry, progress.clone())?;
+        for entry in entries {
+            let entry = self.encode_entry(entry, &progress)?;
+            self.entries.push(entry);
         }
 
         self.write_end_header()?;
-
         Ok(self)
     }
 
     /// Returns the entries in the archive.
     #[inline]
-    pub fn entries(&self) -> &[entries::Entry] {
+    pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
     /// Consumes the archive and returns the entries.
     #[inline]
-    pub fn into_entries(self) -> Vec<entries::Entry> {
+    pub fn into_entries(self) -> Vec<Entry> {
         self.entries
     }
 
@@ -292,199 +438,46 @@ impl Archive {
         mtime: SystemTime,
         owner: (u32, u32),
         compression: CompressionFormat,
-    ) -> std::io::Result<Box<entries::FileEntry>> {
-        let offset = self.file.stream_position()?;
+    ) -> std::io::Result<Box<FileEntry>> {
+        let name = name.into();
+        validate_name(&name, DecodeLimits::default().max_name_len)?;
 
-        let mut buffer = [0; 4096];
-        let mut bytes_read = 0;
-        let mut total_bytes = 0;
-        match compression {
-            CompressionFormat::None => {
-                loop {
-                    self.file.write_all(&buffer[..bytes_read])?;
-                    total_bytes += bytes_read;
+        let offset = self.entries_offset;
+        (&*self.file).seek(SeekFrom::Start(offset))?;
+        let mut encoder = Compressor::new(compression, &*self.file)?;
+        let mut buffer = [0; 65536];
+        let mut size = 0u64;
 
-                    bytes_read = reader.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                }
-
-                self.file.flush()?;
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
             }
-            CompressionFormat::Gzip => {
-                let mut encoder = GzEncoder::new(&mut self.file, flate2::Compression::default());
-                loop {
-                    encoder.write_all(&buffer[..bytes_read])?;
-                    total_bytes += bytes_read;
-
-                    bytes_read = reader.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                }
-
-                encoder.flush()?;
-                encoder.finish()?;
-            }
-            CompressionFormat::Deflate => {
-                let mut encoder =
-                    DeflateEncoder::new(&mut self.file, flate2::Compression::default());
-                loop {
-                    encoder.write_all(&buffer[..bytes_read])?;
-                    total_bytes += bytes_read;
-
-                    bytes_read = reader.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                }
-
-                encoder.flush()?;
-                encoder.finish()?;
-            }
-
-            #[cfg(feature = "brotli")]
-            CompressionFormat::Brotli => {
-                let mut encoder = brotli::CompressorWriter::new(&mut self.file, 4096, 11, 22);
-                loop {
-                    encoder.write_all(&buffer[..bytes_read])?;
-                    total_bytes += bytes_read;
-
-                    bytes_read = reader.read(&mut buffer)?;
-                    if bytes_read == 0 {
-                        break;
-                    }
-                }
-            }
-            #[cfg(not(feature = "brotli"))]
-            CompressionFormat::Brotli => {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "Brotli support is not enabled. Please enable the 'brotli' feature.",
-                ))?;
-            }
+            encoder.write_all(&buffer[..bytes_read])?;
+            size += bytes_read as u64;
         }
+        encoder.finish()?;
 
+        self.entries_offset = (&*self.file).stream_position()?;
         let size_compressed = match compression {
             CompressionFormat::None => None,
-            _ => Some(self.file.stream_position()? - offset),
+            _ => Some(self.entries_offset - offset),
         };
-        let size_real = size_real.unwrap_or(total_bytes as u64);
 
-        let entry = Box::new(entries::FileEntry {
-            name: name.into(),
+        Ok(Box::new(FileEntry {
+            name,
             mode,
-            file: self.file.clone(),
             owner,
             mtime,
-            decoder: None,
-            size_compressed,
-            size_real,
-            size: total_bytes as u64,
-            offset,
-            consumed: 0,
             compression,
-        });
-
-        self.entries_offset = self.file.stream_position()?;
-
-        Ok(entry)
-    }
-
-    /// Adds a single file entry to the archive. (including subdirectories)
-    /// This will append the entry to the end of the archive, if this entry already exists, it will not be replaced.
-    ///
-    /// After this function is called, the existing header will be trimmed to the end of the archive, then readded upon completion.
-    ///
-    /// # Panics
-    /// This function will panic if any filename is not valid UTF-8 or longer than 255 bytes.
-    pub fn add_entries(
-        &mut self,
-        entries: Vec<DirEntry>,
-        progress: ProgressCallback,
-    ) -> std::io::Result<&mut Self> {
-        self.trim_end_header()?;
-
-        for entry in entries {
-            self.encode_entry(None, entry, progress.clone())?;
-        }
-
-        self.write_end_header()?;
-
-        Ok(self)
-    }
-
-    fn recursive_find_archive_entry<'a>(
-        entry: &'a entries::Entry,
-        entry_parts: &[&OsStr],
-        current_depth: usize,
-    ) -> Option<&'a entries::Entry> {
-        if entry_parts.len() > current_depth + 1 {
-            return None;
-        }
-
-        let current_part = entry_parts.first()?;
-        let entry_name: &OsStr = entry.name().as_ref();
-        if entry_name != *current_part {
-            return None;
-        }
-
-        if entry_parts.len() == 1 {
-            return Some(entry);
-        }
-
-        if let entries::Entry::Directory(dir_entry) = entry {
-            let remaining_parts = &entry_parts[1..];
-
-            for sub_entry in &dir_entry.entries {
-                if let Some(found) = Self::recursive_find_archive_entry(
-                    sub_entry,
-                    remaining_parts,
-                    current_depth - 1,
-                ) {
-                    return Some(found);
-                }
-            }
-        }
-
-        None
-    }
-
-    fn recursive_find_archive_entry_mut<'a>(
-        entry: &'a mut entries::Entry,
-        entry_parts: &[&OsStr],
-        current_depth: usize,
-    ) -> Option<&'a mut entries::Entry> {
-        if entry_parts.len() > current_depth + 1 {
-            return None;
-        }
-
-        let current_part = entry_parts.first()?;
-        let entry_name: &OsStr = entry.name().as_ref();
-        if entry_name != *current_part {
-            return None;
-        }
-
-        if entry_parts.len() == 1 {
-            return Some(entry);
-        }
-
-        if let entries::Entry::Directory(dir_entry) = entry {
-            let remaining_parts = &entry_parts[1..];
-
-            for sub_entry in &mut dir_entry.entries {
-                if let Some(found) = Self::recursive_find_archive_entry_mut(
-                    sub_entry,
-                    remaining_parts,
-                    current_depth - 1,
-                ) {
-                    return Some(found);
-                }
-            }
-        }
-
-        None
+            size_compressed,
+            size_real: size_real.unwrap_or(size),
+            size,
+            file: Arc::clone(&self.file),
+            offset,
+            decoder: None,
+            consumed: 0,
+        }))
     }
 
     /// Finds an entry in the archive by name.
@@ -492,20 +485,21 @@ impl Archive {
     /// The entry name is the path inside the archive.
     /// Example: "world/user/level.dat" would be a valid entry name.
     #[inline]
-    pub fn find_archive_entry(&self, entry_name: &Path) -> Option<&entries::Entry> {
-        let entry_parts = entry_name
-            .components()
-            .map(|c| c.as_os_str())
-            .collect::<Vec<&OsStr>>();
-        for entry in self.entries() {
-            if let Some(found) =
-                Self::recursive_find_archive_entry(entry, &entry_parts, entry_parts.len())
-            {
-                return Some(found);
-            }
+    pub fn find_archive_entry(&self, entry_name: &Path) -> Option<&Entry> {
+        let mut parts = entry_name.components().map(|c| c.as_os_str());
+        let first = parts.next()?;
+        let mut entry = self
+            .entries
+            .iter()
+            .find(|e| OsStr::new(e.name()) == first)?;
+        for part in parts {
+            let Entry::Directory(dir) = entry else {
+                return None;
+            };
+            entry = dir.entries.iter().find(|e| OsStr::new(e.name()) == part)?;
         }
 
-        None
+        Some(entry)
     }
 
     /// Finds an entry in the archive by name.
@@ -513,113 +507,91 @@ impl Archive {
     /// The entry name is the path inside the archive.
     /// Example: "world/user/level.dat" would be a valid entry name.
     #[inline]
-    pub fn find_archive_entry_mut(&mut self, entry_name: &Path) -> Option<&mut entries::Entry> {
-        let entry_parts = entry_name
-            .components()
-            .map(|c| c.as_os_str())
-            .collect::<Vec<&OsStr>>();
-        for entry in &mut self.entries {
-            if let Some(found) =
-                Self::recursive_find_archive_entry_mut(entry, &entry_parts, entry_parts.len())
-            {
-                return Some(found);
-            }
+    pub fn find_archive_entry_mut(&mut self, entry_name: &Path) -> Option<&mut Entry> {
+        let mut parts = entry_name.components().map(|c| c.as_os_str());
+        let first = parts.next()?;
+        let mut entry = self
+            .entries
+            .iter_mut()
+            .find(|e| OsStr::new(e.name()) == first)?;
+        for part in parts {
+            let Entry::Directory(dir) = entry else {
+                return None;
+            };
+            entry = dir
+                .entries
+                .iter_mut()
+                .find(|e| OsStr::new(e.name()) == part)?;
         }
 
-        None
+        Some(entry)
     }
 
     pub fn trim_end_header(&mut self) -> std::io::Result<()> {
-        if self.entries_offset == 0 {
-            return Ok(());
-        }
-
-        self.file.set_len(self.entries_offset)?;
-        self.file.flush()?;
-        self.file.seek(SeekFrom::Start(self.entries_offset))?;
-
-        Ok(())
+        self.file.set_len(self.entries_offset)
     }
 
     pub fn write_end_header(&mut self) -> std::io::Result<()> {
-        let mut encoder = DeflateEncoder::new(&mut self.file, flate2::Compression::default());
+        let entries_offset = self.entries_offset;
+        let mut file = &*self.file;
+        file.seek(SeekFrom::Start(entries_offset))?;
+
+        let mut encoder = DeflateEncoder::new(file, flate2::Compression::default());
         for entry in &self.entries {
             Self::encode_entry_metadata(&mut encoder, entry)?;
         }
-
-        encoder.flush()?;
         encoder.finish()?;
-        self.file.flush()?;
 
-        self.file
-            .write_all(&(self.entries.len() as u64).to_le_bytes())?;
-        self.file.write_all(&self.entries_offset.to_le_bytes())?;
-        self.file.flush()?;
-        self.file.sync_all()?;
-
-        Ok(())
+        file.write_all(&(self.entries.len() as u64).to_le_bytes())?;
+        file.write_all(&entries_offset.to_le_bytes())?;
+        file.sync_all()
     }
 
-    fn encode_entry_metadata<S: Write>(
-        writer: &mut S,
-        entry: &entries::Entry,
-    ) -> std::io::Result<()> {
+    fn encode_entry_metadata<W: Write>(writer: &mut W, entry: &Entry) -> std::io::Result<()> {
         let name = entry.name();
-        let name_length = name.len() as u8;
+        validate_name(name, DecodeLimits::default().max_name_len)?;
+        varint::encode(writer, name.len() as u64)?;
+        writer.write_all(name.as_bytes())?;
 
-        writer.write_all(&varint::encode_u32(name_length as u32))?;
-
-        let mut buffer = Vec::with_capacity(name.len() + 4);
-        buffer.extend_from_slice(name.as_bytes());
-
-        let mode = entry.mode().bits();
-        let compression = match entry {
-            entries::Entry::File(file_entry) => file_entry.compression,
-            _ => CompressionFormat::None,
+        let (entry_type, compression) = match entry {
+            Entry::File(file) => (0, file.compression),
+            Entry::Directory(_) => (1, CompressionFormat::None),
+            Entry::Symlink(_) => (2, CompressionFormat::None),
         };
-        let entry_type = match entry {
-            entries::Entry::File(_) => 0,
-            entries::Entry::Directory(_) => 1,
-            entries::Entry::Symlink(_) => 2,
-        };
-
-        let type_compression_mode =
-            (entry_type << 30) | ((compression.encode() as u32) << 26) | (mode & 0x3FFFFFFF);
-        buffer.extend_from_slice(&type_compression_mode.to_le_bytes()[..4]);
-
-        writer.write_all(&buffer)?;
+        let type_compression_mode = (entry_type << 30)
+            | ((compression.encode() as u32) << 26)
+            | (entry.mode().bits() & MODE_MASK);
+        writer.write_all(&type_compression_mode.to_le_bytes())?;
 
         let (uid, gid) = entry.owner();
-        writer.write_all(&varint::encode_u32(uid))?;
-        writer.write_all(&varint::encode_u32(gid))?;
+        varint::encode(writer, uid as u64)?;
+        varint::encode(writer, gid as u64)?;
 
         let mtime = entry
             .mtime()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
-        writer.write_all(&varint::encode_u64(mtime.as_secs()))?;
+        varint::encode(writer, mtime.as_secs())?;
 
         match entry {
-            entries::Entry::File(file_entry) => {
-                writer.write_all(&varint::encode_u64(file_entry.size))?;
-
-                if let Some(size_compressed) = file_entry.size_compressed {
-                    writer.write_all(&varint::encode_u64(size_compressed))?;
+            Entry::File(file) => {
+                varint::encode(writer, file.size)?;
+                if let Some(size_compressed) = file.size_compressed {
+                    varint::encode(writer, size_compressed)?;
                 }
-                writer.write_all(&varint::encode_u64(file_entry.size_real))?;
-                writer.write_all(&varint::encode_u64(file_entry.offset))?;
+                varint::encode(writer, file.size_real)?;
+                varint::encode(writer, file.offset)?;
             }
-            entries::Entry::Directory(dir_entry) => {
-                writer.write_all(&varint::encode_u64(dir_entry.entries.len() as u64))?;
-
-                for sub_entry in &dir_entry.entries {
+            Entry::Directory(dir) => {
+                varint::encode(writer, dir.entries.len() as u64)?;
+                for sub_entry in &dir.entries {
                     Self::encode_entry_metadata(writer, sub_entry)?;
                 }
             }
-            entries::Entry::Symlink(link_entry) => {
-                writer.write_all(&varint::encode_u64(link_entry.target.len() as u64))?;
-                writer.write_all(link_entry.target.as_bytes())?;
-                writer.write_all(&[link_entry.target_dir as u8])?;
+            Entry::Symlink(link) => {
+                varint::encode(writer, link.target.len() as u64)?;
+                writer.write_all(link.target.as_bytes())?;
+                writer.write_all(&[link.target_dir as u8])?;
             }
         }
 
@@ -628,284 +600,193 @@ impl Archive {
 
     fn encode_entry(
         &mut self,
-        entries: Option<&mut Vec<entries::Entry>>,
         fs_entry: DirEntry,
-        progress: ProgressCallback,
-    ) -> std::io::Result<()> {
+        progress: &ProgressCallback,
+    ) -> std::io::Result<Entry> {
         let path = fs_entry.path();
-        let Some(file_name) = path.file_name() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid file name",
-            ));
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| invalid(format!("{} is not a valid UTF-8 file name", path.display())))?
+            .to_owned();
+        let metadata = path.symlink_metadata()?;
+        let mode = metadata.permissions().into();
+        let owner = metadata_owner(&metadata);
+        let mtime = metadata.modified()?;
+
+        let entry = if metadata.is_file() {
+            let compression = match &self.compression_callback {
+                Some(callback) => callback(&path, &metadata),
+                None if metadata.len() > 16 => CompressionFormat::Deflate,
+                None => CompressionFormat::None,
+            };
+            let size_real = self
+                .real_size_callback
+                .as_ref()
+                .map_or(metadata.len(), |callback| callback(&path));
+
+            Entry::File(self.write_file_entry(
+                File::open(&path)?,
+                Some(size_real),
+                name,
+                mode,
+                mtime,
+                owner,
+                compression,
+            )?)
+        } else if metadata.is_dir() {
+            let mut entries = Vec::new();
+            for sub_entry in std::fs::read_dir(&path)? {
+                entries.push(self.encode_entry(sub_entry?, progress)?);
+            }
+
+            Entry::Directory(Box::new(DirectoryEntry {
+                name,
+                mode,
+                owner,
+                mtime,
+                entries,
+            }))
+        } else if metadata.is_symlink() {
+            let target = std::fs::read_link(&path)?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| invalid(format!("{} has a non-UTF-8 target", path.display())))?
+                .to_owned();
+
+            Entry::Symlink(Box::new(SymlinkEntry {
+                name,
+                mode,
+                owner,
+                mtime,
+                target,
+                target_dir: path.is_dir(),
+            }))
+        } else {
+            return Err(invalid(format!(
+                "{} is not a file, directory or symlink",
+                path.display()
+            )));
         };
 
-        let metadata = path.symlink_metadata()?;
-
-        if metadata.is_file() {
-            let mut file = File::open(&path)?;
-
-            let compression = match self.compression_callback {
-                Some(ref f) => f(&path, &metadata),
-                None => {
-                    if metadata.len() > 16 {
-                        CompressionFormat::Deflate
-                    } else {
-                        CompressionFormat::None
-                    }
-                }
-            };
-
-            match compression {
-                CompressionFormat::None => {
-                    std::io::copy(&mut file, &mut self.file)?;
-
-                    self.file.flush()?;
-                }
-                CompressionFormat::Gzip => {
-                    let mut encoder =
-                        GzEncoder::new(&mut self.file, flate2::Compression::default());
-                    std::io::copy(&mut file, &mut encoder)?;
-
-                    encoder.flush()?;
-                    encoder.finish()?;
-                }
-                CompressionFormat::Deflate => {
-                    let mut encoder =
-                        DeflateEncoder::new(&mut self.file, flate2::Compression::default());
-                    std::io::copy(&mut file, &mut encoder)?;
-
-                    encoder.flush()?;
-                    encoder.finish()?;
-                }
-
-                #[cfg(feature = "brotli")]
-                CompressionFormat::Brotli => {
-                    let mut encoder = brotli::CompressorWriter::new(&mut self.file, 4096, 11, 22);
-                    std::io::copy(&mut file, &mut encoder)?;
-                }
-                #[cfg(not(feature = "brotli"))]
-                CompressionFormat::Brotli => {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "Brotli support is not enabled. Please enable the 'brotli' feature.",
-                    ))?;
-                }
-            }
-
-            let entry = entries::FileEntry {
-                name: file_name.to_string_lossy().into(),
-                mode: metadata.permissions().into(),
-                file: self.file.clone(),
-                owner: metadata_owner(&metadata),
-                mtime: metadata.modified()?,
-                decoder: None,
-                size_compressed: match compression {
-                    CompressionFormat::None => None,
-                    _ => Some(self.file.stream_position()? - self.entries_offset),
-                },
-                size_real: match self.real_size_callback {
-                    Some(ref f) => f(&path),
-                    None => metadata.len(),
-                },
-                size: metadata.len(),
-                offset: self.entries_offset,
-                consumed: 0,
-                compression,
-            };
-
-            self.entries_offset = self.file.stream_position()?;
-
-            if let Some(entries) = entries {
-                entries.push(entries::Entry::File(Box::new(entry)));
-            } else {
-                self.entries.push(entries::Entry::File(Box::new(entry)));
-            }
-        } else if metadata.is_dir() {
-            let mut dir_entries = Vec::new();
-            for entry in std::fs::read_dir(&path)?.flatten() {
-                self.encode_entry(Some(&mut dir_entries), entry, progress.clone())?;
-            }
-
-            let dir_entry = entries::DirectoryEntry {
-                name: file_name.to_string_lossy().into(),
-                mode: metadata.permissions().into(),
-                owner: metadata_owner(&metadata),
-                mtime: metadata.modified()?,
-                entries: dir_entries,
-            };
-
-            if let Some(entries) = entries {
-                entries.push(entries::Entry::Directory(Box::new(dir_entry)));
-            } else {
-                self.entries
-                    .push(entries::Entry::Directory(Box::new(dir_entry)));
-            }
-        } else if metadata.is_symlink()
-            && let Ok(Ok(target)) = std::fs::read_link(&path).map(|p| p.canonicalize())
-        {
-            let target = target.to_string_lossy().to_string();
-
-            let link_entry = entries::SymlinkEntry {
-                name: file_name.to_string_lossy().into(),
-                mode: metadata.permissions().into(),
-                owner: metadata_owner(&metadata),
-                mtime: metadata.modified()?,
-                target,
-                target_dir: std::fs::metadata(&path)?.is_dir(),
-            };
-
-            if let Some(entries) = entries {
-                entries.push(entries::Entry::Symlink(Box::new(link_entry)));
-            } else {
-                self.entries
-                    .push(entries::Entry::Symlink(Box::new(link_entry)));
-            }
+        if let Some(progress) = progress {
+            progress(&path);
         }
 
-        if let Some(f) = progress {
-            f(&path)
-        }
-
-        Ok(())
+        Ok(entry)
     }
 
-    fn decode_entry<S: Read>(
-        decoder: &mut S,
-        file: Arc<File>,
+    fn decode_entry<R: Read>(
+        decoder: &mut R,
+        file: &Arc<File>,
         limits: &DecodeLimits,
         depth: usize,
-    ) -> std::io::Result<entries::Entry> {
+    ) -> std::io::Result<Entry> {
         let name_length = varint::decode_u32(decoder)? as usize;
-
         if name_length > limits.max_name_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "entry name length {} exceeds limit {}",
-                    name_length, limits.max_name_len
-                ),
-            ));
+            return Err(invalid(format!(
+                "entry name length {name_length} exceeds limit {}",
+                limits.max_name_len
+            )));
         }
 
-        let mut name_bytes = vec![0; name_length];
-        decoder.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut name = vec![0; name_length];
+        decoder.read_exact(&mut name)?;
+        let name = String::from_utf8(name).map_err(|e| invalid(e.to_string()))?;
+        validate_name(&name, limits.max_name_len)?;
 
-        let mut type_mode_bytes = [0; 4];
-        decoder.read_exact(&mut type_mode_bytes)?;
-        let type_compression_mode = u32::from_le_bytes(type_mode_bytes);
+        let mut type_mode = [0; 4];
+        decoder.read_exact(&mut type_mode)?;
+        let type_compression_mode = u32::from_le_bytes(type_mode);
 
-        let entry_type = (type_compression_mode >> 30) & 0b11;
+        let entry_type = type_compression_mode >> 30;
         let compression =
-            CompressionFormat::try_decode(((type_compression_mode >> 26) & 0b1111) as u8)?;
-        let mode = EntryMode::from(type_compression_mode & 0x3FFFFFFF);
+            CompressionFormat::try_decode(((type_compression_mode >> 26) & 0xF) as u8)?;
+        let mode = EntryMode::from(type_compression_mode & MODE_MASK);
 
         let uid = varint::decode_u32(decoder)?;
         let gid = varint::decode_u32(decoder)?;
-
-        let mtime = varint::decode_u64(decoder)?;
-        let mtime = SystemTime::UNIX_EPOCH + std::time::Duration::new(mtime, 0);
-
-        let size = varint::decode_u64(decoder)?;
+        let mtime = SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(varint::decode(decoder)?))
+            .ok_or_else(|| invalid("entry timestamp is out of range"))?;
+        let size = varint::decode(decoder)?;
 
         match entry_type {
             0 => {
                 let size_compressed = match compression {
                     CompressionFormat::None => None,
-                    _ => Some(varint::decode_u64(decoder)?),
+                    _ => Some(varint::decode(decoder)?),
                 };
-                let size_real = varint::decode_u64(decoder)?;
-                let offset = varint::decode_u64(decoder)?;
+                let size_real = varint::decode(decoder)?;
+                let offset = varint::decode(decoder)?;
 
-                Ok(entries::Entry::File(Box::new(entries::FileEntry {
+                Ok(Entry::File(Box::new(FileEntry {
                     name,
                     mode,
                     owner: (uid, gid),
                     mtime,
-                    file,
-                    decoder: None,
+                    compression,
                     size_compressed,
                     size_real,
                     size,
+                    file: Arc::clone(file),
                     offset,
+                    decoder: None,
                     consumed: 0,
-                    compression,
                 })))
             }
             1 => {
-                let child_count = size as usize;
-
-                if child_count > limits.max_entry_count {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "directory child count {} exceeds limit {}",
-                            child_count, limits.max_entry_count
-                        ),
-                    ));
+                if size > limits.max_entry_count as u64 {
+                    return Err(invalid(format!(
+                        "directory child count {size} exceeds limit {}",
+                        limits.max_entry_count
+                    )));
                 }
-
                 if depth >= limits.max_depth {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("directory nesting exceeded limit {}", limits.max_depth),
-                    ));
+                    return Err(invalid(format!(
+                        "directory nesting exceeds limit {}",
+                        limits.max_depth
+                    )));
                 }
 
-                let mut entries: Vec<entries::Entry> = Vec::with_capacity(child_count);
-                for _ in 0..child_count {
-                    let entry = Self::decode_entry(decoder, file.clone(), limits, depth + 1)?;
-                    entries.push(entry);
+                let mut entries = Vec::with_capacity(size.min(4096) as usize);
+                for _ in 0..size {
+                    entries.push(Self::decode_entry(decoder, file, limits, depth + 1)?);
                 }
 
-                Ok(entries::Entry::Directory(Box::new(
-                    entries::DirectoryEntry {
-                        name,
-                        mode,
-                        owner: (uid, gid),
-                        mtime,
-                        entries,
-                    },
-                )))
+                Ok(Entry::Directory(Box::new(DirectoryEntry {
+                    name,
+                    mode,
+                    owner: (uid, gid),
+                    mtime,
+                    entries,
+                })))
             }
             2 => {
-                let target_len = size as usize;
-
-                if target_len > limits.max_target_len {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "symlink target length {} exceeds limit {}",
-                            target_len, limits.max_target_len
-                        ),
-                    ));
+                if size > limits.max_target_len as u64 {
+                    return Err(invalid(format!(
+                        "symlink target length {size} exceeds limit {}",
+                        limits.max_target_len
+                    )));
                 }
 
-                let mut target_bytes = vec![0; target_len];
-                decoder.read_exact(&mut target_bytes)?;
+                let mut target = vec![0; size as usize];
+                decoder.read_exact(&mut target)?;
+                let target = String::from_utf8(target).map_err(|e| invalid(e.to_string()))?;
 
-                let target = String::from_utf8(target_bytes)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                let mut target_dir = [0; 1];
+                decoder.read_exact(&mut target_dir)?;
 
-                let mut target_dir_bytes = [0; 1];
-                decoder.read_exact(&mut target_dir_bytes)?;
-                let target_dir = target_dir_bytes[0] != 0;
-
-                Ok(entries::Entry::Symlink(Box::new(entries::SymlinkEntry {
+                Ok(Entry::Symlink(Box::new(SymlinkEntry {
                     name,
                     mode,
                     owner: (uid, gid),
                     mtime,
                     target,
-                    target_dir,
+                    target_dir: target_dir[0] != 0,
                 })))
             }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid entry type",
-            )),
+            _ => Err(invalid("invalid entry type")),
         }
     }
 }

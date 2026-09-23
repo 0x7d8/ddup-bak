@@ -1,14 +1,24 @@
+// Package ddupbak wraps libddupbak, a deduplicating backup repository.
+//
+// Build the C library with `cargo build --release` in the `c` directory and point cgo at it:
+//
+//	CGO_CFLAGS="-I/path/to/ddup-bak/c/include" CGO_LDFLAGS="-L/path/to/ddup-bak/target/release"
+//
+// Callbacks may run concurrently on library worker threads.
 package ddupbak
 
 /*
 #cgo LDFLAGS: -lddupbak
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <libddupbak.h>
 */
 import "C"
+
 import (
+	"encoding/binary"
 	"errors"
+	"runtime/cgo"
 	"unsafe"
 )
 
@@ -20,6 +30,15 @@ const (
 	CompressionGzip    CompressionFormat = 1
 	CompressionDeflate CompressionFormat = 2
 	CompressionBrotli  CompressionFormat = 3
+	CompressionZstd    CompressionFormat = 4
+)
+
+// HashAlgorithm is the chunk hash of a repository, fixed at creation.
+type HashAlgorithm uint8
+
+const (
+	HashBlake2b256 HashAlgorithm = 0 // default
+	HashBlake3     HashAlgorithm = 1
 )
 
 // EntryType defines the type of a filesystem entry
@@ -31,49 +50,144 @@ const (
 	EntryTypeSymlink   EntryType = 2
 )
 
-// Error handling - converting C integer return values to Go errors
-func cErrorToGoError(code C.int) error {
-	if code == 0 {
+// ChunkHash is the 256-bit hash identifying a chunk.
+type ChunkHash [32]byte
+
+// ID is the first 8 bytes of the hash, passed to DeletionProgressCallback as chunkID.
+func (h ChunkHash) ID() uint64 {
+	return binary.LittleEndian.Uint64(h[:8])
+}
+
+// ProgressCallback is a callback for tracking progress operations (chunking, archiving, restoring)
+type ProgressCallback func(path string)
+
+type (
+	// ChunkingProgressCallback is a callback for tracking chunking progress
+	ChunkingProgressCallback = ProgressCallback
+
+	// ArchivingProgressCallback is a callback for tracking archiving progress
+	ArchivingProgressCallback = ProgressCallback
+
+	// RestoringProgressCallback is a callback for tracking restoring progress
+	RestoringProgressCallback = ProgressCallback
+)
+
+// DeletionProgressCallback is a callback for tracking deletion progress
+type DeletionProgressCallback func(chunkID uint64, deleted bool)
+
+// CleaningProgressCallback is a callback for tracking cleaning progress
+type CleaningProgressCallback = DeletionProgressCallback
+
+// RebuildProgressCallback is called for every chunk with its reference count during a rebuild.
+type RebuildProgressCallback func(hash ChunkHash, references uint64)
+
+// CompressionFormatCallback is a callback for determining the compression format
+type CompressionFormatCallback func(path string) CompressionFormat
+
+// CompressionCallback determines the compression format for a file
+type CompressionCallback func(path string, size uint64) CompressionFormat
+
+// RealSizeCallback determines the real size of a file before compression
+type RealSizeCallback func(path string) uint64
+
+type callbacks struct {
+	progress    ProgressCallback
+	archiving   ProgressCallback
+	deletion    DeletionProgressCallback
+	rebuild     RebuildProgressCallback
+	compression CompressionFormatCallback
+	archiveComp CompressionCallback
+	realSize    RealSizeCallback
+}
+
+// userData stores a cgo.Handle to cb in C memory for use as user_data. The returned func frees both.
+func userData(cb *callbacks) (C.CUserData, func()) {
+	handle := cgo.NewHandle(cb)
+	cell := (*C.uintptr_t)(C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
+	*cell = C.uintptr_t(handle)
+
+	return C.CUserData(unsafe.Pointer(cell)), func() {
+		C.free(unsafe.Pointer(cell))
+		handle.Delete()
+	}
+}
+
+func userCallbacks(data unsafe.Pointer) *callbacks {
+	return cgo.Handle(*(*C.uintptr_t)(data)).Value().(*callbacks)
+}
+
+func hashOf(hash *C.uint8_t) ChunkHash {
+	return *(*ChunkHash)(unsafe.Pointer(hash))
+}
+
+//export goProgressCallback
+func goProgressCallback(path *C.char, data unsafe.Pointer) {
+	cbs := userCallbacks(data)
+	if cbs.progress != nil || cbs.archiving != nil {
+		p := C.GoString(path)
+		if cbs.progress != nil {
+			cbs.progress(p)
+		}
+		if cbs.archiving != nil {
+			cbs.archiving(p)
+		}
+	}
+}
+
+//export goDeletionCallback
+func goDeletionCallback(hash *C.uint8_t, deleted C.bool, data unsafe.Pointer) {
+	if cb := userCallbacks(data).deletion; cb != nil {
+		cb(hashOf(hash).ID(), bool(deleted))
+	}
+}
+
+//export goRebuildCallback
+func goRebuildCallback(hash *C.uint8_t, references C.uint64_t, data unsafe.Pointer) {
+	if cb := userCallbacks(data).rebuild; cb != nil {
+		cb(hashOf(hash), uint64(references))
+	}
+}
+
+//export goCompressionCallback
+func goCompressionCallback(path *C.char, size C.uint64_t, data unsafe.Pointer) C.CCompressionFormat {
+	cbs := userCallbacks(data)
+	if cbs.compression != nil {
+		return C.CCompressionFormat(cbs.compression(C.GoString(path)))
+	}
+	if cbs.archiveComp != nil {
+		return C.CCompressionFormat(cbs.archiveComp(C.GoString(path), uint64(size)))
+	}
+	return C.CCompressionFormat(CompressionDeflate)
+}
+
+//export goRealSizeCallback
+func goRealSizeCallback(path *C.char, data unsafe.Pointer) C.uint64_t {
+	if cb := userCallbacks(data).realSize; cb != nil {
+		return C.uint64_t(cb(C.GoString(path)))
+	}
+	return 0
+}
+
+func lastError(fallback string) error {
+	if message := C.GoString(C.last_error()); message != "" {
+		return errors.New(message)
+	}
+	return errors.New(fallback)
+}
+
+func cString(value string) *C.char {
+	return C.CString(value)
+}
+
+func optionalCString(value *string) *C.char {
+	if value == nil || *value == "" {
 		return nil
 	}
-	return errors.New("ddupbak operation failed")
+	return C.CString(*value)
 }
 
-// Helper function to convert Go string array to C string array
-func goStringsToCStrings(strings []string) (**C.char, func()) {
-	if len(strings) == 0 {
-		return nil, func() {}
+func freeCString(value *C.char) {
+	if value != nil {
+		C.free(unsafe.Pointer(value))
 	}
-
-	cStrings := C.malloc(C.size_t(len(strings)) * C.size_t(unsafe.Sizeof(uintptr(0))))
-	for i, str := range strings {
-		cStr := C.CString(str)
-		ptr := (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cStrings)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
-		*ptr = cStr
-	}
-
-	cleanup := func() {
-		for i := 0; i < len(strings); i++ {
-			ptr := (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cStrings)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
-			C.free(unsafe.Pointer(*ptr))
-		}
-		C.free(unsafe.Pointer(cStrings))
-	}
-
-	return (**C.char)(cStrings), cleanup
-}
-
-// Helper function to convert C string array to Go string array
-func cStringsToGoStrings(cArray **C.char, count C.uint) []string {
-	if cArray == nil || count == 0 {
-		return []string{}
-	}
-
-	result := make([]string, count)
-	for i := 0; i < int(count); i++ {
-		ptr := (**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cArray)) + uintptr(i)*unsafe.Sizeof(uintptr(0))))
-		result[i] = C.GoString(*ptr)
-	}
-
-	return result
 }

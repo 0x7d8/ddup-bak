@@ -1,15 +1,17 @@
 [package]
 name = "libddupbak"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 name = "ddupbak"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-ddup-bak = { path = ".." }
+# No CLI dependencies, but brotli as well as the always-present zstd, so a consumer of the C
+# library can open every repository the binary can.
+ddup-bak = { path = "..", default-features = false, features = ["brotli"] }
 ignore = "0.4.23"
 
 [build-dependencies]
-cbindgen = "0.24.0"
+cbindgen = "0.29"

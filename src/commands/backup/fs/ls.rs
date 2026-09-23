@@ -319,7 +319,7 @@ fn render_entries(mut entries: Vec<&Entry>) -> std::io::Result<()> {
 }
 
 pub fn ls(name: &str, matches: &ArgMatches) -> std::io::Result<i32> {
-    let repository = open_repository(false);
+    let repository = open_repository();
     let path = matches.get_one::<String>("path");
 
     if !repository

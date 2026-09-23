@@ -15,6 +15,7 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
             name.cyan(),
             "does not exist!".red()
         );
+
         return Ok(1);
     }
 
@@ -34,6 +35,7 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
         name,
         Some({
             let progress = progress.clone();
+
             Arc::new(move |hash, deleted| {
                 progress.set_text(format!(
                     "{} {}",
@@ -49,6 +51,7 @@ pub fn delete(matches: &ArgMatches) -> std::io::Result<i32> {
     )?;
 
     progress.finish();
+
     println!(
         "{} {}",
         "deleting backup...".bright_black(),

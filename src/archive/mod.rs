@@ -29,8 +29,9 @@ pub(crate) const ZSTD_LEVEL: i32 = 3;
 #[cfg(feature = "brotli")]
 const BROTLI_PARAMS: (usize, u32, u32) = (4096, 11, 22);
 
-/// Ids are stored on disk in archive entries and chunk files. Reading Brotli data without the
-/// `brotli` feature fails with `ErrorKind::Unsupported`.
+/// Compression of an archive entry or chunk. The ids are stored on disk in archive entries and
+/// chunk files. Reading Brotli data without the `brotli` feature fails with
+/// `ErrorKind::Unsupported`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompressionFormat {
@@ -61,9 +62,8 @@ impl CompressionFormat {
     /// Whether this build can compress and decompress the format.
     pub const fn is_supported(&self) -> bool {
         match self {
-            Self::None | Self::Gzip | Self::Deflate => true,
+            Self::None | Self::Gzip | Self::Deflate | Self::Zstd => true,
             Self::Brotli => cfg!(feature = "brotli"),
-            Self::Zstd => true,
         }
     }
 

@@ -8,6 +8,7 @@ use crate::{
 use dashmap::DashMap;
 use flate2::read::DeflateDecoder;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs::File,
     io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
@@ -577,8 +578,10 @@ fn entry_body(entry: &mut FileEntry) -> std::io::Result<Vec<u8>> {
 }
 
 thread_local! {
-    static ZSTD_COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> = const { std::cell::RefCell::new(None) };
-    static ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { std::cell::RefCell::new(None) };
+    static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { RefCell::new(None) };
+    static ZSTD_DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
 }
 
 pub(crate) fn write_chunk(

@@ -2,7 +2,7 @@ use super::ChunkHash;
 use std::{
     fs::File,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -53,7 +53,7 @@ impl ChunkStorage for ChunkStorageLocal {
         &self,
         chunk: &ChunkHash,
     ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
-        Ok(Box::new(std::fs::File::open(
+        Ok(Box::new(File::open(
             self.0.join(self.path_from_chunk(chunk)),
         )?))
     }
@@ -192,7 +192,7 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
 }
 
 /// A regular file with at least the format byte. Empty ones, left by a crash, get rewritten.
-fn is_chunk_file(path: &std::path::Path) -> bool {
+fn is_chunk_file(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
 }

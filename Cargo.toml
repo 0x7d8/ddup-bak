@@ -26,15 +26,15 @@ required-features = ["cli"]
 
 [dependencies]
 blake2 = "0.10.6"
-blake3 = "1"
+blake3 = "1.8.7"
 flate2 = "1.1.1"
 positioned-io = "0.3.4"
 rayon = "1.10.0"
 dashmap = { version = "6.1.0", features = ["inline"] }
 ignore = "0.4.23"
 parking_lot = "0.12.5"
-same-file = "1"
-zstd = "0.13"
+same-file = "1.0.6"
+zstd = "0.13.3"
 brotli = { version = "8.0.0", optional = true }
 fastcdc = "4.0.1"
 
@@ -47,5 +47,4 @@ chrono = { version = "0.4.40", optional = true }
 tar = { version = "0.4.44", optional = true }
 
 [dev-dependencies]
-libc = "0.2.172"
 tempfile = "3.27.0"

@@ -225,13 +225,12 @@ impl Repository {
     /// Migrates every format 1 archive through `ids`, skipping damaged ones. Returns whether any
     /// were skipped.
     fn migrate_archives(&self, ids: &HashMap<u64, ChunkHash>) -> std::io::Result<bool> {
-        let damaged = chunks::is_damage;
         let mut remaining = false;
         for name in self.list_archives()? {
             let path = self.archive_path(&name)?;
             let archive = match Archive::open(&path) {
                 Ok(archive) => archive,
-                Err(err) if damaged(&err) => {
+                Err(err) if chunks::is_damage(&err) => {
                     remaining = true;
                     continue;
                 }
@@ -256,7 +255,7 @@ impl Repository {
                 .and_then(|()| std::fs::rename(&tmp_path, &path));
             if let Err(err) = result {
                 let _ = std::fs::remove_file(&tmp_path);
-                if !damaged(&err) {
+                if !chunks::is_damage(&err) {
                     return Err(err);
                 }
                 remaining = true;
@@ -336,7 +335,7 @@ impl Repository {
         Ok(())
     }
 
-    /// See `save`.
+    /// No-op kept for compatibility; the index is never held back until drop.
     #[inline]
     pub const fn set_save_on_drop(&mut self, _save_on_drop: bool) -> &mut Self {
         self
@@ -809,8 +808,8 @@ impl Repository {
         Ok(())
     }
 
-    /// While the reader is open, `clean`, `delete_archive` and `rebuild` in this process fail with
-    /// `WouldBlock`.
+    /// Opens a streaming reader over a file entry's content. While the reader is open, `clean`,
+    /// `delete_archive` and `rebuild` in this process fail with `WouldBlock`.
     pub fn entry_reader(&self, entry: Entry) -> std::io::Result<EntryReader> {
         let lock = Lock::reader(&self.chunks_lock_path())?;
         self.entry_reader_with(entry, lock)
@@ -1291,16 +1290,15 @@ pub fn remove_restored(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        {
-            let mode = metadata.permissions().mode();
-            if mode & 0o700 != 0o700 {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700))?;
-            }
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?.path();
-                if entry.symlink_metadata()?.is_dir() {
-                    remove_restored(&entry)?;
-                }
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode | 0o700))?;
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?.path();
+            if entry.symlink_metadata()?.is_dir() {
+                remove_restored(&entry)?;
             }
         }
     }

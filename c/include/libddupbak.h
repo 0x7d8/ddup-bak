@@ -200,7 +200,7 @@ int repository_save(struct CRepository *repo);
 /**
  * Kept for callers of older versions; has no effect.
  */
-struct CRepository *repository_set_save_on_drop(struct CRepository *repo, bool _save_on_drop);
+struct CRepository *repository_set_save_on_drop(struct CRepository *repo, bool save_on_drop);
 
 struct CRepository *open_repository(const char *directory, const char *chunks_directory);
 

@@ -111,7 +111,7 @@ not require reading file data
 archives inside a repository (`.ddup-bak/archives/*.ddup`) do not store file data inline. the content of every
 file entry is a list of 32-byte chunk hashes (compression_format 0), and the "real" size is the size of the
 original file. the chunks themselves live in `.ddup-bak/chunks/<xx>/<yy>/<rest>.chunk`, named by the hex hash
-of their uncompressed content, prefixed with one compression_format byte.
+of their uncompressed content. each chunk file starts with one compression_format byte followed by the data.
 
 the hash is either BLAKE2b-256 (`0`, the default) or BLAKE3-256 (`1`), chosen when the repository is created
 and fixed for its lifetime, since chunk files are named by it.
@@ -126,8 +126,9 @@ and fixed for its lifetime, since chunk files are named by it.
 `...entry      ` - `u8[32]` chunk hash followed by `varint(u64)` reference count<br>
 `    u8[32]     ` - BLAKE3 hash of everything above, checked when the index is loaded
 
-three older index formats are still read: `DDUPIDX3`, the same without the trailing hash; `DDUPIDX2`, a deflate stream with the same fields minus the hash
-algorithm byte and always BLAKE3-256, and format 1, a deflate stream keyed by index-assigned chunk ids.
+three older index formats are still read: `DDUPIDX3`, the same without the trailing hash; `DDUPIDX2`, a
+deflate stream with the same fields minus the hash algorithm byte and always BLAKE3-256, and format 1, a
+deflate stream keyed by index-assigned chunk ids.
 
 deleting an archive moves it to `.ddup-bak/deleting/<name>.ddup` (`<name>.ddup.1` and so on while that
 is taken, with no name at all if that would not fit), removes the chunks only it referenced, saves the
@@ -156,11 +157,12 @@ inspect and recover any retained `previous` entries before manually removing the
 directory. a process killed during publication can leave a mixture of old and new entries;
 this rollback protocol is not a whole-directory atomic swap or a power-loss guarantee. other
 writers, including restores from another repository, must not modify the same destination during
-publication. the non-replacing `restore_archive_to` / `restore_entries_to` APIs retain their
-existing behavior: they do not overwrite existing destination paths.
+publication. the non-replacing `restore_archive_to` / `restore_entries_to` APIs never overwrite or
+follow existing destination paths.
 
 ### changes from version 1
 
 version 1 repository archives referenced chunks by index-assigned ids. opening such a repository rewrites its
 archives and index into version 2 in place before anything else reads them.
-entry names are validated on read and write: they must be non-empty, not `.` or `..`, and contain no `/`, `\` or NUL.
+entry names are validated on read and write: they must be non-empty, not `.` or `..`, and contain no `/` or NUL.
+on windows `\` is rejected as well, since it separates paths there.

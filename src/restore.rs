@@ -1,8 +1,5 @@
-//! Staging and rollback for restores which replace existing destination contents.
-
 use std::{
     ffi::{OsStr, OsString},
-    io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -15,14 +12,15 @@ fn reserved(name: &OsStr) -> bool {
         || name.to_str().is_some_and(|name| name.starts_with(PREFIX))
 }
 
+/// Staging and rollback for restores which replace existing destination contents.
 pub(crate) struct StagedRestore {
     root: PathBuf,
-    // Set once originals start moving, so even a panic leaves them recoverable.
+    /// Set once originals start moving, so even a panic leaves them recoverable.
     retain: bool,
 }
 
 impl StagedRestore {
-    pub(crate) fn new(destination: &Path) -> io::Result<Self> {
+    pub(crate) fn new(destination: &Path) -> std::io::Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = loop {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -30,7 +28,7 @@ impl StagedRestore {
             match std::fs::create_dir(&root) {
                 Ok(()) => break root,
                 // Never reuse a directory just because its name looks like ours.
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err),
             }
         };
@@ -51,15 +49,15 @@ impl StagedRestore {
         self.root.join("previous")
     }
 
-    pub(crate) fn publish(&mut self, destination: &Path) -> io::Result<()> {
+    pub(crate) fn publish(&mut self, destination: &Path) -> std::io::Result<()> {
         self.publish_with(destination, |from, to| std::fs::rename(from, to))
     }
 
     fn publish_with(
         &mut self,
         destination: &Path,
-        mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
-    ) -> io::Result<()> {
+        mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         // Validate everything before touching the destination.
         let old = names(destination)?
             .into_iter()
@@ -67,8 +65,8 @@ impl StagedRestore {
             .collect::<Vec<_>>();
         let new = names(&self.path())?;
         if let Some(name) = new.iter().find(|name| reserved(name)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
                 format!(
                     "cannot replace reserved restore entry {}",
                     name.to_string_lossy()
@@ -121,7 +119,7 @@ impl StagedRestore {
             }
             if let Some(rollback) = rollback_error {
                 // Keep Drop from deleting the only copy of the originals.
-                return Err(io::Error::new(
+                return Err(std::io::Error::new(
                     original.kind(),
                     format!(
                         "restore failed: {original}; rollback failed: {rollback}; original entries \
@@ -142,10 +140,10 @@ impl StagedRestore {
     }
 }
 
-fn names(directory: &Path) -> io::Result<Vec<OsString>> {
+fn names(directory: &Path) -> std::io::Result<Vec<OsString>> {
     let mut names = std::fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.file_name()))
-        .collect::<io::Result<Vec<_>>>()?;
+        .collect::<std::io::Result<Vec<_>>>()?;
     names.sort();
     Ok(names)
 }
@@ -153,17 +151,17 @@ fn names(directory: &Path) -> io::Result<Vec<OsString>> {
 fn move_entry(
     from: &Path,
     to: &Path,
-    rename: &mut impl FnMut(&Path, &Path) -> io::Result<()>,
-) -> io::Result<()> {
+    rename: &mut impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     // Never overwrite, even when a rollback finds something unexpected.
     match to.symlink_metadata() {
         Ok(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
                 to.display().to_string(),
             ));
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
     rename(from, to)
@@ -224,7 +222,7 @@ mod tests {
                     let fail = calls == fail_at;
                     calls += 1;
                     if fail {
-                        Err(io::Error::other("injected rename failure"))
+                        Err(std::io::Error::other("injected rename failure"))
                     } else {
                         fs::rename(from, to)
                     }
@@ -246,7 +244,7 @@ mod tests {
         let error = staging
             .publish_with(destination.path(), |from, to| {
                 if from == new.join("c") || from.starts_with(&old) {
-                    Err(io::Error::other("persistent I/O failure"))
+                    Err(std::io::Error::other("persistent I/O failure"))
                 } else {
                     fs::rename(from, to)
                 }
@@ -274,7 +272,7 @@ mod tests {
             .publish_with(destination.path(), |from, to| {
                 if from == new.join("a") {
                     fs::write(to, b"concurrent writer").unwrap();
-                    Err(io::Error::other("publication failed"))
+                    Err(std::io::Error::other("publication failed"))
                 } else {
                     fs::rename(from, to)
                 }
@@ -326,7 +324,7 @@ mod tests {
         fs::write(staging.path().join(".ddup-bak-restore"), b"reserved").unwrap();
         assert_eq!(
             staging.publish(destination.path()).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
+            std::io::ErrorKind::InvalidInput
         );
         drop(staging);
         assert_original(destination.path());
@@ -350,7 +348,7 @@ mod tests {
             staging
                 .publish_with(destination.path(), |from, to| {
                     if from == new.join("c") {
-                        Err(io::Error::other("injected"))
+                        Err(std::io::Error::other("injected"))
                     } else {
                         fs::rename(from, to)
                     }

@@ -13,6 +13,7 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
 
     if !Path::new(directory).join(".ddup-bak").exists() {
         println!("{} {}", ".ddup-bak".cyan(), "does not exist!".red());
+
         return Ok(1);
     }
 
@@ -41,6 +42,7 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
         None,
         Some({
             let progress = progress.clone();
+
             Arc::new(move |hash, references| {
                 progress.set_text(format!(
                     "{} ({references} references)",
@@ -51,6 +53,7 @@ pub fn rebuild(matches: &ArgMatches) -> std::io::Result<i32> {
     )?;
 
     progress.finish();
+
     println!(
         "{} {} {} {}",
         "rebuilding".bright_black(),

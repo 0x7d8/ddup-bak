@@ -14,6 +14,8 @@ pub type CUserData = *mut c_void;
 #[derive(Clone, Copy)]
 pub(crate) struct UserData(pub CUserData);
 
+// SAFETY: the pointer is only handed back to the caller's callbacks, never dereferenced here;
+// `CUserData` documents that those callbacks may run on several threads at once.
 unsafe impl Send for UserData {}
 unsafe impl Sync for UserData {}
 

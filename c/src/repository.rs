@@ -138,8 +138,9 @@ pub unsafe extern "C" fn repository_save(repo: *mut CRepository) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_set_save_on_drop(
     repo: *mut CRepository,
-    _save_on_drop: bool,
+    save_on_drop: bool,
 ) -> *mut CRepository {
+    let _ = save_on_drop;
     repo
 }
 

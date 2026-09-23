@@ -23,6 +23,7 @@ pub fn create(matches: &ArgMatches) -> std::io::Result<i32> {
     };
     if !compression.is_supported() {
         println!("{}", compression.unsupported_message().red());
+
         return Ok(1);
     }
 
@@ -37,6 +38,7 @@ pub fn create(matches: &ArgMatches) -> std::io::Result<i32> {
             name.cyan(),
             "already exists!".red()
         );
+
         return Ok(1);
     }
 
@@ -65,6 +67,7 @@ pub fn create(matches: &ArgMatches) -> std::io::Result<i32> {
         directory,
         Some({
             let progress = progress.clone();
+
             Arc::new(move |file| progress.set_text(file.to_string_lossy()))
         }),
         Some(Arc::new(move |_, _| compression)),
@@ -72,6 +75,7 @@ pub fn create(matches: &ArgMatches) -> std::io::Result<i32> {
     )?;
 
     progress.finish();
+
     println!(
         "{} {}",
         "creating backup...".bright_black(),

@@ -20,6 +20,7 @@ pub fn clean(_matches: &ArgMatches) -> std::io::Result<i32> {
 
     repository.clean(Some({
         let progress = progress.clone();
+
         Arc::new(move |hash, _| {
             progress.set_text(format!(
                 "{} {}",
@@ -30,6 +31,7 @@ pub fn clean(_matches: &ArgMatches) -> std::io::Result<i32> {
     }))?;
 
     progress.finish();
+
     println!(
         "{} {}",
         "cleaning repository...".bright_black(),

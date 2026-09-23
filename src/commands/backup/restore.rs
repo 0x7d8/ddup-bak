@@ -9,6 +9,7 @@ use std::{
 
 pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     let repository = open_repository();
+
     let name = matches.get_one::<String>("name").expect("required");
     let destination = matches.get_one::<String>("destination").map(PathBuf::from);
     let threads = *matches.get_one::<usize>("threads").expect("required");
@@ -24,6 +25,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
             name.cyan(),
             "does not exist!".red()
         );
+
         return Ok(1);
     }
 
@@ -32,6 +34,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     // Held through the restore so no delete removes the chunks.
     let _lock = repository.shared_lock()?;
     let archive = repository.get_archive(name)?;
+
     let total = archive.entries().iter().map(count_entries).sum();
 
     let mut progress = Progress::new(total);
@@ -48,6 +51,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
 
     let progress_callback = Some({
         let progress = progress.clone();
+
         Arc::new(move |_: &Path| progress.incr(1usize)) as Arc<_>
     });
     match &destination {
@@ -65,6 +69,7 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
     }
 
     progress.finish();
+
     println!(
         "{} {}",
         "restoring backup...".bright_black(),

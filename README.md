@@ -2,4 +2,4 @@
 
 very experimental archive/dedup format that can use multiple different compression formats per file/chunk
 
-repositories written before 0.11 use archive format version 1 and are not readable by 0.11 or later, see ARCHIVE.md.
+repositories written before 0.11 use archive format version 1 and are migrated to version 2 in place the first time 0.11 or later opens them, see ARCHIVE.md.

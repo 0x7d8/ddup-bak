@@ -164,6 +164,24 @@ fn move_entry(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
+
+    // Moving a directory to another parent rewrites its `..`, which needs write access to it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = from.symlink_metadata()?;
+        let mode = metadata.permissions().mode();
+        if metadata.is_dir() && mode & 0o200 == 0 {
+            std::fs::set_permissions(from, std::fs::Permissions::from_mode(mode | 0o200))?;
+            let result = rename(from, to);
+            let moved = if result.is_ok() { to } else { from };
+            std::fs::set_permissions(moved, std::fs::Permissions::from_mode(mode))?;
+
+            return result;
+        }
+    }
+
     rename(from, to)
 }
 

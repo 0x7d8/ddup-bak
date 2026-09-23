@@ -174,7 +174,13 @@ jobs:
 
       - name: Get cli version from Cargo.toml
         id: version
-        run: echo "val=$(cargo metadata --format-version=1 --no-deps | jq '.packages[0].version' -r)" >> $GITHUB_OUTPUT
+        run: |
+          version=$(cargo metadata --format-version=1 --no-deps | jq -r --arg name "$PROJECT_NAME" '.packages[] | select(.name == $name) | .version')
+          if [ -z "$version" ]; then
+              echo "could not find version of package $PROJECT_NAME" >&2
+              exit 1
+          fi
+          echo "val=$version" >> $GITHUB_OUTPUT
 
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2

@@ -1203,7 +1203,7 @@ fn restore_entry(
             }
 
             // Open before applying the mode, which may deny opening it.
-            let directory = File::open(&path)?;
+            let directory = open_dir(&path)?;
             chown(&path, owner)?;
             directory.set_times(FileTimes::new().set_modified(mtime))?;
             std::fs::set_permissions(&path, mode.into())
@@ -1530,6 +1530,23 @@ fn create_new_file(path: &Path) -> std::io::Result<File> {
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+/// Opens a directory to set its times. Windows only opens directories with backup semantics.
+fn open_dir(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        File::options()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    File::open(path)
 }
 
 fn open_nofollow(path: &Path) -> std::io::Result<File> {

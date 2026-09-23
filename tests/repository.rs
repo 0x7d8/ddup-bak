@@ -136,7 +136,15 @@ fn roundtrip_restores_every_file_and_metadata() {
         ],
     );
     let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
-    File::open(source.join("sub"))
+    let mut sub = File::options();
+    sub.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Write attributes, with backup semantics so Windows opens a directory.
+        sub.access_mode(0x100).custom_flags(0x0200_0000);
+    }
+    sub.open(source.join("sub"))
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(old))
         .unwrap();

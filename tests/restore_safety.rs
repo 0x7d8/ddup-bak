@@ -41,7 +41,7 @@ fn duplicate_archive_creation_is_atomic() {
         std::io::ErrorKind::AlreadyExists
     );
     repo.clean(None).unwrap();
-    let restored = repo.restore_archive("same-name", None, 2).unwrap();
+    let restored = repo.restore_archive("same-name", None, None, 2).unwrap();
     let expected = format!("creator-{winner}");
     assert_eq!(
         fs::read(restored.join("file")).unwrap(),
@@ -69,7 +69,7 @@ fn restoring_preserves_setuid_and_setgid_bits() {
     let repo = Repository::new(&root, 4096, 0, None).unwrap();
     repo.create_archive("one", None, Some(&src), None, None, 2)
         .unwrap();
-    let dst = repo.restore_archive("one", None, 2).unwrap();
+    let dst = repo.restore_archive("one", None, None, 2).unwrap();
     let actual = fs::metadata(dst.join("executable"))
         .unwrap()
         .permissions()
@@ -143,9 +143,9 @@ fn a_failed_repeated_restore_preserves_the_previous_output() {
     let repo = Repository::new(&root, 4096, 0, None).unwrap();
     repo.create_archive("one", None, Some(&source), None, None, 2)
         .unwrap();
-    let restored = repo.restore_archive("one", None, 2).unwrap();
+    let restored = repo.restore_archive("one", None, None, 2).unwrap();
     corrupt_chunk(&root);
-    assert!(repo.restore_archive("one", None, 2).is_err());
+    assert!(repo.restore_archive("one", None, None, 2).is_err());
     assert_eq!(
         fs::read(restored.join("file")).unwrap(),
         b"previous restore"

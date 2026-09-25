@@ -204,6 +204,10 @@ struct CRepository *repository_set_save_on_drop(struct CRepository *repo, bool s
 
 struct CRepository *open_repository(const char *directory, const char *chunks_directory);
 
+/**
+ * Rebuilds the chunk index from the archives and stored chunks. After all archives are counted,
+ * `progress_callback` is called once per chunk with its final reference count, zero included.
+ */
 struct CRepository *rebuild_repository(const char *directory,
                                        unsigned int chunk_size,
                                        unsigned int max_chunk_count,
@@ -238,20 +242,29 @@ struct CArchive *repository_get_archive(struct CRepository *repo, const char *ar
 /**
  * Restores an archive into `.ddup-bak/archives-restored/<name>`, replacing a previous restore,
  * and returns that path. Free it with `free_string`.
+ *
+ * Each entry is reported with its final path, once to `progress_callback` before it is created
+ * and once to `restored_callback` after it is fully restored. A directory counts as restored
+ * after all its children, so children are reported to `restored_callback` before their parent.
+ * Entries that fail are never reported to `restored_callback`. Entries are moved from staging
+ * into the reported paths just before this returns.
  */
 char *repository_restore_archive(struct CRepository *repo,
                                  const char *archive_name,
                                  CProgressCallback progress_callback,
+                                 CProgressCallback restored_callback,
                                  CUserData user_data,
                                  unsigned int threads);
 
 /**
- * Restores an archive into `destination`, which is created if missing.
+ * Restores an archive into `destination`, which is created if missing. Callbacks work as in
+ * `repository_restore_archive`, except entries are restored in place.
  */
 int repository_restore_archive_to(struct CRepository *repo,
                                   const char *archive_name,
                                   const char *destination,
                                   CProgressCallback progress_callback,
+                                  CProgressCallback restored_callback,
                                   CUserData user_data,
                                   unsigned int threads);
 

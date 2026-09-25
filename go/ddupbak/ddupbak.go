@@ -68,8 +68,11 @@ type (
 	// ArchivingProgressCallback is a callback for tracking archiving progress
 	ArchivingProgressCallback = ProgressCallback
 
-	// RestoringProgressCallback is a callback for tracking restoring progress
+	// RestoringProgressCallback is called with an entry's path before it is restored
 	RestoringProgressCallback = ProgressCallback
+
+	// RestoredProgressCallback is called with an entry's path after it is fully restored
+	RestoredProgressCallback = ProgressCallback
 )
 
 // DeletionProgressCallback is a callback for tracking deletion progress
@@ -78,7 +81,8 @@ type DeletionProgressCallback func(chunkID uint64, deleted bool)
 // CleaningProgressCallback is a callback for tracking cleaning progress
 type CleaningProgressCallback = DeletionProgressCallback
 
-// RebuildProgressCallback is called for every chunk with its reference count during a rebuild.
+// RebuildProgressCallback is called once for every chunk with its final reference count, zero
+// included, after a rebuild has counted all archives.
 type RebuildProgressCallback func(hash ChunkHash, references uint64)
 
 // CompressionFormatCallback is a callback for determining the compression format
@@ -93,6 +97,7 @@ type RealSizeCallback func(path string) uint64
 type callbacks struct {
 	progress    ProgressCallback
 	archiving   ProgressCallback
+	restored    ProgressCallback
 	deletion    DeletionProgressCallback
 	rebuild     RebuildProgressCallback
 	compression CompressionFormatCallback
@@ -131,6 +136,13 @@ func goProgressCallback(path *C.char, data unsafe.Pointer) {
 		if cbs.archiving != nil {
 			cbs.archiving(p)
 		}
+	}
+}
+
+//export goRestoredCallback
+func goRestoredCallback(path *C.char, data unsafe.Pointer) {
+	if cb := userCallbacks(data).restored; cb != nil {
+		cb(C.GoString(path))
 	}
 }
 

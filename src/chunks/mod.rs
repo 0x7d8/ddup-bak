@@ -331,7 +331,8 @@ impl ChunkIndex {
     }
 
     /// Recounts references from `archives`, one archive in memory at a time. Unreferenced chunks in
-    /// storage get a count of zero so `clean` deletes them.
+    /// storage get a count of zero so `clean` deletes them. Once counting is done, `progress` is
+    /// called once per chunk in the new index with its final count, zero included.
     pub fn rebuild(
         chunk_size: usize,
         max_chunk_count: usize,
@@ -345,24 +346,23 @@ impl ChunkIndex {
             index.chunks.insert(hash, 0);
         }
         for archive in archives {
-            index.count_references(archive?.into_entries(), &progress)?;
+            index.count_references(archive?.into_entries())?;
+        }
+        for entry in index.chunks.iter() {
+            progress(entry.key(), *entry.value());
         }
         Ok(index)
     }
 
-    fn count_references(
-        &self,
-        entries: Vec<Entry>,
-        progress: &impl Fn(&ChunkHash, u64),
-    ) -> std::io::Result<()> {
+    fn count_references(&self, entries: Vec<Entry>) -> std::io::Result<()> {
         for entry in entries {
             match entry {
                 Entry::File(mut file) => {
                     for hash in entry_hashes(&mut file)? {
-                        progress(&hash, self.reference(&hash));
+                        self.reference(&hash);
                     }
                 }
-                Entry::Directory(dir) => self.count_references(dir.entries, progress)?,
+                Entry::Directory(dir) => self.count_references(dir.entries)?,
                 Entry::Symlink(_) => {}
             }
         }

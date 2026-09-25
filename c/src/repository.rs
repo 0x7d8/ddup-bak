@@ -161,6 +161,8 @@ pub unsafe extern "C" fn open_repository(
     ))
 }
 
+/// Rebuilds the chunk index from the archives and stored chunks. After all archives are counted,
+/// `progress_callback` is called once per chunk with its final reference count, zero included.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rebuild_repository(
     directory: *const c_char,
@@ -322,11 +324,18 @@ pub unsafe extern "C" fn repository_get_archive(
 
 /// Restores an archive into `.ddup-bak/archives-restored/<name>`, replacing a previous restore,
 /// and returns that path. Free it with `free_string`.
+///
+/// Each entry is reported with its final path, once to `progress_callback` before it is created
+/// and once to `restored_callback` after it is fully restored. A directory counts as restored
+/// after all its children, so children are reported to `restored_callback` before their parent.
+/// Entries that fail are never reported to `restored_callback`. Entries are moved from staging
+/// into the reported paths just before this returns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_restore_archive(
     repo: *mut CRepository,
     archive_name: *const c_char,
     progress_callback: CProgressCallback,
+    restored_callback: CProgressCallback,
     user_data: CUserData,
     threads: c_uint,
 ) -> *mut c_char {
@@ -339,6 +348,7 @@ pub unsafe extern "C" fn repository_restore_archive(
     match repo.restore_archive(
         &name,
         wrap_progress(progress_callback, UserData(user_data)),
+        wrap_progress(restored_callback, UserData(user_data)),
         threads as usize,
     ) {
         Ok(path) => c_string(path.to_string_lossy().into_owned()).into_raw(),
@@ -349,13 +359,15 @@ pub unsafe extern "C" fn repository_restore_archive(
     }
 }
 
-/// Restores an archive into `destination`, which is created if missing.
+/// Restores an archive into `destination`, which is created if missing. Callbacks work as in
+/// `repository_restore_archive`, except entries are restored in place.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn repository_restore_archive_to(
     repo: *mut CRepository,
     archive_name: *const c_char,
     destination: *const c_char,
     progress_callback: CProgressCallback,
+    restored_callback: CProgressCallback,
     user_data: CUserData,
     threads: c_uint,
 ) -> c_int {
@@ -371,6 +383,7 @@ pub unsafe extern "C" fn repository_restore_archive_to(
         &name,
         Path::new(&destination),
         wrap_progress(progress_callback, UserData(user_data)),
+        wrap_progress(restored_callback, UserData(user_data)),
         threads as usize,
     ))
 }

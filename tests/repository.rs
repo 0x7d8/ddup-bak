@@ -1,10 +1,10 @@
 use ddup_bak::{
     archive::{
-        Archive, CompressionFormat, CompressionFormatCallback,
+        Archive, CompressionFormat, CompressionFormatCallback, ProgressCallback,
         entries::{Entry, EntryMode, FileEntry},
     },
     chunks::{
-        ChunkIndex, HashAlgorithm,
+        ChunkHash, ChunkIndex, HashAlgorithm,
         storage::{ChunkStorage, ChunkStorageLocal},
     },
     lock::Lock,
@@ -15,7 +15,7 @@ use std::{
     io::{Cursor, Read},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
@@ -73,7 +73,7 @@ impl Fixture {
     fn restore(&self, name: &str) -> std::io::Result<PathBuf> {
         let destination = self.root.join(format!("restored-{name}"));
         self.repository
-            .restore_archive_to(name, &destination, None, 4)?;
+            .restore_archive_to(name, &destination, None, None, 4)?;
         Ok(destination)
     }
 
@@ -1110,7 +1110,10 @@ fn restore_recreates_the_directory_it_restores_into() {
     fixture.backup("a", &source).unwrap();
     fs::remove_dir_all(fixture.root.join("repo/.ddup-bak/archives-restored")).unwrap();
 
-    let restored = fixture.repository.restore_archive("a", None, 2).unwrap();
+    let restored = fixture
+        .repository
+        .restore_archive("a", None, None, 2)
+        .unwrap();
     assert_eq!(fs::read(restored.join("f")).unwrap(), b"back");
 }
 
@@ -1262,7 +1265,7 @@ fn open_or_rebuild_rebuilds_an_index_cut_short_after_its_header() {
     let repo = fixture.root.join("repo");
     let repository = Repository::open_or_rebuild(&repo, CHUNK_SIZE, 0, None, None, None).unwrap();
     assert!(ChunkIndex::load(&index_path).is_ok());
-    let restored = repository.restore_archive("a", None, 2).unwrap();
+    let restored = repository.restore_archive("a", None, None, 2).unwrap();
     assert_same_files(&source, &restored, &["f"]);
 }
 
@@ -1273,8 +1276,8 @@ fn restores_of_one_archive_into_its_own_place_take_turns() {
     fixture.backup("a", &source).unwrap();
 
     let restored = std::thread::scope(|scope| {
-        let first = scope.spawn(|| fixture.repository.restore_archive("a", None, 2));
-        let second = scope.spawn(|| fixture.repository.restore_archive("a", None, 2));
+        let first = scope.spawn(|| fixture.repository.restore_archive("a", None, None, 2));
+        let second = scope.spawn(|| fixture.repository.restore_archive("a", None, None, 2));
         let first = first.join().unwrap().unwrap();
         assert_eq!(second.join().unwrap().unwrap(), first);
         first
@@ -1349,9 +1352,15 @@ fn restore_replaces_its_earlier_output_even_where_that_is_read_only() {
     fs::set_permissions(source.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
     fixture.backup("a", &source).unwrap();
 
-    let first = fixture.repository.restore_archive("a", None, 2).unwrap();
+    let first = fixture
+        .repository
+        .restore_archive("a", None, None, 2)
+        .unwrap();
     assert_eq!(fs::read(first.join("ro/f")).unwrap(), b"kept");
-    let second = fixture.repository.restore_archive("a", None, 2).unwrap();
+    let second = fixture
+        .repository
+        .restore_archive("a", None, None, 2)
+        .unwrap();
     assert_eq!(fs::read(second.join("ro/f")).unwrap(), b"kept");
     fs::set_permissions(source.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(second.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1414,7 +1423,7 @@ fn rebuild_tells_the_hash_algorithm_from_a_whole_chunk_not_the_first_listed() {
         inner: ChunkStorageLocal(fixture.chunks_dir()),
     });
     let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, Some(storage), None).unwrap();
-    let restored = rebuilt.restore_archive("a", None, 2).unwrap();
+    let restored = rebuilt.restore_archive("a", None, None, 2).unwrap();
     assert_eq!(
         fs::read(restored.join("f")).unwrap(),
         fs::read(source.join("f")).unwrap()
@@ -1471,7 +1480,13 @@ fn a_directory_without_read_permission_restores_with_its_mode() {
     let restored = fixture.root.join("restored");
     fixture
         .repository
-        .restore_entries_to(vec![Entry::Directory(Box::new(entry))], &restored, None, 2)
+        .restore_entries_to(
+            vec![Entry::Directory(Box::new(entry))],
+            &restored,
+            None,
+            None,
+            2,
+        )
         .unwrap();
 
     let metadata = fs::metadata(restored.join("x")).unwrap();
@@ -2225,7 +2240,7 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
         let expected = if entry.name() == "sub" { 0o755 } else { 0o644 };
         assert_eq!(entry.mode().bits(), expected, "{}", entry.name());
     }
-    let restored = repository.restore_archive("old", None, 2).unwrap();
+    let restored = repository.restore_archive("old", None, None, 2).unwrap();
     assert_eq!(restored, repo.join(".ddup-bak/archives-restored/old"));
     assert_eq!(fs::read(restored.join("a")).unwrap(), a);
     assert_eq!(fs::read(restored.join("sub/in-sub-b")).unwrap(), b);
@@ -2310,7 +2325,7 @@ fn a_format_1_archive_with_the_longest_name_migrates() {
 
     let repository = Repository::open(&repo, None, None).unwrap();
     assert_eq!(repository.get_archive(&name).unwrap().version(), 2);
-    let restored = repository.restore_archive(&name, None, 2).unwrap();
+    let restored = repository.restore_archive(&name, None, None, 2).unwrap();
     assert_eq!(fs::read(restored.join("f")).unwrap(), content);
 }
 
@@ -2333,7 +2348,7 @@ fn migration_counts_references_from_the_archives_not_the_old_index() {
 
     let repository = Repository::open(&repo, None, None).unwrap();
     repository.delete_archive("old", None).unwrap();
-    let restored = repository.restore_archive("twin", None, 2).unwrap();
+    let restored = repository.restore_archive("twin", None, None, 2).unwrap();
     assert_eq!(fs::read(restored.join("f")).unwrap(), content);
 }
 
@@ -2398,7 +2413,7 @@ fn a_legacy_chunk_larger_than_this_version_ever_writes_still_reads() {
     );
 
     let repository = Repository::open(&repo, None, None).unwrap();
-    let restored = repository.restore_archive("old", None, 2).unwrap();
+    let restored = repository.restore_archive("old", None, None, 2).unwrap();
     assert_eq!(fs::read(restored.join("f")).unwrap(), big);
 }
 
@@ -2430,7 +2445,7 @@ fn a_damaged_format_1_archive_migrates_once_it_reads_again() {
     assert_eq!(repository.get_archive("twin").unwrap().version(), 2);
     assert!(!ids.exists());
     repository.delete_archive("old", None).unwrap();
-    let restored = repository.restore_archive("twin", None, 2).unwrap();
+    let restored = repository.restore_archive("twin", None, None, 2).unwrap();
     assert_eq!(fs::read(restored.join("f")).unwrap(), content);
 }
 
@@ -2484,7 +2499,7 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
 
     fs::write(&index, &intact).unwrap();
     let repository = Repository::open(&repo, None, None).unwrap();
-    let restored = repository.restore_archive("old", None, 2).unwrap();
+    let restored = repository.restore_archive("old", None, None, 2).unwrap();
     for (name, content) in names.iter().zip(&contents) {
         assert_eq!(&fs::read(restored.join(name)).unwrap(), content, "{name}");
     }
@@ -2527,7 +2542,7 @@ fn a_running_old_version_holds_off_the_migration() {
     assert_eq!(
         fs::read(
             repository
-                .restore_archive("old", None, 2)
+                .restore_archive("old", None, None, 2)
                 .unwrap()
                 .join("a")
         )
@@ -2568,7 +2583,7 @@ fn a_damaged_archive_does_not_block_the_migration_of_the_others() {
         Archive::open(&broken).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
-    let restored = repository.restore_archive("old", None, 2).unwrap();
+    let restored = repository.restore_archive("old", None, None, 2).unwrap();
     assert_eq!(fs::read(restored.join("a")).unwrap(), content);
     assert!(repository.get_archive("broken").is_err());
 }
@@ -2645,4 +2660,310 @@ fn zstd_chunks_roundtrip() {
         CompressionFormat::Zstd.encode()
     );
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["text"]);
+}
+
+type Reports = Arc<Mutex<Vec<(&'static str, PathBuf)>>>;
+
+fn restore_callbacks(
+    check: impl Fn(&Path) -> bool + Send + Sync + 'static,
+) -> (Reports, ProgressCallback, ProgressCallback) {
+    let reports: Reports = Arc::default();
+    let progress = Arc::clone(&reports);
+    let restored = Arc::clone(&reports);
+    (
+        reports,
+        Some(Arc::new(move |path: &Path| {
+            progress
+                .lock()
+                .unwrap()
+                .push(("progress", path.to_path_buf()));
+        })),
+        Some(Arc::new(move |path: &Path| {
+            let tag = if check(path) {
+                "restored"
+            } else {
+                "restored-early"
+            };
+            restored.lock().unwrap().push((tag, path.to_path_buf()));
+        })),
+    )
+}
+
+fn assert_reported_in_order(reports: &[(&str, PathBuf)], expected: &[PathBuf]) {
+    let position = |tag: &str, path: &Path| {
+        let found: Vec<usize> = (0..reports.len())
+            .filter(|&i| reports[i].0 == tag && reports[i].1 == path)
+            .collect();
+        assert_eq!(found.len(), 1, "{tag} {}", path.display());
+        found[0]
+    };
+    assert_eq!(reports.len(), expected.len() * 2, "{reports:?}");
+    for path in expected {
+        assert!(position("progress", path) < position("restored", path));
+        if let Some(parent) = expected.iter().find(|p| Some(p.as_path()) == path.parent()) {
+            assert!(position("restored", path) < position("restored", parent));
+        }
+    }
+}
+
+fn duplicated_files() -> [(&'static str, Vec<u8>); 3] {
+    let content = seeded(1, 5 * CHUNK_SIZE);
+    [
+        ("d/f", content.clone()),
+        ("d/g", content),
+        ("top", seeded(3, 100)),
+    ]
+}
+
+fn expected_paths(destination: &Path) -> Vec<PathBuf> {
+    ["d", "d/f", "d/g", "top"]
+        .iter()
+        .map(|path| destination.join(path))
+        .collect()
+}
+
+#[test]
+fn replacing_restores_report_each_final_path_once_children_first() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("a", &fixture.source("src", &refs)).unwrap();
+
+    // restore_archive
+    let (reports, progress, restored) = restore_callbacks(|_| true);
+    let destination = fixture
+        .repository
+        .restore_archive("a", progress, restored, 4)
+        .unwrap();
+    let expected = expected_paths(&destination);
+    assert_reported_in_order(&reports.lock().unwrap(), &expected);
+    assert!(expected.iter().all(|path| path.exists()));
+
+    // restore_entries_replacing
+    let destination = fixture.root.join("out");
+    let (reports, progress, restored) = restore_callbacks(|_| true);
+    let entries = fixture.repository.get_archive("a").unwrap().into_entries();
+    fixture
+        .repository
+        .restore_entries_replacing(entries, &destination, progress, restored, 4)
+        .unwrap();
+    let expected = expected_paths(&destination);
+    assert_reported_in_order(&reports.lock().unwrap(), &expected);
+    assert!(expected.iter().all(|path| path.exists()));
+}
+
+#[test]
+fn restore_to_reports_an_entry_restored_only_once_it_is_on_disk() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("a", &fixture.source("src", &refs)).unwrap();
+    let destination = fixture.root.join("out");
+
+    // restore_archive_to
+    let base = destination.clone();
+    let (reports, progress, restored) = restore_callbacks(move |path| {
+        let relative = path.strip_prefix(&base).unwrap();
+        match files.iter().find(|(name, _)| Path::new(name) == relative) {
+            Some((_, content)) => fs::read(path).is_ok_and(|read| read == *content),
+            None => path.is_dir(),
+        }
+    });
+    fixture
+        .repository
+        .restore_archive_to("a", &destination, progress, restored, 4)
+        .unwrap();
+    assert_reported_in_order(&reports.lock().unwrap(), &expected_paths(&destination));
+}
+
+#[test]
+fn restore_to_never_reports_an_entry_that_failed_as_restored() {
+    let fixture = Fixture::new();
+    let broken = seeded(4, 100);
+    let source = fixture.source("src", &[("broken", &broken), ("fine", b"fine")]);
+    fixture.backup("a", &source).unwrap();
+    fs::remove_file(fixture.chunk_path(&broken)).unwrap();
+    let destination = fixture.root.join("out");
+
+    // restore_archive_to
+    let (reports, progress, restored) = restore_callbacks(|_| true);
+    assert!(
+        fixture
+            .repository
+            .restore_archive_to("a", &destination, progress, restored, 4)
+            .is_err()
+    );
+    assert!(
+        !reports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(tag, path)| *tag != "progress" && *path == destination.join("broken"))
+    );
+}
+
+fn archive_hashes(fixture: &Fixture, name: &str) -> Vec<ChunkHash> {
+    let mut entries = fixture.repository.get_archive(name).unwrap().into_entries();
+    let mut hashes = Vec::new();
+    while let Some(entry) = entries.pop() {
+        match entry {
+            Entry::File(mut file) => {
+                hashes.extend(ddup_bak::chunks::entry_hashes(&mut file).unwrap())
+            }
+            Entry::Directory(directory) => entries.extend(directory.entries),
+            _ => {}
+        }
+    }
+    hashes
+}
+
+type Deletions = Arc<Mutex<Vec<(ChunkHash, bool)>>>;
+
+fn deletion_callback() -> (Deletions, ddup_bak::repository::DeletionProgressCallback) {
+    let reports: Deletions = Arc::default();
+    let callback = Arc::clone(&reports);
+    (
+        reports,
+        Some(Arc::new(move |hash: &ChunkHash, deleted| {
+            callback.lock().unwrap().push((*hash, deleted));
+        })),
+    )
+}
+
+fn sorted(mut reports: Vec<(ChunkHash, bool)>) -> Vec<(ChunkHash, bool)> {
+    reports.sort();
+    reports
+}
+
+#[test]
+fn delete_archive_reports_each_unique_chunk_once_with_whether_it_went() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("a", &fixture.source("a", &refs)).unwrap();
+    fixture
+        .backup("b", &fixture.source("b", &[("f", &files[0].1)]))
+        .unwrap();
+    let of_a = archive_hashes(&fixture, "a");
+    let of_b = archive_hashes(&fixture, "b");
+    let mut unique = of_a.clone();
+    unique.sort();
+    unique.dedup();
+    assert!(unique.len() < of_a.len());
+
+    // delete_archive
+    let (reports, progress) = deletion_callback();
+    fixture.repository.delete_archive("a", progress).unwrap();
+    let expected: Vec<_> = unique
+        .iter()
+        .map(|hash| (*hash, !of_b.contains(hash)))
+        .collect();
+    assert!(expected.iter().any(|(_, deleted)| !deleted));
+    assert_eq!(sorted(reports.lock().unwrap().clone()), expected);
+}
+
+#[test]
+fn delete_archive_reports_chunks_it_frees_finishing_an_interrupted_delete() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("x", &fixture.source("x", &refs)).unwrap();
+    fixture
+        .backup(
+            "y",
+            &fixture.source("y", &[("f", &seeded(5, 3 * CHUNK_SIZE))]),
+        )
+        .unwrap();
+    let mut expected: Vec<_> = archive_hashes(&fixture, "x")
+        .into_iter()
+        .chain(archive_hashes(&fixture, "y"))
+        .map(|hash| (hash, true))
+        .collect();
+    expected.sort();
+    expected.dedup();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/x.ddup"),
+        ddup_bak.join("deleting/x.ddup"),
+    )
+    .unwrap();
+
+    // delete_archive
+    let (reports, progress) = deletion_callback();
+    fixture.repository.delete_archive("y", progress).unwrap();
+    assert_eq!(sorted(reports.lock().unwrap().clone()), expected);
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn clean_reports_chunks_it_frees_finishing_an_interrupted_delete() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("x", &fixture.source("x", &refs)).unwrap();
+    fixture
+        .backup("z", &fixture.source("z", &[("f", &files[0].1)]))
+        .unwrap();
+    let of_z = archive_hashes(&fixture, "z");
+    let mut expected: Vec<_> = archive_hashes(&fixture, "x")
+        .into_iter()
+        .filter(|hash| !of_z.contains(hash))
+        .map(|hash| (hash, true))
+        .collect();
+    expected.sort();
+    expected.dedup();
+    let ddup_bak = fixture.root.join("repo/.ddup-bak");
+    fs::rename(
+        ddup_bak.join("archives/x.ddup"),
+        ddup_bak.join("deleting/x.ddup"),
+    )
+    .unwrap();
+
+    // clean
+    let (reports, progress) = deletion_callback();
+    fixture.repository.clean(progress).unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(sorted(reports.lock().unwrap().clone()), expected);
+    assert_eq!(fixture.stored_chunks(), of_z.len());
+}
+
+#[test]
+fn rebuild_reports_every_indexed_chunk_once_with_its_final_count() {
+    let fixture = Fixture::new();
+    let files = duplicated_files();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, c)| (*n, c.as_slice())).collect();
+    fixture.backup("a", &fixture.source("a", &refs)).unwrap();
+    fixture
+        .backup("b", &fixture.source("b", &[("f", &files[0].1)]))
+        .unwrap();
+    fixture
+        .backup("orphan", &fixture.source("o", &[("f", &seeded(6, 100))]))
+        .unwrap();
+    let orphans = archive_hashes(&fixture, "orphan");
+    fs::remove_file(fixture.repository.archive_path("orphan").unwrap()).unwrap();
+
+    // Repository::rebuild
+    let reports: Arc<Mutex<Vec<(ChunkHash, u64)>>> = Arc::default();
+    let callback = Arc::clone(&reports);
+    Repository::rebuild(
+        &fixture.root.join("repo"),
+        CHUNK_SIZE,
+        0,
+        None,
+        None,
+        Some(Arc::new(move |hash: &ChunkHash, count| {
+            callback.lock().unwrap().push((*hash, count));
+        })),
+    )
+    .unwrap();
+
+    let mut reports = reports.lock().unwrap().clone();
+    reports.sort();
+    let mut indexed: Vec<(ChunkHash, u64)> = ChunkIndex::load(&fixture.chunks_dir().join("index"))
+        .unwrap()
+        .iter()
+        .collect();
+    indexed.sort();
+    assert_eq!(reports, indexed);
+    assert!(orphans.iter().all(|orphan| reports.contains(&(*orphan, 0))));
 }

@@ -24,6 +24,13 @@ func cProgressCallback(cb ...ProgressCallback) C.CProgressCallback {
 	return nil
 }
 
+func cRestoredCallback(cb RestoredProgressCallback) C.CProgressCallback {
+	if cb == nil {
+		return nil
+	}
+	return C.restoredCallback()
+}
+
 func cDeletionCallback(cb DeletionProgressCallback) C.CDeletionProgressCallback {
 	if cb == nil {
 		return nil
@@ -215,9 +222,16 @@ func (r *Repository) GetArchive(archiveName string) (*Archive, error) {
 
 // RestoreArchive restores an archive into .ddup-bak/archives-restored/<name> in the repository,
 // replacing a previous restore, and returns that path.
+//
+// Each entry is reported with its final path, once to progressCallback before it is created and
+// once to restoredCallback after it is fully restored. A directory counts as restored after all
+// its children, so children reach restoredCallback before their parent. Entries that fail never
+// reach restoredCallback. Entries are moved from staging into the reported paths just before
+// this returns.
 func (r *Repository) RestoreArchive(
 	archiveName string,
 	progressCallback RestoringProgressCallback,
+	restoredCallback RestoredProgressCallback,
 	threads uint,
 ) (string, error) {
 	if r.repo == nil {
@@ -227,10 +241,13 @@ func (r *Repository) RestoreArchive(
 	cName := cString(archiveName)
 	defer freeCString(cName)
 
-	data, release := userData(&callbacks{progress: progressCallback})
+	data, release := userData(&callbacks{progress: progressCallback, restored: restoredCallback})
 	defer release()
 
-	path := C.repository_restore_archive(r.repo, cName, cProgressCallback(progressCallback), data, C.uint(threads))
+	path := C.repository_restore_archive(
+		r.repo, cName, cProgressCallback(progressCallback), cRestoredCallback(restoredCallback),
+		data, C.uint(threads),
+	)
 	if path == nil {
 		return "", lastError("ddupbak: restore failed")
 	}
@@ -239,11 +256,13 @@ func (r *Repository) RestoreArchive(
 }
 
 // RestoreArchiveTo restores an archive into destination, which is created if missing. Existing
-// paths inside it are never overwritten.
+// paths inside it are never overwritten. Callbacks work as in RestoreArchive, except entries are
+// restored in place.
 func (r *Repository) RestoreArchiveTo(
 	archiveName string,
 	destination string,
 	progressCallback RestoringProgressCallback,
+	restoredCallback RestoredProgressCallback,
 	threads uint,
 ) error {
 	if r.repo == nil {
@@ -254,10 +273,13 @@ func (r *Repository) RestoreArchiveTo(
 	defer freeCString(cName)
 	defer freeCString(cDestination)
 
-	data, release := userData(&callbacks{progress: progressCallback})
+	data, release := userData(&callbacks{progress: progressCallback, restored: restoredCallback})
 	defer release()
 
-	if C.repository_restore_archive_to(r.repo, cName, cDestination, cProgressCallback(progressCallback), data, C.uint(threads)) != 0 {
+	if C.repository_restore_archive_to(
+		r.repo, cName, cDestination, cProgressCallback(progressCallback),
+		cRestoredCallback(restoredCallback), data, C.uint(threads),
+	) != 0 {
 		return lastError("ddupbak: restore failed")
 	}
 	return nil

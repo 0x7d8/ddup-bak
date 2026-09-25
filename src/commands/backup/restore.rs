@@ -59,12 +59,19 @@ pub fn restore(matches: &ArgMatches) -> std::io::Result<i32> {
             repository.restore_entries_replacing(
                 archive.into_entries(),
                 destination,
+                None,
                 progress_callback,
                 threads,
             )?;
         }
         None => {
-            repository.restore_entries(name, archive.into_entries(), progress_callback, threads)?;
+            repository.restore_entries(
+                name,
+                archive.into_entries(),
+                None,
+                progress_callback,
+                threads,
+            )?;
         }
     }
 

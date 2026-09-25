@@ -129,7 +129,7 @@ func TestMainEraAPI(t *testing.T) {
 	}
 	RecursiveFree(entry)
 
-	path, err := repo.RestoreArchive("first", nil, 2)
+	path, err := repo.RestoreArchive("first", nil, nil, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestMainEraAPI(t *testing.T) {
 		t.Fatalf("restored content: %v", err)
 	}
 	// Restoring again replaces the previous restore.
-	if _, err := repo.RestoreArchive("first", nil, 2); err != nil {
+	if _, err := repo.RestoreArchive("first", nil, nil, 2); err != nil {
 		t.Fatal(err)
 	}
 

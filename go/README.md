@@ -24,8 +24,8 @@ _, err = repo.CreateArchive("nightly", "/srv/server/world", func(path string) {
     log.Println("chunking", path)
 }, nil, nil, 8) // nil compression callback = deflate
 
-path, err := repo.RestoreArchive("nightly", nil, 8) // into .ddup-bak/archives-restored/nightly
-err = repo.RestoreArchiveTo("nightly", "/srv/restore", nil, 8)
+path, err := repo.RestoreArchive("nightly", nil, nil, 8) // into .ddup-bak/archives-restored/nightly
+err = repo.RestoreArchiveTo("nightly", "/srv/restore", nil, nil, 8)
 
 archive, err := repo.GetArchive("nightly")
 defer archive.Free()

@@ -111,6 +111,9 @@ impl Repository {
     ///
     /// Use this when `open()` fails because the chunk index is corrupt or
     /// missing (e.g. after a disk-full event).
+    ///
+    /// After all archives are counted, `progress` is called once per chunk with its final
+    /// reference count, including chunks nothing references any more.
     pub fn rebuild(
         directory: &Path,
         chunk_size: usize,
@@ -693,16 +696,23 @@ impl Repository {
 
     /// Restores an archive into the repository's `.ddup-bak/archives-restored/<name>` directory,
     /// replacing whatever a previous restore left there, and returns that path.
+    ///
+    /// Each entry is reported with its final path, once to `progress` before it is created and
+    /// once to `restored` after it is fully restored. A directory counts as restored after all its
+    /// children and its own metadata, so children are reported to `restored` before their parent.
+    /// Entries that fail are never reported to `restored`. Calls come from several threads, so
+    /// the order between unrelated entries is unspecified.
     pub fn restore_archive(
         &self,
         name: &str,
         progress: ProgressCallback,
+        restored: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
         // Locked before reading the archive so a delete can't run in between.
         let _lock = Lock::shared(&self.chunks_lock_path())?;
         let archive = self.get_archive(name)?;
-        self.restore_entries(name, archive.into_entries(), progress, threads)
+        self.restore_entries(name, archive.into_entries(), progress, restored, threads)
     }
 
     /// `restore_archive` for entries picked out of an archive.
@@ -711,21 +721,26 @@ impl Repository {
         name: &str,
         entries: Vec<Entry>,
         progress: ProgressCallback,
+        restored: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<PathBuf> {
         let destination = self.restored_path(name)?;
-        self.restore_entries_replacing(entries, &destination, progress, threads)?;
+        self.restore_entries_replacing(entries, &destination, progress, restored, threads)?;
         Ok(destination)
     }
 
     /// Restores into staging, then swaps it into `destination`. Existing entries are kept until
     /// the swap succeeds and moved back if it fails. `.ddup-bak` and `.ddup-bak-restore*` entries
     /// are left alone. Not atomic against other writers or a crash.
+    ///
+    /// Callbacks work as in `restore_archive`. They report paths in `destination`, but entries
+    /// are only moved there from staging once all of them are restored, before this returns.
     pub fn restore_entries_replacing(
         &self,
         entries: Vec<Entry>,
         destination: &Path,
         progress: ProgressCallback,
+        restored: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<()> {
         let _lock = Lock::shared(&self.chunks_lock_path())?;
@@ -741,35 +756,61 @@ impl Repository {
             Err(err) => return Err(err),
         }
         std::fs::create_dir_all(destination)?;
+        let reported = destination.to_path_buf();
         let destination = destination.canonicalize()?;
         let locks = self.directory.join(".ddup-bak/restore-locks");
         std::fs::create_dir_all(&locks)?;
         let key = chunks::hex(blake3::hash(destination.as_os_str().as_encoded_bytes()).as_bytes());
         let _turn = Lock::exclusive(&locks.join(format!("destination-{}", &key[..16])))?;
         let mut staging = crate::restore::StagedRestore::new(&destination)?;
-        self.restore_entries_to(entries, &staging.path(), progress, threads)?;
+        let staged = staging.path();
+        // Report where entries end up, as the caller named it, not where they are staged.
+        let published = |callback: ProgressCallback| {
+            callback.map(|callback| {
+                let (staged, reported) = (staged.clone(), reported.clone());
+                Arc::new(move |path: &Path| {
+                    callback(&reported.join(path.strip_prefix(&staged).unwrap_or(path)))
+                }) as Arc<dyn Fn(&Path) + Send + Sync>
+            })
+        };
+        self.restore_entries_to(
+            entries,
+            &staged,
+            published(progress),
+            published(restored),
+            threads,
+        )?;
         staging.publish(&destination)
     }
 
+    /// Restores an archive into `destination`. Callbacks work as in `restore_archive`.
     pub fn restore_archive_to(
         &self,
         name: &str,
         destination: &Path,
         progress: ProgressCallback,
+        restored: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<()> {
         let _lock = Lock::shared(&self.chunks_lock_path())?;
         let archive = self.get_archive(name)?;
-        self.restore_entries_to(archive.into_entries(), destination, progress, threads)
+        self.restore_entries_to(
+            archive.into_entries(),
+            destination,
+            progress,
+            restored,
+            threads,
+        )
     }
 
     /// Restores entries into `destination`, creating it if missing. Never overwrites or follows
-    /// existing paths.
+    /// existing paths. Callbacks work as in `restore_archive`.
     pub fn restore_entries_to(
         &self,
         entries: Vec<Entry>,
         destination: &Path,
         progress: ProgressCallback,
+        restored: ProgressCallback,
         threads: usize,
     ) -> std::io::Result<()> {
         let _lock = Lock::shared(&self.chunks_lock_path())?;
@@ -783,11 +824,20 @@ impl Repository {
 
         pool.in_place_scope(|scope| {
             for entry in entries {
-                let (storage, progress, error) = (&self.storage, &progress, &error);
+                let (storage, progress, restored, error) =
+                    (&self.storage, &progress, &restored, &error);
                 let algorithm = self.hash_algorithm;
                 scope.spawn(move |_| {
                     record(
-                        restore_entry(storage, algorithm, entry, destination, progress, error),
+                        restore_entry(
+                            storage,
+                            algorithm,
+                            entry,
+                            destination,
+                            progress,
+                            restored,
+                            error,
+                        ),
                         error,
                     );
                 });
@@ -877,6 +927,9 @@ impl Repository {
     /// Moves the archive to `.ddup-bak/deleting`, deletes the chunks only it used, then saves the
     /// index. Deleting first frees space even on a full disk. `settle_pending` finishes interrupted
     /// deletes.
+    ///
+    /// `progress` is called once per chunk the archive uses, with whether it was deleted, and once
+    /// for each chunk deleted while finishing interrupted deletes. Calls come from several threads.
     pub fn delete_archive(
         &self,
         name: &str,
@@ -906,7 +959,7 @@ impl Repository {
         }
         Self::refuse_deletion(&unreadable)?;
         let index = ChunkIndex::load(&self.index_path())?;
-        let (index, mut markers) = self.settle_pending(index)?;
+        let (index, mut markers) = self.settle_pending(index, &progress)?;
 
         if live {
             let mut hashes = Vec::new();
@@ -917,10 +970,18 @@ impl Repository {
             self.sync_archive_dirs()?;
             markers.push(marker);
 
-            let deletions: Vec<_> = hashes
+            let mut counts: HashMap<ChunkHash, u64> = HashMap::new();
+            for hash in hashes {
+                *counts.entry(hash).or_default() += 1;
+            }
+            let deletions: Vec<_> = counts
                 .into_iter()
-                .map(|hash| {
-                    let deleted = index.dereference(&hash) == 0;
+                .map(|(hash, count)| {
+                    let mut remaining = 0;
+                    for _ in 0..count {
+                        remaining = index.dereference(&hash);
+                    }
+                    let deleted = remaining == 0;
                     if deleted {
                         index.remove(&hash);
                     }
@@ -1006,9 +1067,13 @@ impl Repository {
     }
 
     /// Finishes interrupted deletions: recounts their chunks from the remaining archives, deletes
-    /// unreferenced ones, and returns the markers to remove after the caller saves the index.
-    /// Needs the chunks lock held exclusively.
-    fn settle_pending(&self, index: ChunkIndex) -> std::io::Result<(ChunkIndex, Vec<PathBuf>)> {
+    /// unreferenced ones, reporting each to `progress`, and returns the markers to remove after
+    /// the caller saves the index. Needs the chunks lock held exclusively.
+    fn settle_pending(
+        &self,
+        index: ChunkIndex,
+        progress: &DeletionProgressCallback,
+    ) -> std::io::Result<(ChunkIndex, Vec<PathBuf>)> {
         let markers = self.pending_markers()?;
         if markers.is_empty() {
             return Ok((index, Vec::new()));
@@ -1047,6 +1112,9 @@ impl Repository {
             if count == 0 {
                 self.delete_chunk(&hash)?;
                 index.remove(&hash);
+                if let Some(progress) = progress {
+                    progress(&hash, true);
+                }
             } else {
                 index.set(&hash, count);
             }
@@ -1079,12 +1147,13 @@ impl Repository {
         Ok(())
     }
 
-    /// Deletes unreferenced chunks, including ones left behind by interrupted backups.
+    /// Deletes unreferenced chunks, including ones left behind by interrupted backups and deletes.
+    /// `progress` is called once per deleted chunk, always with `deleted` set.
     pub fn clean(&self, progress: DeletionProgressCallback) -> std::io::Result<()> {
         let _lock = Lock::exclusive(&self.chunks_lock_path())?;
         Self::refuse_deletion(&self.unreadable_archives()?)?;
         let index = ChunkIndex::load(&self.index_path())?;
-        let (index, markers) = self.settle_pending(index)?;
+        let (index, markers) = self.settle_pending(index, &progress)?;
 
         self.storage.remove_leftovers()?;
         self.remove_partial_archives()?;
@@ -1135,6 +1204,7 @@ fn restore_entry(
     entry: Entry,
     directory: &Path,
     progress: &ProgressCallback,
+    restored: &ProgressCallback,
     error: &Mutex<Option<std::io::Error>>,
 ) -> std::io::Result<()> {
     let path = directory.join(entry.name());
@@ -1192,7 +1262,9 @@ fn restore_entry(
                     let path = &path;
                     scope.spawn(move |_| {
                         record(
-                            restore_entry(storage, algorithm, child, path, progress, error),
+                            restore_entry(
+                                storage, algorithm, child, path, progress, restored, error,
+                            ),
                             error,
                         );
                     });
@@ -1212,7 +1284,11 @@ fn restore_entry(
             symlink(&link_entry, &path)?;
             chown(&path, link_entry.owner)
         }
+    }?;
+    if let Some(restored) = restored {
+        restored(&path);
     }
+    Ok(())
 }
 
 fn record(result: std::io::Result<()>, error: &Mutex<Option<std::io::Error>>) {

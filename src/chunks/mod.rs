@@ -11,6 +11,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs::File,
+    hash::{BuildHasherDefault, Hasher},
     io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -36,6 +37,10 @@ const CHUNK_HEADER_LEN: u64 = 1;
 const INDEX_MAGIC_V4: &[u8; 8] = b"DDUPIDX4";
 const INDEX_MAGIC_V3: &[u8; 8] = b"DDUPIDX3";
 const INDEX_MAGIC_V2: &[u8; 8] = b"DDUPIDX2";
+/// Magic plus the 17 bytes `parse_header` reads, in formats 3 and 4.
+const INDEX_HEADER_LEN: usize = 25;
+/// Smallest index record: a hash and a one-byte reference count.
+const INDEX_RECORD_MIN_LEN: usize = 33;
 
 /// Hash that names chunk files, fixed per chunk store and recorded in the index header.
 /// BLAKE2b is the default for compatibility; BLAKE3 is faster and opt-in.
@@ -99,7 +104,47 @@ pub struct ChunkIndex {
     pub chunk_size: usize,
     pub max_chunk_count: usize,
     pub hash_algorithm: HashAlgorithm,
-    chunks: DashMap<ChunkHash, u64>,
+    chunks: DashMap<ChunkHash, Count, BuildHasherDefault<PrefixHasher>>,
+}
+
+/// A reference count in the low 63 bits, with the top bit marking a chunk that `reference` took
+/// from zero: one the loaded index did not count.
+#[derive(Clone, Copy, Default)]
+struct Count(u64);
+
+impl Count {
+    const NEW: u64 = 1 << 63;
+
+    fn of(references: u64) -> Self {
+        Self(references & !Self::NEW)
+    }
+
+    fn get(self) -> u64 {
+        self.0 & !Self::NEW
+    }
+
+    fn is_new(self) -> bool {
+        self.0 & Self::NEW != 0
+    }
+}
+
+/// Chunk hashes are already uniform, so the index keys its map by their leading bytes instead of
+/// hashing them again. `[u8; 32]` hashes as a length prefix followed by the bytes, two `write`
+/// calls, so each call is mixed into the last rather than replacing it.
+#[derive(Default)]
+struct PrefixHasher(u64);
+
+impl Hasher for PrefixHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut word = [0; 8];
+        let len = bytes.len().min(8);
+        word[..len].copy_from_slice(&bytes[..len]);
+        self.0 = self.0.rotate_left(8) ^ u64::from_le_bytes(word);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl ChunkIndex {
@@ -108,7 +153,7 @@ impl ChunkIndex {
             chunk_size,
             max_chunk_count,
             hash_algorithm,
-            chunks: DashMap::new(),
+            chunks: DashMap::default(),
         }
     }
 
@@ -121,31 +166,46 @@ impl ChunkIndex {
                 "index uses format 1; the repository has not been migrated",
             ));
         }
-        // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
-        // reads cheap.
-        if header.version == 4 {
-            let mut bytes = std::fs::read(path)?;
-            let Some(body) = bytes.len().checked_sub(32) else {
-                return Err(invalid("index is cut short"));
-            };
-            if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
-                return Err(invalid("index does not match its checksum"));
-            }
-            bytes.truncate(body);
-            let mut cursor = Cursor::new(bytes);
-            cursor.set_position(25);
-            reader = Box::new(cursor);
+        if header.version != 4 {
+            return Self::read_records(header, &mut reader, count, 1 << 20);
         }
 
-        let index = Self::new(
-            header.chunk_size,
-            header.max_chunk_count,
-            header.hash_algorithm,
-        );
+        // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
+        // reads cheap.
+        let bytes = std::fs::read(path)?;
+        let Some(body) = bytes.len().checked_sub(32) else {
+            return Err(invalid("index is cut short"));
+        };
+        if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
+            return Err(invalid("index does not match its checksum"));
+        }
+        let mut records = bytes.get(INDEX_HEADER_LEN..body).unwrap_or_default();
+        let capacity = records.len() / INDEX_RECORD_MIN_LEN;
+        Self::read_records(header, &mut records, count, capacity)
+    }
+
+    /// Reads an index of `count` (hash, references) records that must end the reader. `capacity`
+    /// caps what a damaged count can allocate. Generic so the in-memory format 4 path inlines the
+    /// varint reads.
+    fn read_records(
+        header: IndexHeader,
+        reader: &mut impl Read,
+        count: u64,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
+        let index = Self {
+            chunk_size: header.chunk_size,
+            max_chunk_count: header.max_chunk_count,
+            hash_algorithm: header.hash_algorithm,
+            chunks: DashMap::with_capacity_and_hasher(
+                count.min(capacity as u64) as usize,
+                Default::default(),
+            ),
+        };
         let mut hash = [0; 32];
         for _ in 0..count {
             reader.read_exact(&mut hash)?;
-            let references = varint::decode(&mut reader)?;
+            let references = varint::decode(reader)?;
             // Rejected so incrementing can't overflow.
             if references > MAX_REFERENCES {
                 return Err(invalid(format!(
@@ -153,12 +213,11 @@ impl ChunkIndex {
                     hex(&hash)
                 )));
             }
-            index.chunks.insert(hash, references);
+            index.chunks.insert(hash, Count::of(references));
         }
         if reader.read(&mut [0])? != 0 {
             return Err(invalid("index has trailing data"));
         }
-
         Ok(index)
     }
 
@@ -183,7 +242,9 @@ impl ChunkIndex {
             }
             let id = varint::decode(&mut reader)?;
             let references = varint::decode(&mut reader)?;
-            index.chunks.insert(hash, references);
+            index
+                .chunks
+                .insert(hash, Count::of(references.min(MAX_REFERENCES)));
             ids.insert(id, hash);
         }
         // The stream can end cleanly before the promised record count.
@@ -236,7 +297,9 @@ impl ChunkIndex {
             if damaged(varint::decode(&mut reader).map(|v| references = v))? {
                 break;
             }
-            index.chunks.insert(hash, references);
+            index
+                .chunks
+                .insert(hash, Count::of(references.min(MAX_REFERENCES)));
             ids.insert(id, hash);
         }
 
@@ -320,7 +383,7 @@ impl ChunkIndex {
         writer.write_all(&(self.chunks.len() as u64).to_le_bytes())?;
         for entry in self.chunks.iter() {
             writer.write_all(entry.key())?;
-            varint::encode(&mut writer, *entry.value())?;
+            varint::encode(&mut writer, entry.value().get())?;
         }
         let Hashing { mut inner, hasher } = writer;
         inner.write_all(hasher.finalize().as_bytes())?;
@@ -343,13 +406,13 @@ impl ChunkIndex {
     ) -> std::io::Result<Self> {
         let index = Self::new(chunk_size, max_chunk_count, hash_algorithm);
         for hash in storage.list_chunk_hashes()? {
-            index.chunks.insert(hash, 0);
+            index.chunks.insert(hash, Count::default());
         }
         for archive in archives {
             index.count_references(archive?.into_entries())?;
         }
         for entry in index.chunks.iter() {
-            progress(entry.key(), *entry.value());
+            progress(entry.key(), entry.value().get());
         }
         Ok(index)
     }
@@ -383,27 +446,35 @@ impl ChunkIndex {
 
     #[inline]
     pub fn references(&self, hash: &ChunkHash) -> u64 {
-        self.chunks.get(hash).map_or(0, |count| *count)
+        self.chunks.get(hash).map_or(0, |count| count.get())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ChunkHash, u64)> + '_ {
         self.chunks
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .map(|entry| (*entry.key(), entry.value().get()))
     }
 
     /// Increments the reference count and returns it; 1 means the chunk is new.
     pub fn reference(&self, hash: &ChunkHash) -> u64 {
-        let mut count = self.chunks.entry(*hash).or_insert(0);
-        *count = count.saturating_add(1).min(MAX_REFERENCES);
-        *count
+        self.reference_new(hash).0
+    }
+
+    /// `reference`, plus whether the loaded index did not count the chunk. A backup's first
+    /// reference to such a chunk writes it, so later ones neither write it nor look for it.
+    pub(crate) fn reference_new(&self, hash: &ChunkHash) -> (u64, bool) {
+        let mut count = self.chunks.entry(*hash).or_default();
+        let references = (count.get() + 1).min(MAX_REFERENCES);
+        let new = references == 1 || count.is_new();
+        *count = Count(references | if new { Count::NEW } else { 0 });
+        (references, new)
     }
 
     /// Decrements the reference count and returns the new count.
     pub fn dereference(&self, hash: &ChunkHash) -> u64 {
         self.chunks.get_mut(hash).map_or(0, |mut count| {
-            *count = count.saturating_sub(1);
-            *count
+            *count = Count(count.0 - count.get().min(1));
+            count.get()
         })
     }
 
@@ -412,13 +483,13 @@ impl ChunkIndex {
     }
 
     pub fn set(&self, hash: &ChunkHash, count: u64) {
-        self.chunks.insert(*hash, count);
+        self.chunks.insert(*hash, Count::of(count));
     }
 
     pub fn unreferenced(&self) -> Vec<ChunkHash> {
         self.chunks
             .iter()
-            .filter(|entry| *entry.value() == 0)
+            .filter(|entry| entry.value().get() == 0)
             .map(|entry| *entry.key())
             .collect()
     }
@@ -589,8 +660,14 @@ pub(crate) fn write_chunk(
     hash: &ChunkHash,
     data: &[u8],
     compression: CompressionFormat,
+    durable: bool,
 ) -> std::io::Result<()> {
-    storage.write_chunk_content(hash, &encode_chunk(data, compression)?)
+    let content = encode_chunk(data, compression)?;
+    if durable {
+        storage.write_chunk_content_durable(hash, &content)
+    } else {
+        storage.write_chunk_content(hash, &content)
+    }
 }
 
 /// A format byte followed by the data. Chunks that don't shrink are stored raw. Zstd frames

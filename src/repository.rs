@@ -1512,14 +1512,20 @@ impl Job<'_> {
             (&file).read_to_end(&mut data)?;
         }
         if metadata.len() <= max as u64 && data.len() <= max {
-            rayon::scope(|scope| {
-                for chunk in fastcdc::v2020::FastCDC::new(&data, min, avg, max) {
-                    let chunk = &data[chunk.offset..chunk.offset + chunk.length];
-                    size += chunk.len() as u64;
-                    self.store(scope, Cow::Borrowed(chunk), compression, &hashes)?;
-                }
-                Ok::<(), std::io::Error>(())
-            })?;
+            let chunks: Vec<_> = fastcdc::v2020::FastCDC::new(&data, min, avg, max).collect();
+            size = data.len() as u64;
+            if let [chunk] = &chunks[..] {
+                let chunk = &data[chunk.offset..chunk.offset + chunk.length];
+                hashes.lock().push(self.store_one(chunk, compression)?);
+            } else {
+                rayon::scope(|scope| {
+                    for chunk in &chunks {
+                        let chunk = &data[chunk.offset..chunk.offset + chunk.length];
+                        self.store(scope, Cow::Borrowed(chunk), compression, &hashes)?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })?;
+            }
         } else {
             // `data` holds what was read before the file turned out larger than expected.
             let reader = Cursor::new(data).chain(file);
@@ -1536,8 +1542,8 @@ impl Job<'_> {
         Ok((hashes.into_inner(), size))
     }
 
-    /// Hashes a chunk into the next slot of `hashes` and stores it unless the index already has
-    /// it. Runs on `scope` when a slot is free, so a file's chunks hash in parallel.
+    /// `store_one` into the next slot of `hashes`. Runs on `scope` when a slot is free, so a
+    /// file's chunks hash in parallel.
     fn store<'s>(
         &'s self,
         scope: &rayon::Scope<'s>,
@@ -1551,20 +1557,7 @@ impl Job<'_> {
             hashes.len() - 1
         };
         let store = move || {
-            let hash = self.index.hash_algorithm.hash(&data);
-            hashes.lock()[slot] = hash;
-            let (references, new) = self.index.reference_new(&hash);
-            // A new chunk is written by its first reference. A count in the saved index doesn't
-            // prove the chunk exists; a lost one is rewritten here.
-            if references > 1 && (new || self.storage.has_chunk(&hash)?) {
-                return Ok(());
-            }
-            chunks::write_chunk(&**self.storage, &hash, &data, compression)?;
-            // The saved index already trusts a rewritten lost chunk, so it is synced at once: the
-            // backup may fail or crash before its own sync and leave it torn.
-            if !new {
-                self.storage.sync_chunk(&hash)?;
-            }
+            hashes.lock()[slot] = self.store_one(&data, compression)?;
             Ok(())
         };
 
@@ -1577,6 +1570,21 @@ impl Job<'_> {
         } else {
             store()
         }
+    }
+
+    /// Hashes a chunk and stores it unless the index already has it.
+    fn store_one(&self, data: &[u8], compression: CompressionFormat) -> std::io::Result<ChunkHash> {
+        let hash = self.index.hash_algorithm.hash(data);
+        let (references, new) = self.index.reference_new(&hash);
+        // A new chunk is written by its first reference. A count in the saved index doesn't prove
+        // the chunk exists; a lost one is rewritten here.
+        if references > 1 && (new || self.storage.has_chunk(&hash)?) {
+            return Ok(hash);
+        }
+        // The saved index already trusts a rewritten lost chunk, so a crash before the backup's
+        // sync must not leave it torn.
+        chunks::write_chunk(&**self.storage, &hash, data, compression, !new)?;
+        Ok(hash)
     }
 }
 

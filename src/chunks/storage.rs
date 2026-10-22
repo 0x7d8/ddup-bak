@@ -50,12 +50,10 @@ pub trait ChunkStorage: Send + Sync {
     /// around another storage can't silently drop the inner one's sync.
     fn sync(&self) -> std::io::Result<()>;
 
-    /// Makes one written chunk durable. Backups call it for a chunk the saved index already
-    /// counts, which can't wait for `sync`. A wrapper should forward it: the default syncs
-    /// everything.
-    fn sync_chunk(&self, _chunk: &ChunkHash) -> std::io::Result<()> {
-        self.sync()
-    }
+    /// `write_chunk_content` for a chunk the saved index already counts, whose content must be
+    /// durable before it appears rather than at the next `sync`. Required for the same reason.
+    fn write_chunk_content_durable(&self, chunk: &ChunkHash, content: &[u8])
+    -> std::io::Result<()>;
 }
 
 pub struct ChunkStorageLocal {
@@ -70,27 +68,15 @@ impl ChunkStorageLocal {
             durable: Default::default(),
         }
     }
-}
 
-impl ChunkStorage for ChunkStorageLocal {
-    fn read_chunk_content(
-        &self,
-        chunk: &ChunkHash,
-    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
-        Ok(Box::new(File::open(
-            self.path.join(self.path_from_chunk(chunk)),
-        )?))
-    }
-
-    fn write_chunk_content(&self, chunk: &ChunkHash, content: &[u8]) -> std::io::Result<()> {
+    fn write(&self, chunk: &ChunkHash, content: &[u8], durable: bool) -> std::io::Result<()> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        // Replaces an existing file: one the index doesn't count may be torn by a crash before
-        // `sync`.
         let path = self.path.join(self.path_from_chunk(chunk));
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
-        durable::begin(&self.path, &self.durable)?;
+        self.durable.begin(&self.path)?;
+        let durable = durable || path.symlink_metadata().is_ok();
 
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
@@ -105,7 +91,7 @@ impl ChunkStorage for ChunkStorageLocal {
 
         if let Err(err) = file
             .write_all(content)
-            .and_then(|()| durable::chunk(&self.durable, &file))
+            .and_then(|()| self.durable.chunk(&file, durable))
         {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
@@ -115,20 +101,35 @@ impl ChunkStorage for ChunkStorageLocal {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
-        durable::wrote(&self.durable, path);
+        self.durable.wrote(&path, file);
         Ok(())
+    }
+}
+
+impl ChunkStorage for ChunkStorageLocal {
+    fn read_chunk_content(
+        &self,
+        chunk: &ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        Ok(Box::new(File::open(
+            self.path.join(self.path_from_chunk(chunk)),
+        )?))
+    }
+
+    fn write_chunk_content(&self, chunk: &ChunkHash, content: &[u8]) -> std::io::Result<()> {
+        self.write(chunk, content, false)
+    }
+
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.write(chunk, content, true)
     }
 
     fn sync(&self) -> std::io::Result<()> {
-        durable::all(&self.path, &self.durable)
-    }
-
-    fn sync_chunk(&self, chunk: &ChunkHash) -> std::io::Result<()> {
-        durable::one(
-            &self.path,
-            &self.durable,
-            &self.path.join(self.path_from_chunk(chunk)),
-        )
+        self.durable.all(&self.path)
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
@@ -230,9 +231,6 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
     Some(hash)
 }
 
-/// Chunk durability in four steps: `begin` before a chunk is written, `chunk` and `wrote` after,
-/// and `all` once per backup. `one` does for a single chunk at `path` what `all` does for every
-/// chunk.
 #[cfg(unix)]
 mod durable {
     use parking_lot::Mutex;
@@ -250,48 +248,52 @@ mod durable {
         batch: batch::Batch,
     }
 
-    pub fn begin(_dir: &Path, _state: &State) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        _state.batch.begin(_dir)?;
-        Ok(())
-    }
-
-    pub fn chunk(_state: &State, file: &File) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if _state.batch.active() {
-            return Ok(());
+    impl State {
+        pub fn begin(&self, dir: &Path) -> std::io::Result<()> {
+            #[cfg(target_os = "linux")]
+            self.batch.begin(dir)?;
+            #[cfg(not(target_os = "linux"))]
+            let _ = dir;
+            Ok(())
         }
-        sync(file)
-    }
 
-    pub fn wrote(state: &State, path: PathBuf) {
-        let parent = path.parent().unwrap();
-        let mut dirs = state.dirs.lock();
-        if !dirs.contains(parent) {
-            dirs.insert(parent.to_path_buf());
+        /// Syncs a written chunk unless `all` will. `now` makes it durable here regardless.
+        pub fn chunk(&self, file: &File, now: bool) -> std::io::Result<()> {
+            if now {
+                return file.sync_all();
+            }
+            #[cfg(target_os = "linux")]
+            if self.batch.active() {
+                return Ok(());
+            }
+            sync(file)
         }
-        drop(dirs);
-        #[cfg(target_os = "linux")]
-        state.batch.wrote(path);
-    }
 
-    pub fn all(dir: &Path, state: &State) -> std::io::Result<()> {
-        let dirs = std::mem::take(&mut *state.dirs.lock());
-        #[cfg(target_os = "linux")]
-        if state.batch.all()? {
-            return Ok(());
+        pub fn wrote(&self, path: &Path, file: File) {
+            let parent = path.parent().unwrap();
+            let mut dirs = self.dirs.lock();
+            if !dirs.contains(parent) {
+                dirs.insert(parent.to_path_buf());
+            }
+            drop(dirs);
+            #[cfg(target_os = "linux")]
+            self.batch.wrote(file);
+            #[cfg(not(target_os = "linux"))]
+            let _ = file;
         }
-        sync_dirs(dirs.iter().map(PathBuf::as_path))?;
-        flush(dir)
-    }
 
-    pub fn one(dir: &Path, _state: &State, path: &Path) -> std::io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if _state.batch.active() {
-            sync_path(path)?;
+        pub fn all(&self, dir: &Path) -> std::io::Result<()> {
+            let dirs = std::mem::take(&mut *self.dirs.lock());
+            #[cfg(target_os = "linux")]
+            if self.batch.all()? {
+                return Ok(());
+            }
+            if dirs.is_empty() {
+                return Ok(());
+            }
+            sync_dirs(dirs.iter().map(PathBuf::as_path))?;
+            flush(dir)
         }
-        sync_dirs(path.parent())?;
-        flush(dir)
     }
 
     /// Syncs the directories and the two levels above each, which `write_chunk_content` may have
@@ -301,22 +303,19 @@ mod durable {
             .into_iter()
             .flat_map(|dir| dir.ancestors().take(3))
             .collect();
-        dirs.into_iter().try_for_each(sync_path)
-    }
-
-    fn sync_path(path: &Path) -> std::io::Result<()> {
-        match File::open(path) {
+        dirs.into_iter().try_for_each(|dir| match File::open(dir) {
             Ok(file) => sync(&file),
-            // `clean` may have deleted a chunk that a failed backup wrote.
+            // `clean` may have removed a directory that a failed backup wrote into.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
-        }
+        })
     }
 
     /// Plain `fsync` on Apple hands the data to the drive without flushing its cache, which
     /// `sync_all` would do per call; `flush` does that once.
     fn sync(file: &File) -> std::io::Result<()> {
         #[cfg(target_vendor = "apple")]
+        // SAFETY: `file` owns a valid descriptor for the duration of the call.
         if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(file)) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -326,21 +325,22 @@ mod durable {
     }
 
     /// F_FULLFSYNC flushes the drive's cache, which holds everything `sync` handed it.
-    fn flush(_dir: &Path) -> std::io::Result<()> {
+    fn flush(dir: &Path) -> std::io::Result<()> {
         #[cfg(target_vendor = "apple")]
-        File::open(_dir)?.sync_all()?;
+        crate::chunks::sync_dir(dir)?;
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = dir;
         Ok(())
     }
 
     /// One `syncfs` for a backup's chunks instead of a sync per chunk, where that is safe.
     #[cfg(target_os = "linux")]
     mod batch {
-        use super::sync_path;
         use parking_lot::Mutex;
         use std::{
             fs::File,
             os::fd::AsRawFd,
-            path::{Path, PathBuf},
+            path::Path,
             sync::{LazyLock, OnceLock},
         };
 
@@ -348,11 +348,19 @@ mod durable {
         /// also flushes everything else on the filesystem.
         const FSYNC_LIMIT: usize = 64;
 
-        /// Filesystems whose `syncfs` makes the data durable and reports failed writes: ext,
-        /// XFS, Btrfs, F2FS and ZFS. FUSE doesn't pass it to its daemon and overlayfs may drop
-        /// the errors, so anything else syncs each chunk.
-        const SYNCFS_FILESYSTEMS: [u32; 5] =
-            [0xEF53, 0x5846_5342, 0x9123_683E, 0xF2F5_2010, 0x2FC1_2FC1];
+        /// Filesystems whose `syncfs` makes the data durable and reports failed writes. FUSE
+        /// doesn't pass it to its daemon and overlayfs may drop the errors, so anything else
+        /// syncs each chunk.
+        const SYNCFS_FILESYSTEMS: [u32; 5] = [
+            libc::EXT4_SUPER_MAGIC as u32,
+            XFS_SUPER_MAGIC,
+            libc::BTRFS_SUPER_MAGIC as u32,
+            libc::F2FS_SUPER_MAGIC as u32,
+            ZFS_SUPER_MAGIC,
+        ];
+        /// Missing from libc on musl.
+        const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+        const ZFS_SUPER_MAGIC: u32 = 0x2FC1_2FC1;
 
         /// `syncfs` reports failed writes since Linux 5.8. Older kernels sync each chunk, as does
         /// a kernel whose version can't be read.
@@ -367,50 +375,74 @@ mod durable {
 
         #[derive(Default)]
         pub struct Batch {
-            /// The chunk directory, if `syncfs` is used there. `syncfs` misses a failed write
-            /// that another caller saw before its descriptor was opened, so this one is opened
-            /// ahead of the chunk writes.
-            dir: OnceLock<Option<File>>,
-            /// Chunks written since the last `all`. Stops growing one past `FSYNC_LIMIT`.
-            written: Mutex<Vec<PathBuf>>,
+            /// Whether `syncfs` is used, decided by the first `begin`.
+            syncfs: OnceLock<bool>,
+            pending: Mutex<Pending>,
+        }
+
+        /// What `all` syncs, gathered since the last call.
+        #[derive(Default)]
+        struct Pending {
+            /// The chunk directory, opened before the first chunk write: `syncfs` misses a failed
+            /// write that another caller saw before its descriptor was opened, and one kept
+            /// across backups reports failures from long before.
+            dir: Option<File>,
+            /// Kept open so a failed write is still reported when they are synced.
+            files: Vec<File>,
+            /// More than `FSYNC_LIMIT` chunks were written, so `files` was dropped for `syncfs`.
+            overflowed: bool,
         }
 
         impl Batch {
             pub fn begin(&self, dir: &Path) -> std::io::Result<()> {
-                if self.dir.get().is_none() {
+                if self.syncfs.get() == Some(&false) {
+                    return Ok(());
+                }
+                let mut pending = self.pending.lock();
+                if pending.dir.is_none() {
                     let dir = File::open(dir)?;
-                    let batch = *SYNCFS_REPORTS_ERRORS && syncfs_is_durable(&dir)?;
-                    let _ = self.dir.set(batch.then_some(dir));
+                    if self.syncfs.get().is_none() {
+                        let _ = self
+                            .syncfs
+                            .set(*SYNCFS_REPORTS_ERRORS && syncfs_is_durable(&dir)?);
+                    }
+                    if self.active() {
+                        pending.dir = Some(dir);
+                    }
                 }
                 Ok(())
             }
 
-            /// Whether chunks are left unsynced for `all`.
             pub fn active(&self) -> bool {
-                matches!(self.dir.get(), Some(Some(_)))
+                self.syncfs.get() == Some(&true)
             }
 
-            pub fn wrote(&self, path: PathBuf) {
+            pub fn wrote(&self, file: File) {
                 if !self.active() {
                     return;
                 }
-                let mut written = self.written.lock();
-                if written.len() <= FSYNC_LIMIT {
-                    written.push(path);
+                let mut pending = self.pending.lock();
+                if !pending.overflowed && pending.files.len() < FSYNC_LIMIT {
+                    pending.files.push(file);
+                } else {
+                    pending.overflowed = true;
+                    pending.files.clear();
                 }
             }
 
             /// Syncs the chunks written since the last call. `true` if it flushed the whole
             /// filesystem, directories included; a few chunks are synced on their own instead.
             pub fn all(&self) -> std::io::Result<bool> {
-                let Some(Some(dir)) = self.dir.get() else {
+                let Pending {
+                    dir,
+                    files,
+                    overflowed,
+                } = std::mem::take(&mut *self.pending.lock());
+                let Some(dir) = dir.filter(|_| overflowed) else {
+                    files.iter().try_for_each(File::sync_all)?;
                     return Ok(false);
                 };
-                let written = std::mem::take(&mut *self.written.lock());
-                if written.len() <= FSYNC_LIMIT {
-                    written.iter().try_for_each(|path| sync_path(path))?;
-                    return Ok(false);
-                }
+                // SAFETY: `dir` owns a valid descriptor for the duration of the call.
                 if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -420,9 +452,11 @@ mod durable {
 
         fn syncfs_is_durable(dir: &File) -> std::io::Result<bool> {
             let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: `dir` owns a valid descriptor and `stat` is writable for a `statfs`.
             if unsafe { libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // SAFETY: `fstatfs` succeeded, so it filled `stat`.
             let kind = unsafe { stat.assume_init() }.f_type as u32;
             Ok(SYNCFS_FILESYSTEMS.contains(&kind))
         }
@@ -432,30 +466,25 @@ mod durable {
 /// Directories can't be synced here, so only the chunks are.
 #[cfg(not(unix))]
 mod durable {
-    use std::{
-        fs::File,
-        path::{Path, PathBuf},
-    };
+    use std::{fs::File, path::Path};
 
     #[derive(Default)]
     pub struct State;
 
-    pub fn begin(_dir: &Path, _state: &State) -> std::io::Result<()> {
-        Ok(())
-    }
+    impl State {
+        pub fn begin(&self, _dir: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
 
-    pub fn chunk(_state: &State, file: &File) -> std::io::Result<()> {
-        file.sync_all()
-    }
+        pub fn chunk(&self, file: &File, _now: bool) -> std::io::Result<()> {
+            file.sync_all()
+        }
 
-    pub fn wrote(_state: &State, _path: PathBuf) {}
+        pub fn wrote(&self, _path: &Path, _file: File) {}
 
-    pub fn all(_dir: &Path, _state: &State) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    pub fn one(_dir: &Path, _state: &State, _path: &Path) -> std::io::Result<()> {
-        Ok(())
+        pub fn all(&self, _dir: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
 

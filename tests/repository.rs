@@ -275,6 +275,14 @@ impl ChunkStorage for FailingDelete {
         self.inner.list_chunk_hashes()
     }
 
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content_durable(chunk, content)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
         self.inner.sync()
     }
@@ -505,6 +513,14 @@ impl ChunkStorage for UnlockOnDelete {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.inner.list_chunk_hashes()
+    }
+
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content_durable(chunk, content)
     }
 
     fn sync(&self) -> std::io::Result<()> {
@@ -768,6 +784,14 @@ impl ChunkStorage for InterruptOnce {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.inner.list_chunk_hashes()
+    }
+
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content_durable(chunk, content)
     }
 
     fn sync(&self) -> std::io::Result<()> {
@@ -1421,6 +1445,14 @@ impl ChunkStorage for ListFirst {
         Ok(hashes)
     }
 
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content_durable(chunk, content)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
         self.inner.sync()
     }
@@ -1690,6 +1722,14 @@ impl ChunkStorage for SlowRead {
         self.0.list_chunk_hashes()
     }
 
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.0.write_chunk_content_durable(chunk, content)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
         self.0.sync()
     }
@@ -1877,13 +1917,13 @@ fn truncated_index_is_rejected() {
     assert!(fixture.backup("c", &source).is_err());
 }
 
-struct CountingSync {
+struct CountingWrites {
     inner: ChunkStorageLocal,
     writes: Arc<AtomicUsize>,
-    syncs: Arc<AtomicUsize>,
+    durable_writes: Arc<AtomicUsize>,
 }
 
-impl ChunkStorage for CountingSync {
+impl ChunkStorage for CountingWrites {
     fn read_chunk_content(
         &self,
         chunk: &ddup_bak::chunks::ChunkHash,
@@ -1908,20 +1948,28 @@ impl ChunkStorage for CountingSync {
         self.inner.list_chunk_hashes()
     }
 
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.durable_writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.write_chunk_content_durable(chunk, content)
+    }
+
     fn sync(&self) -> std::io::Result<()> {
-        self.syncs.fetch_add(1, Ordering::SeqCst);
         self.inner.sync()
     }
 }
 
 #[test]
-fn a_rewritten_lost_chunk_is_synced_without_waiting_for_the_backup_to_finish() {
-    let (writes, syncs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+fn a_rewritten_lost_chunk_is_written_durably() {
+    let (writes, durable_writes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let fixture = Fixture::with_storage(|chunks| {
-        Some(Arc::new(CountingSync {
+        Some(Arc::new(CountingWrites {
             inner: ChunkStorageLocal::new(chunks),
             writes: writes.clone(),
-            syncs: syncs.clone(),
+            durable_writes: durable_writes.clone(),
         }))
     });
     // The same chunk many times over: repeats within a backup are not lost chunks.
@@ -1935,11 +1983,12 @@ fn a_rewritten_lost_chunk_is_synced_without_waiting_for_the_backup_to_finish() {
 
     fixture.backup("a", &source).unwrap();
     assert_eq!(writes.load(Ordering::SeqCst), 1);
-    assert_eq!(syncs.swap(0, Ordering::SeqCst), 1);
+    assert_eq!(durable_writes.load(Ordering::SeqCst), 0);
 
     fs::remove_file(fixture.chunk_path(&content)).unwrap();
     fixture.backup("b", &source).unwrap();
-    assert!(syncs.load(Ordering::SeqCst) > 1);
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    assert!(durable_writes.load(Ordering::SeqCst) >= 1);
     assert_same_files(&source, &fixture.restore("b").unwrap(), &["f0"]);
 }
 
@@ -1967,6 +2016,14 @@ impl ChunkStorage for FailingSync {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.0.list_chunk_hashes()
+    }
+
+    fn write_chunk_content_durable(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.0.write_chunk_content_durable(chunk, content)
     }
 
     fn sync(&self) -> std::io::Result<()> {

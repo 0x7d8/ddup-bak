@@ -242,7 +242,9 @@ impl ChunkIndex {
             }
             let id = varint::decode(&mut reader)?;
             let references = varint::decode(&mut reader)?;
-            index.chunks.insert(hash, Count::of(references));
+            index
+                .chunks
+                .insert(hash, Count::of(references.min(MAX_REFERENCES)));
             ids.insert(id, hash);
         }
         // The stream can end cleanly before the promised record count.
@@ -295,7 +297,9 @@ impl ChunkIndex {
             if damaged(varint::decode(&mut reader).map(|v| references = v))? {
                 break;
             }
-            index.chunks.insert(hash, Count::of(references));
+            index
+                .chunks
+                .insert(hash, Count::of(references.min(MAX_REFERENCES)));
             ids.insert(id, hash);
         }
 
@@ -656,8 +660,14 @@ pub(crate) fn write_chunk(
     hash: &ChunkHash,
     data: &[u8],
     compression: CompressionFormat,
+    durable: bool,
 ) -> std::io::Result<()> {
-    storage.write_chunk_content(hash, &encode_chunk(data, compression)?)
+    let content = encode_chunk(data, compression)?;
+    if durable {
+        storage.write_chunk_content_durable(hash, &content)
+    } else {
+        storage.write_chunk_content(hash, &content)
+    }
 }
 
 /// A format byte followed by the data. Chunks that don't shrink are stored raw. Zstd frames

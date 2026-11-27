@@ -230,6 +230,8 @@ impl Default for DecodeLimits {
 }
 
 pub type ProgressCallback = Option<Arc<dyn Fn(&Path) + Send + Sync + 'static>>;
+/// Returns true once the operation should stop.
+pub type AbortCallback = Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>;
 pub type CompressionFormatCallback =
     Option<Arc<dyn Fn(&Path, &Metadata) -> CompressionFormat + Send + Sync>>;
 type RealSizeCallback = Option<Arc<dyn Fn(&Path) -> u64 + Send + Sync + 'static>>;

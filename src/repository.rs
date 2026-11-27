@@ -1,6 +1,7 @@
 use crate::{
     archive::{
-        Archive, CompressionFormat, CompressionFormatCallback, FILE_VERSION, ProgressCallback,
+        AbortCallback, Archive, CompressionFormat, CompressionFormatCallback, FILE_VERSION,
+        ProgressCallback,
         entries::{DirectoryEntry, Entry, SymlinkEntry},
         metadata_owner,
     },
@@ -500,6 +501,23 @@ impl Repository {
         compression: CompressionFormatCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
+        self.create_archive_with_abort(name, walker, root, progress, compression, None, threads)
+    }
+
+    /// `create_archive` that stops with an error once `abort` returns true, leaving no archive.
+    /// It is polled between entries and chunks, and once more right before the archive is
+    /// published.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_archive_with_abort(
+        &self,
+        name: &str,
+        walker: Option<ignore::Walk>,
+        root: Option<&Path>,
+        progress: ProgressCallback,
+        compression: CompressionFormatCallback,
+        abort: AbortCallback,
+        threads: usize,
+    ) -> std::io::Result<Archive> {
         let archive_path = self.archive_path(name)?;
         let _chunks_lock = Lock::shared(&self.chunks_lock_path())?;
         let _index_lock = Lock::exclusive(&self.index_lock_path())?;
@@ -548,9 +566,11 @@ impl Repository {
                 root,
                 progress,
                 compression,
+                &abort,
                 threads,
             )
             .and_then(|mut archive| {
+                check_abort(&abort)?;
                 // Before the index counts the new chunks, so a crash can't leave it trusting one.
                 self.storage.sync()?;
                 index.save(&self.index_path())?;
@@ -576,6 +596,7 @@ impl Repository {
         root: &Path,
         progress: ProgressCallback,
         compression: CompressionFormatCallback,
+        abort: &AbortCallback,
         threads: usize,
     ) -> std::io::Result<Archive> {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -588,6 +609,7 @@ impl Repository {
             storage: &self.storage,
             compression: &compression,
             progress: &progress,
+            abort,
             chunk_size: self.chunk_size,
             max_chunk_count: self.max_chunk_count,
             files: Inflight::new(pool.current_num_threads() * 4),
@@ -601,6 +623,7 @@ impl Repository {
                 if job.error.lock().is_some() {
                     break;
                 }
+                check_abort(abort)?;
 
                 let item = match item {
                     Ok(item) => item,
@@ -1422,6 +1445,13 @@ fn collect_hashes(entries: Vec<Entry>, hashes: &mut Vec<ChunkHash>) -> std::io::
     Ok(())
 }
 
+fn check_abort(abort: &AbortCallback) -> std::io::Result<()> {
+    if abort.as_ref().is_some_and(|abort| abort()) {
+        return Err(std::io::Error::other("archive creation aborted"));
+    }
+    Ok(())
+}
+
 /// Nests entries collected per parent directory into a tree, starting at `dir`.
 fn assemble(dir: PathBuf, children: &mut HashMap<PathBuf, Vec<Entry>>) -> Vec<Entry> {
     let mut entries = children.remove(&dir).unwrap_or_default();
@@ -1439,6 +1469,7 @@ struct Job<'a> {
     storage: &'a Arc<dyn ChunkStorage>,
     compression: &'a CompressionFormatCallback,
     progress: &'a ProgressCallback,
+    abort: &'a AbortCallback,
     chunk_size: usize,
     max_chunk_count: usize,
     files: Inflight,
@@ -1531,6 +1562,7 @@ impl Job<'_> {
             let reader = Cursor::new(data).chain(file);
             rayon::scope(|scope| {
                 for chunk in fastcdc::v2020::StreamCDC::new(reader, min, avg, max) {
+                    check_abort(self.abort)?;
                     let data = chunk.map_err(cdc_error)?.data;
                     size += data.len() as u64;
                     self.store(scope, Cow::Owned(data), compression, &hashes)?;
@@ -1574,6 +1606,7 @@ impl Job<'_> {
 
     /// Hashes a chunk and stores it unless the index already has it.
     fn store_one(&self, data: &[u8], compression: CompressionFormat) -> std::io::Result<ChunkHash> {
+        check_abort(self.abort)?;
         let hash = self.index.hash_algorithm.hash(data);
         let (references, new) = self.index.reference_new(&hash);
         // A new chunk is written by its first reference. A count in the saved index doesn't prove

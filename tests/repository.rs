@@ -1,6 +1,6 @@
 use ddup_bak::{
     archive::{
-        Archive, CompressionFormat, CompressionFormatCallback, ProgressCallback,
+        AbortCallback, Archive, CompressionFormat, CompressionFormatCallback, ProgressCallback,
         entries::{Entry, EntryMode, FileEntry},
     },
     chunks::{
@@ -67,6 +67,29 @@ impl Fixture {
             Some(Arc::new(|_, _| CompressionFormat::Deflate));
         self.repository
             .create_archive(name, Some(walker), Some(source), None, compression, 4)?;
+        Ok(())
+    }
+
+    fn backup_with_abort(
+        &self,
+        name: &str,
+        source: &Path,
+        abort: AbortCallback,
+    ) -> std::io::Result<()> {
+        let walker = ignore::WalkBuilder::new(source)
+            .standard_filters(false)
+            .build();
+        let compression: CompressionFormatCallback =
+            Some(Arc::new(|_, _| CompressionFormat::Deflate));
+        self.repository.create_archive_with_abort(
+            name,
+            Some(walker),
+            Some(source),
+            None,
+            compression,
+            abort,
+            4,
+        )?;
         Ok(())
     }
 
@@ -3155,4 +3178,65 @@ fn rebuild_reports_every_indexed_chunk_once_with_its_final_count() {
     indexed.sort();
     assert_eq!(reports, indexed);
     assert!(orphans.iter().all(|orphan| reports.contains(&(*orphan, 0))));
+}
+
+fn abort_after(polls: usize) -> (AbortCallback, Arc<AtomicUsize>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&count);
+    let abort: AbortCallback = Some(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst) + 1 >= polls
+    }));
+    (abort, count)
+}
+
+#[test]
+fn a_backup_aborted_at_any_poll_publishes_nothing_and_leaves_the_repository_usable() {
+    let fixture = Fixture::new();
+    let source = fixture.source(
+        "src",
+        &[
+            ("a", &random(20_000)),
+            ("sub/b", &seeded(1, 9_000)),
+            ("sub/c", b"c"),
+        ],
+    );
+    let paths = ["a", "sub/b", "sub/c"];
+
+    let (never, polls) = abort_after(usize::MAX);
+    fixture.backup_with_abort("probe", &source, never).unwrap();
+    assert_same_files(&source, &fixture.restore("probe").unwrap(), &paths);
+    fixture.repository.delete_archive("probe", None).unwrap();
+    let polls = polls.load(Ordering::SeqCst);
+    assert!(polls > 0);
+
+    for at in 1..=polls {
+        let (abort, _) = abort_after(at);
+        assert!(
+            fixture.backup_with_abort("b", &source, abort).is_err(),
+            "abort at poll {at}"
+        );
+        assert!(
+            fixture.repository.list_archives().unwrap().is_empty(),
+            "abort at poll {at}"
+        );
+    }
+
+    fixture.backup("b", &source).unwrap();
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &paths);
+    fixture.repository.delete_archive("b", None).unwrap();
+    fixture.repository.clean(None).unwrap();
+    assert_eq!(fixture.stored_chunks(), 0);
+}
+
+#[test]
+fn an_abort_of_a_backup_with_nothing_to_store_still_prevents_publishing() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("empty");
+    fs::create_dir_all(&source).unwrap();
+
+    let abort: AbortCallback = Some(Arc::new(|| true));
+    assert!(fixture.backup_with_abort("b", &source, abort).is_err());
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    fixture.backup("b", &source).unwrap();
+    assert_eq!(fixture.repository.list_archives().unwrap(), ["b"]);
 }

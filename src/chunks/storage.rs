@@ -140,11 +140,14 @@ impl ChunkStorage for ChunkStorageLocal {
         let path = self.path.join(self.path_from_chunk(chunk));
         std::fs::remove_file(&path)?;
 
+        // Best effort: concurrent deletes race on shared shards, and Windows reports a
+        // directory pending deletion as PermissionDenied rather than NotFound.
         for parent in path.ancestors().skip(1).take(2) {
-            if std::fs::read_dir(parent)?.next().is_some() {
+            let is_empty =
+                std::fs::read_dir(parent).is_ok_and(|mut entries| entries.next().is_none());
+            if !is_empty || std::fs::remove_dir(parent).is_err() {
                 break;
             }
-            std::fs::remove_dir(parent)?;
         }
 
         Ok(())
